@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/Tracer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/benchmarks" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/benchmarks/libxml" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/libxml2" vcs="Git" />
+  </component>
+</project>

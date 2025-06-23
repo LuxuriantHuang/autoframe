@@ -1,0 +1,73 @@
+2025-06-22 20:08:08,696 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/luxuh/auto_interact/benchmarks/seeds/xml
+2025-06-22 20:08:08,696 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/output/libxml_test_py
+2025-06-22 20:08:08,696 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-22 20:08:08,696 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml
+2025-06-22 20:08:08,697 - AutomationFramework@FuzzerRunner - INFO - Fuzzer执行命令：/home/luxuh/auto_interact/AFLplusplus/afl-fuzz -i /home/luxuh/auto_interact/benchmarks/seeds/xml -o benchmarks/output/libxml_test_py -- /home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml @@
+2025-06-22 20:08:08,700 - AutomationFramework@FuzzerRunner - INFO - fuzzer在系统中的pid：42720
+2025-06-22 20:08:08,700 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-22 20:08:12,436 - AutomationFramework@CoverageTracer - ERROR - 环境变量$__AFL_SHM_ID未配置，请先运行AFL再进行配置
+2025-06-22 20:08:14,961 - AutomationFramework@FuzzerRunner - INFO - 正在停止fuzzer
+2025-06-22 20:08:14,961 - AutomationFramework@FuzzerRunner - INFO - fuzzer成功终止
+2025-06-22 20:08:15,586 - AutomationFramework@__main__ - INFO - fuzzer 已终止
+2025-06-22 20:09:53,858 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/luxuh/auto_interact/benchmarks/seeds/xml
+2025-06-22 20:09:53,859 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/output/libxml_test_py
+2025-06-22 20:09:53,859 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-22 20:09:53,859 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml
+2025-06-22 20:09:53,859 - AutomationFramework@FuzzerRunner - INFO - Fuzzer执行命令：/home/luxuh/auto_interact/AFLplusplus/afl-fuzz -i /home/luxuh/auto_interact/benchmarks/seeds/xml -o benchmarks/output/libxml_test_py -- /home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml @@
+2025-06-22 20:09:53,861 - AutomationFramework@FuzzerRunner - INFO - fuzzer在系统中的pid：43650
+2025-06-22 20:09:53,862 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-22 20:09:55,430 - AutomationFramework@CoverageTracer - ERROR - 环境变量$__AFL_SHM_ID未配置，请先运行AFL再进行配置
+2025-06-22 20:10:18,076 - AutomationFramework@FuzzerRunner - INFO - 正在停止fuzzer
+2025-06-22 20:10:18,076 - AutomationFramework@FuzzerRunner - INFO - fuzzer成功终止
+2025-06-22 20:10:18,076 - AutomationFramework@__main__ - INFO - fuzzer 已终止
+2025-06-22 20:10:31,697 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/luxuh/auto_interact/benchmarks/seeds/xml
+2025-06-22 20:10:31,697 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/output/libxml_test_py
+2025-06-22 20:10:31,697 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-22 20:10:31,697 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml
+2025-06-22 20:10:31,697 - AutomationFramework@FuzzerRunner - INFO - Fuzzer执行命令：/home/luxuh/auto_interact/AFLplusplus/afl-fuzz -i /home/luxuh/auto_interact/benchmarks/seeds/xml -o benchmarks/output/libxml_test_py -- /home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml @@
+2025-06-22 20:10:31,699 - AutomationFramework@FuzzerRunner - INFO - fuzzer在系统中的pid：44013
+2025-06-22 20:10:31,700 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-22 20:10:32,967 - AutomationFramework@CoverageTracer - ERROR - 环境变量$__AFL_SHM_ID未配置，请先运行AFL再进行配置
+2025-06-22 20:10:36,904 - AutomationFramework@FuzzerRunner - INFO - 正在停止fuzzer
+2025-06-22 20:10:36,904 - AutomationFramework@FuzzerRunner - INFO - fuzzer成功终止
+2025-06-22 20:10:36,904 - AutomationFramework@__main__ - INFO - fuzzer 已终止
+2025-06-22 20:11:05,594 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/luxuh/auto_interact/benchmarks/seeds/xml
+2025-06-22 20:11:05,594 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/output/libxml_test_py
+2025-06-22 20:11:05,594 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-22 20:11:05,594 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml
+2025-06-22 20:11:05,594 - AutomationFramework@FuzzerRunner - INFO - Fuzzer执行命令：/home/luxuh/auto_interact/AFLplusplus/afl-fuzz -i /home/luxuh/auto_interact/benchmarks/seeds/xml -o benchmarks/output/libxml_test_py -- /home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml @@
+2025-06-22 20:11:05,596 - AutomationFramework@FuzzerRunner - INFO - fuzzer在系统中的pid：44374
+2025-06-22 20:11:05,596 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-22 20:11:07,263 - AutomationFramework@CoverageTracer - ERROR - 环境变量$__AFL_SHM_ID未配置，请先运行AFL再进行配置
+2025-06-22 20:11:12,769 - AutomationFramework@FuzzerRunner - ERROR - 没有启动fuzzer，请先启动fuzzer！
+2025-06-22 20:11:12,769 - AutomationFramework@__main__ - INFO - fuzzer 已终止
+2025-06-22 20:11:28,970 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/luxuh/auto_interact/benchmarks/seeds/xml
+2025-06-22 20:11:28,971 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/output/libxml_test_py
+2025-06-22 20:11:28,971 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-22 20:11:28,971 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml
+2025-06-22 20:11:28,971 - AutomationFramework@FuzzerRunner - INFO - Fuzzer执行命令：/home/luxuh/auto_interact/AFLplusplus/afl-fuzz -i /home/luxuh/auto_interact/benchmarks/seeds/xml -o benchmarks/output/libxml_test_py -- /home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml @@
+2025-06-22 20:11:28,973 - AutomationFramework@FuzzerRunner - INFO - fuzzer在系统中的pid：62455
+2025-06-22 20:11:28,973 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-22 20:11:28,973 - AutomationFramework@CoverageTracer - ERROR - 环境变量$__AFL_SHM_ID未配置，请先运行AFL再进行配置
+2025-06-22 20:11:28,973 - AutomationFramework@FuzzerRunner - ERROR - 没有启动fuzzer，请先启动fuzzer！
+2025-06-22 20:11:28,973 - AutomationFramework@__main__ - INFO - fuzzer 已终止
+2025-06-22 20:16:08,279 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/luxuh/auto_interact/benchmarks/seeds/xml
+2025-06-22 20:16:08,280 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/output/libxml_test_py
+2025-06-22 20:16:08,280 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-22 20:16:08,280 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml
+2025-06-22 20:16:08,280 - AutomationFramework@FuzzerRunner - INFO - Fuzzer执行命令：/home/luxuh/auto_interact/AFLplusplus/afl-fuzz -i /home/luxuh/auto_interact/benchmarks/seeds/xml -o benchmarks/output/libxml_test_py -- /home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml @@
+2025-06-22 20:16:08,282 - AutomationFramework@FuzzerRunner - INFO - fuzzer在系统中的pid：85778
+2025-06-22 20:16:08,282 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-22 20:16:08,282 - AutomationFramework@CoverageTracer - ERROR - 环境变量$__AFL_SHM_ID未配置，请先运行AFL再进行配置
+2025-06-22 20:16:08,282 - AutomationFramework@FuzzerRunner - ERROR - 没有启动fuzzer，请先启动fuzzer！
+2025-06-22 20:16:08,282 - AutomationFramework@__main__ - INFO - fuzzer 已终止
+2025-06-22 20:16:15,943 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/luxuh/auto_interact/benchmarks/seeds/xml
+2025-06-22 20:16:15,943 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/output/libxml_test_py
+2025-06-22 20:16:15,943 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-22 20:16:15,943 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml
+2025-06-22 20:16:15,943 - AutomationFramework@FuzzerRunner - INFO - Fuzzer执行命令：/home/luxuh/auto_interact/AFLplusplus/afl-fuzz -i /home/luxuh/auto_interact/benchmarks/seeds/xml -o benchmarks/output/libxml_test_py -- /home/luxuh/auto_interact/benchmarks/targets/libxml/target_libxml @@
+2025-06-22 20:16:15,946 - AutomationFramework@FuzzerRunner - INFO - fuzzer在系统中的pid：108550
+2025-06-22 20:16:15,946 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-22 20:17:01,418 - AutomationFramework@__main__ - INFO - 检测到用户中断(Ctrl+C)，正在终止...
+2025-06-22 20:17:01,418 - AutomationFramework@FuzzerRunner - ERROR - 没有启动fuzzer，请先启动fuzzer！
+2025-06-22 20:17:01,418 - AutomationFramework@__main__ - INFO - fuzzer 已终止
