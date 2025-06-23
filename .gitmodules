@@ -1,3 +1,6 @@
 [submodule "AFLplusplus"]
 	path = AFLplusplus
 	url = https://github.com/AFLplusplus/AFLplusplus.git
+[submodule "tracer"]
+	path = tracer
+	url = https://gitlab.com/adhoprsy/tracer.git
