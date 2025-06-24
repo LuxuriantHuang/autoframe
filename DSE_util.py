@@ -1,3 +1,6 @@
+import docker
+
+
 class DSEUtil:
     def __init__(self):
         self.dse_path = None
@@ -5,4 +8,3 @@ class DSEUtil:
 
     def dse_runner(self):
         pass
-

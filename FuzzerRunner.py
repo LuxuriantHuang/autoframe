@@ -18,14 +18,14 @@ class FuzzerRunner:
 
     def run(self):
         cmd = [
-            os.fspath(AFL_PATH),
+            os.fspath(AFL_PATH / "afl-fuzz"),
             "-i", os.fspath(self.input_dir),
             "-o", os.fspath(self.output_dir),
             "--", os.fspath(self.target_prog),
             *self.fuzzing_args
         ]
         logger.info(f"Fuzzer执行命令：{' '.join(cmd)}")
-        self.fuzzer_process = subprocess.Popen(cmd)
+        self.fuzzer_process = subprocess.Popen(cmd, env={"AFL_NO_UI":"1","AFL_QUIET":"1"})
         logger.info(f"fuzzer在系统中的pid：{self.fuzzer_process.pid}")
 
     def terminate(self):

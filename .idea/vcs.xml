@@ -1,11 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="VcsDirectoryMappings">
-    <mapping directory="$PROJECT_DIR$" vcs="Git" />
+    <mapping directory="" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/AFLplusplus" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/Tracer" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/benchmarks" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/benchmarks/libxml" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/libxml2" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/coresight_mode/coresight-trace" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/coresight_mode/patchelf" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/custom_mutators/gramatron/json-c" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/custom_mutators/grammar_mutator/grammar_mutator" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/nyx_mode/QEMU-Nyx" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/nyx_mode/libnyx" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/nyx_mode/packer" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/qemu_mode/qemuafl" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/AFLplusplus/unicorn_mode/unicornafl" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/tracer" vcs="Git" />
   </component>
 </project>

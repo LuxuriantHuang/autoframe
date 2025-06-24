@@ -42,33 +42,39 @@ class Bitmap:
 
 class HitSeed:
     def __init__(self) -> None:
-        self.hit_seed = defaultdict()  # dict[str][str]=list[str]
+        self.hit_seed = defaultdict(set)
 
     def merge(self, other, output_dir, basic_block, fuzzer_name):
         pattern = re.compile(r'id[_:](\d+)')
         seed_path, seed_info = other.values()
-        ppath = Path(PROJECT_HOME) / "out" / fuzzer_name / "queue" / seed_path
-        for bb in seed_info['basic_blocks']:
-            start = basic_block[bb["id"]]["lineStart"]
-            end = basic_block[bb["id"]]["lineEnd"]
-            for line in range(start, end + 1):
-                if Path.is_file(ppath):
-                    try:
-                        match = pattern.match(seed_path)
-                        seed_id = int(match.group(1))
-
-                        name = bb['name']
-                        if name not in self.hit_seed:
-                            self.hit_seed[name] = defaultdict(list)
-                        if line not in self.hit_seed[name]:
-                            self.hit_seed[name][line] = []
-                        self.hit_seed[bb['name']][line].append(seed_id)
-                    except Exception:
-                        print(seed_path)
-                        sys.exit(1)
-                else:
-                    continue
-                self.hit_seed[bb['name']][line] = list(set(self.hit_seed[bb['name']][line]))
+        if Path.is_file(seed_path):
+            # seed-bb to bb-seed
+            match = pattern.match(seed_path.name)
+            seed_id = int(match.group(1))
+            # line-seed
+            for bb in seed_info['basic_blocks']:
+                try:
+                    self.hit_seed[bb["id"]].add(seed_path.name)
+                except Exception:
+                    print(seed_path)
+                    sys.exit(1)
+            pass
+                # start = basic_block[bb["id"]]["lineStart"]
+                # end = basic_block[bb["id"]]["lineEnd"]
+                # for line in range(start, end + 1):
+                #     try:
+                #         # match = pattern.match(seed_path.name)
+                #         # seed_id = int(match.group(1))
+                #         name = bb['name']
+                #         if name not in self.hit_seed:
+                #             self.hit_seed[name] = defaultdict(list)
+                #         if line not in self.hit_seed[name]:
+                #             self.hit_seed[name][line] = []
+                #         self.hit_seed[bb['name']][line].append(seed_id)
+                #     except Exception:
+                #         print(seed_path)
+                #         sys.exit(1)
+                # self.hit_seed[bb['name']][line] = list(set(self.hit_seed[bb['name']][line]))
 
     def merge_corpus(self, other: 'HitSeed'):
         for k1, file_content in other.hit_seed.items():
@@ -94,8 +100,11 @@ class InfoProcesser:
         new_info = {"seed": seed_name, "info": trace_data}
         self._bitmap.merge(new_info)
         self._hit_seed.merge(new_info, self._output_dir, basic_block, fuzzer_name)
-        pass
 
     @property
     def bitmap(self):
         return self._bitmap
+
+    @property
+    def hit_seed(self):
+        return self._hit_seed
