@@ -1,6 +1,5 @@
 import os
 import subprocess
-from pathlib import Path
 
 from config import *
 from utils import valid_path
@@ -48,3 +47,6 @@ class FuzzerRunner:
         if self.fuzzer_process is None:
             return False
         return self.fuzzer_process.poll() is None
+
+    def add_seed(self):
+        pass

@@ -1,16 +1,13 @@
 import os
 import random
-import time
 import traceback
 
-import ujson
 from argparse import ArgumentParser
-from pathlib import Path
 
 from DSE_util import DSEUtil
 from CoverageTracer import CoverageTracer
 from FuzzerRunner import FuzzerRunner
-from LLM import LLM_util
+from LLM.LLM_util import LLM_util
 from config import *
 from utils import valid_path
 
@@ -20,8 +17,7 @@ def setup_logger():
     logger.setLevel(LOGGING_LEVEL)
 
     os.makedirs(LOG_PATH, exist_ok=True)
-    handler = logging.FileHandler(
-        Path(LOG_PATH) / LOGGER_FILE_NAME / "-" / time.strftime("%m-%d-%H_%M_%S", time.localtime()) / ".log")
+    handler = logging.FileHandler(Path(LOG_PATH) / LOGGER_FILE_NAME)
     handler.setLevel(LOGGING_LEVEL)
     formatter = logging.Formatter(LOGGING_FORMAT)
     handler.setFormatter(formatter)
@@ -59,7 +55,7 @@ def main():
     # fuzzer.run()
     logger.info("fuzzer已开始运行")
     try:
-        tracer = CoverageTracer(input_dir, output_dir, fuzzing_args, target_prog, trace_prog)
+        tracer = CoverageTracer(input_dir, output_dir, fuzzing_args, target_prog, trace_prog, bbs, funcs)
         while True:
             # try:
             #     tracer.check_coverage_growth()
@@ -77,17 +73,42 @@ def main():
                 if not ret:
                     raise Exception(error_info)
                 # 使用瓶颈分析算法分析所有瓶颈并排序，返回瓶颈list（前10）
-                roadblocks = tracer.get_roadblocks(bb, STATIC_PATH)
+                roadblocks = tracer.get_roadblocks(STATIC_PATH)
                 # 按照顺序获得瓶颈点，并得到roadblocks所需的信息
                 success = False
                 for roadblock in roadblocks:
                     seeds = tracer.get_rb_seed(roadblock)
                     dse_util = DSEUtil()
                     llm_util = LLM_util()
-                    for seed in random.sample(seeds, min(3, len(seeds))):
-                        result_dse, dse_seed = dse_util.dse_runner()
-                        pass
-
+                    rb_file, rb_line = tracer.get_rb_file_and_line(roadblock)
+                    for seed in random.sample(sorted(seeds), min(DSE_SEEDS_NUM, len(seeds))):
+                        logs = dse_util.dse_runner(seed, rb_file, rb_line)
+                        solved = False
+                        for log in logs:
+                            if "New testcase" in log:
+                                solved = True
+                                break
+                        if solved:
+                            fuzzer.add_seed()
+                            success = True
+                            break
+                        call_chain, code_slice, bcode = tracer.get_slice(roadblock, seed)
+                        seed_id = 0
+                        result_llm, llm_seed = llm_util.solve(call_chain, code_slice, bcode,
+                                                              roadblock, seed_id)  # 将检测放在llm_utils内检查
+                        if result_llm:
+                            fuzzer.add_seed(llm_seed)
+                            success = True
+                            break
+                    if success:
+                        break
+                    # for seed in random.sample(sorted(seeds), min(DSE_SEEDS_NUM, len(seeds))):
+                    #     code_slice = tracer.get_slice(roadblock, seed)
+                    #     result_llm, llm_seed = llm_util.solve(code_slice, rb_file, rb_line)  # 将检测放在llm_utils内检查
+                    #     if result_llm:
+                    #         fuzzer.add_seed(llm_seed)
+                    #         success = True
+                    #         break
                     # dse_util = DSEUtil()
                     # result_dse, dse_seed = dse_util.dse_runner()
                     # if result_dse and dse_util.check():

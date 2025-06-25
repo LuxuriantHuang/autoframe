@@ -1,5 +1,3 @@
-./benchmarks/output
-./benchmarks/seeds
-./benchmarks/build/*
 ./libxml
 ./libxml2
+./benchmarks_old
