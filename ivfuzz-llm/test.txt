@@ -1,0 +1,560 @@
+int main(int argc, char* argv[]) {  // coverage: 1
+    // open file  // coverage: 1
+    FILE *f = fopen(argv[1], "rb");  // coverage: 1
+  // coverage: 1
+    // get file size  // coverage: 1
+    fseek(f, 0, SEEK_END);  // coverage: 1
+    long fsize = ftell(f);  // coverage: 1
+  // coverage: 1
+    // read file contents  // coverage: 1
+    fseek(f, 0, SEEK_SET);  // coverage: 1
+    char *string = (char*)malloc(fsize + 1);  // coverage: 1
+    fread(string, 1, fsize, f);  // coverage: 1
+    fclose(f);  // coverage: 1
+  // coverage: 1
+    // Now call into the harness  // coverage: 1
+    int retval = LLVMFuzzerTestOneInput((const uint8_t *)string, fsize);  // coverage: 1
+  // coverage: 1
+    free(string);  // coverage: 1
+    return retval;  // coverage: 1
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {  // coverage: 1
+  xmlSetGenericErrorFunc(NULL, &ignore);  // coverage: 1
+  if (auto doc = xmlReadMemory(reinterpret_cast<const char *>(data), size,  // coverage: 1
+                               "noname.xml", NULL, 0))
+    xmlFreeDoc(doc);
+  return 0;  // coverage: 1
+
+xmlReadMemory(const char *buffer, int size, const char *URL, const char *encoding, int options)  // coverage: 1
+{  // coverage: 1
+    xmlParserCtxtPtr ctxt;  // coverage: 1
+  // coverage: 1
+    xmlInitParser();  // coverage: 1
+    ctxt = xmlCreateMemoryParserCtxt(buffer, size);  // coverage: 1
+    if (ctxt == NULL)  // coverage: 1
+        return (NULL);
+    return (xmlDoRead(ctxt, URL, encoding, options, 0));  // coverage: 1
+}  // coverage: 1
+
+xmlDoRead(xmlParserCtxtPtr ctxt, const char *URL, const char *encoding,  // coverage: 1
+          int options, int reuse)  // coverage: 1
+{  // coverage: 1
+    xmlDocPtr ret;  // coverage: 1
+  // coverage: 1
+    xmlCtxtUseOptionsInternal(ctxt, options, encoding);  // coverage: 1
+    if (encoding != NULL) {  // coverage: 1
+        xmlCharEncodingHandlerPtr hdlr;
+
+	hdlr = xmlFindCharEncodingHandler(encoding);
+	if (hdlr != NULL)
+	    xmlSwitchToEncoding(ctxt, hdlr);
+    }
+    if ((URL != NULL) && (ctxt->input != NULL) &&  // coverage: 2
+        (ctxt->input->filename == NULL))  // coverage: 1
+        ctxt->input->filename = (char *) xmlStrdup((const xmlChar *) URL);  // coverage: 1
+    xmlParseDocument(ctxt);  // coverage: 1
+    if ((ctxt->wellFormed) || ctxt->recovery)  // coverage: 2
+        ret = ctxt->myDoc;
+    else {
+        ret = NULL;  // coverage: 1
+	if (ctxt->myDoc != NULL) {  // coverage: 1
+	    xmlFreeDoc(ctxt->myDoc);  // coverage: 1
+	}  // coverage: 1
+    }
+    ctxt->myDoc = NULL;  // coverage: 1
+    if (!reuse) {  // coverage: 1
+	xmlFreeParserCtxt(ctxt);  // coverage: 1
+    }  // coverage: 1
+
+    return (ret);  // coverage: 1
+
+xmlParseDocument(xmlParserCtxtPtr ctxt) {  // coverage: 1
+    xmlChar start[4];  // coverage: 1
+    xmlCharEncoding enc;  // coverage: 1
+  // coverage: 1
+    xmlInitParser();  // coverage: 1
+  // coverage: 1
+    if ((ctxt == NULL) || (ctxt->input == NULL))  // coverage: 2
+        return(-1);
+
+    GROW;  // coverage: 3
+
+    /*
+     * SAX: detecting the level.
+     */
+    xmlDetectSAX2(ctxt);  // coverage: 1
+  // coverage: 1
+    /*  // coverage: 1
+     * SAX: beginning of the document processing.  // coverage: 1
+     */  // coverage: 1
+    if ((ctxt->sax) && (ctxt->sax->setDocumentLocator))  // coverage: 2
+        ctxt->sax->setDocumentLocator(ctxt->userData, &xmlDefaultSAXLocator);  // coverage: 1
+    if (ctxt->instate == XML_PARSER_EOF)  // coverage: 1
+	return(-1);
+
+    if ((ctxt->encoding == NULL) &&  // coverage: 1
+        ((ctxt->input->end - ctxt->input->cur) >= 4)) {  // coverage: 1
+	/*
+	 * Get the 4 first bytes and decode the charset
+	 * if enc != XML_CHAR_ENCODING_NONE
+	 * plug some encoding conversion routines.
+	 */
+	start[0] = RAW;  // coverage: 1
+	start[1] = NXT(1);  // coverage: 1
+	start[2] = NXT(2);  // coverage: 1
+	start[3] = NXT(3);  // coverage: 1
+	enc = xmlDetectCharEncoding(&start[0], 4);  // coverage: 1
+	if (enc != XML_CHAR_ENCODING_NONE) {  // coverage: 1
+	    xmlSwitchEncoding(ctxt, enc);  // coverage: 1
+	}  // coverage: 1
+    }  // coverage: 1
+
+
+    if (CUR == 0) {  // coverage: 1
+	xmlFatalErr(ctxt, XML_ERR_DOCUMENT_EMPTY, NULL);
+    }
+
+    /*
+     * Check for the XMLDecl in the Prolog.
+     * do not GROW here to avoid the detected encoder to decode more
+     * than just the first line, unless the amount of data is really
+     * too small to hold "<?xml version="1.0" encoding="foo"
+     */
+    if ((ctxt->input->end - ctxt->input->cur) < 35) {  // coverage: 1
+       GROW;
+    }
+    if ((CMP5(CUR_PTR, '<', '?', 'x', 'm', 'l')) && (IS_BLANK_CH(NXT(5)))) {  // coverage: 6
+
+	/*
+	 * Note that we will switch encoding on the fly.
+	 */
+	xmlParseXMLDecl(ctxt);  // coverage: 1
+	if (ctxt->errNo == XML_ERR_UNSUPPORTED_ENCODING) {  // coverage: 1
+	    /*
+	     * The XML REC instructs us to stop parsing right here
+	     */
+	    return(-1);
+	}
+	ctxt->standalone = ctxt->input->standalone;  // coverage: 1
+	SKIP_BLANKS;  // coverage: 1
+    } else {  // coverage: 1
+	ctxt->version = xmlCharStrdup(XML_DEFAULT_VERSION);
+    }
+    if ((ctxt->sax) && (ctxt->sax->startDocument) && (!ctxt->disableSAX))  // coverage: 3
+        ctxt->sax->startDocument(ctxt->userData);  // coverage: 1
+    if (ctxt->instate == XML_PARSER_EOF)  // coverage: 1
+	return(-1);
+    if ((ctxt->myDoc != NULL) && (ctxt->input != NULL) &&  // coverage: 2
+        (ctxt->input->buf != NULL) && (ctxt->input->buf->compressed >= 0)) {  // coverage: 2
+	ctxt->myDoc->compression = ctxt->input->buf->compressed;
+    }
+
+    /*
+     * The Misc part of the Prolog
+     */
+    GROW;  // coverage: 3
+    xmlParseMisc(ctxt);  // coverage: 1
+  // coverage: 1
+    /*  // coverage: 1
+     * Then possibly doc type declaration(s) and more Misc  // coverage: 1
+     * (doctypedecl Misc*)?  // coverage: 1
+     */  // coverage: 1
+    GROW;  // coverage: 3
+    if (CMP9(CUR_PTR, '<', '!', 'D', 'O', 'C', 'T', 'Y', 'P', 'E')) {  // coverage: 9
+
+	ctxt->inSubset = 1;  // coverage: 1
+	xmlParseDocTypeDecl(ctxt);  // coverage: 1
+	if (RAW == '[') {  // coverage: 1
+	    ctxt->instate = XML_PARSER_DTD;  // coverage: 1
+	    xmlParseInternalSubset(ctxt);  // coverage: 1
+	    if (ctxt->instate == XML_PARSER_EOF)  // coverage: 1
+		return(-1);
+	}  // coverage: 1
+
+	/*
+	 * Create and update the external subset.
+	 */
+	ctxt->inSubset = 2;  // coverage: 1
+	if ((ctxt->sax != NULL) && (ctxt->sax->externalSubset != NULL) &&  // coverage: 2
+	    (!ctxt->disableSAX))  // coverage: 1
+	    ctxt->sax->externalSubset(ctxt->userData, ctxt->intSubName,  // coverage: 1
+	                              ctxt->extSubSystem, ctxt->extSubURI);  // coverage: 1
+	if (ctxt->instate == XML_PARSER_EOF)  // coverage: 1
+	    return(-1);
+	ctxt->inSubset = 0;  // coverage: 1
+  // coverage: 1
+        xmlCleanSpecialAttr(ctxt);  // coverage: 1
+  // coverage: 1
+	ctxt->instate = XML_PARSER_PROLOG;  // coverage: 1
+	xmlParseMisc(ctxt);  // coverage: 1
+    }  // coverage: 1
+
+    /*
+     * Time to start parsing the tree itself
+     */
+    GROW;  // coverage: 3
+    if (RAW != '<') {  // coverage: 1
+	xmlFatalErrMsg(ctxt, XML_ERR_DOCUMENT_EMPTY,
+		       "Start tag expected, '<' not found\n");
+    } else {
+	ctxt->instate = XML_PARSER_CONTENT;  // coverage: 1
+	xmlParseElement(ctxt);  // coverage: 1
+	ctxt->instate = XML_PARSER_EPILOG;  // coverage: 1
+  // coverage: 1
+  // coverage: 1
+	/*  // coverage: 1
+	 * The Misc part at the end  // coverage: 1
+	 */  // coverage: 1
+	xmlParseMisc(ctxt);  // coverage: 1
+  // coverage: 1
+	if (RAW != 0) {  // coverage: 1
+	    xmlFatalErr(ctxt, XML_ERR_DOCUMENT_END, NULL);
+	}
+	ctxt->instate = XML_PARSER_EOF;  // coverage: 1
+    }
+
+    /*
+     * SAX: end of the document processing.
+     */
+    if ((ctxt->sax) && (ctxt->sax->endDocument != NULL))  // coverage: 2
+        ctxt->sax->endDocument(ctxt->userData);  // coverage: 1
+
+    /*
+     * Remove locally kept entity definitions if the tree was not built
+     */
+    if ((ctxt->myDoc != NULL) &&  // coverage: 1
+	(xmlStrEqual(ctxt->myDoc->version, SAX_COMPAT_MODE))) {  // coverage: 1
+	xmlFreeDoc(ctxt->myDoc);
+	ctxt->myDoc = NULL;
+    }
+
+    if ((ctxt->wellFormed) && (ctxt->myDoc != NULL)) {  // coverage: 1
+        ctxt->myDoc->properties |= XML_DOC_WELLFORMED;
+	if (ctxt->valid)
+	    ctxt->myDoc->properties |= XML_DOC_DTDVALID;
+	if (ctxt->nsWellFormed)
+	    ctxt->myDoc->properties |= XML_DOC_NSVALID;
+	if (ctxt->options & XML_PARSE_OLD10)
+	    ctxt->myDoc->properties |= XML_DOC_OLD10;
+    }
+    if (! ctxt->wellFormed) {  // coverage: 1
+	ctxt->valid = 0;  // coverage: 1
+	return(-1);  // coverage: 1
+    }
+    return(0);
+}  // coverage: 1
+
+xmlParseInternalSubset(xmlParserCtxtPtr ctxt) {  // coverage: 1
+    /*  // coverage: 1
+     * Is there any DTD definition ?  // coverage: 1
+     */  // coverage: 1
+    if (RAW == '[') {  // coverage: 1
+        ctxt->instate = XML_PARSER_DTD;  // coverage: 1
+        NEXT;  // coverage: 1
+	/*  // coverage: 1
+	 * Parse the succession of Markup declarations and  // coverage: 1
+	 * PEReferences.  // coverage: 1
+	 * Subsequence (markupdecl | PEReference | S)*  // coverage: 1
+	 */  // coverage: 1
+	while ((RAW != ']') && (ctxt->instate != XML_PARSER_EOF)) {  // coverage: 8
+	    const xmlChar *check = CUR_PTR;  // coverage: 2
+	    unsigned int cons = ctxt->input->consumed;  // coverage: 2
+  // coverage: 2
+	    SKIP_BLANKS;  // coverage: 2
+	    xmlParseMarkupDecl(ctxt);  // coverage: 2
+	    xmlParsePEReference(ctxt);  // coverage: 2
+  // coverage: 2
+	    /*  // coverage: 2
+	     * Pop-up of finished entities.  // coverage: 2
+	     */  // coverage: 2
+	    while ((RAW == 0) && (ctxt->inputNr > 1))  // coverage: 4
+		xmlPopInput(ctxt);
+
+	    if ((CUR_PTR == check) && (cons == ctxt->input->consumed)) {  // coverage: 2
+		xmlFatalErr(ctxt, XML_ERR_INTERNAL_ERROR,
+	     "xmlParseInternalSubset: error detected in Markup declaration\n");
+		break;
+	    }
+	}
+	if (RAW == ']') {  // coverage: 1
+	    NEXT;  // coverage: 1
+	    SKIP_BLANKS;  // coverage: 1
+	}  // coverage: 1
+    }  // coverage: 1
+
+    /*
+     * We should be at the end of the DOCTYPE declaration.
+     */
+    if (RAW != '>') {  // coverage: 1
+	xmlFatalErr(ctxt, XML_ERR_DOCTYPE_NOT_FINISHED, NULL);
+    }
+    NEXT;  // coverage: 1
+}  // coverage: 1
+
+xmlParseMarkupDecl(xmlParserCtxtPtr ctxt) {  // coverage: 2
+    GROW;  // coverage: 6
+    if (CUR == '<') {  // coverage: 2
+        if (NXT(1) == '!') {  // coverage: 1
+	    switch (NXT(2)) {  // coverage: 1
+	        case 'E':
+		    if (NXT(3) == 'L')  // coverage: 1
+			xmlParseElementDecl(ctxt);  // coverage: 1
+		    else if (NXT(3) == 'N')
+			xmlParseEntityDecl(ctxt);
+		    break;  // coverage: 1
+	        case 'A':
+		    xmlParseAttributeListDecl(ctxt);
+		    break;
+	        case 'N':
+		    xmlParseNotationDecl(ctxt);
+		    break;
+	        case '-':
+		    xmlParseComment(ctxt);
+		    break;
+		default:
+		    /* there is an error but it will be detected later */
+		    break;
+	    }
+	} else if (NXT(1) == '?') {  // coverage: 1
+	    xmlParsePI(ctxt);
+	}
+    }  // coverage: 1
+    /*
+     * This is only for internal subset. On external entities,
+     * the replacement is done before parsing stage
+     */
+    if ((ctxt->external == 0) && (ctxt->inputNr == 1))  // coverage: 4
+	xmlParsePEReference(ctxt);  // coverage: 2
+
+    /*
+     * Conditional sections are allowed from entities included
+     * by PE References in the internal subset.
+     */
+    if ((ctxt->external == 0) && (ctxt->inputNr > 1)) {  // coverage: 4
+        if ((RAW == '<') && (NXT(1) == '!') && (NXT(2) == '[')) {
+	    xmlParseConditionalSections(ctxt);
+	}
+    }
+
+    ctxt->instate = XML_PARSER_DTD;  // coverage: 2
+}  // coverage: 2
+
+xmlParseElementDecl(xmlParserCtxtPtr ctxt) {  // coverage: 1
+    const xmlChar *name;  // coverage: 1
+    int ret = -1;  // coverage: 1
+    xmlElementContentPtr content  = NULL;  // coverage: 1
+  // coverage: 1
+    /* GROW; done in the caller */  // coverage: 1
+    if (CMP9(CUR_PTR, '<', '!', 'E', 'L', 'E', 'M', 'E', 'N', 'T')) {  // coverage: 9
+	xmlParserInputPtr input = ctxt->input;  // coverage: 1
+  // coverage: 1
+	SKIP(9);  // coverage: 4
+	if (!IS_BLANK_CH(CUR)) {  // coverage: 1
+	    xmlFatalErrMsg(ctxt, XML_ERR_SPACE_REQUIRED,
+		           "Space required after 'ELEMENT'\n");
+	}
+        SKIP_BLANKS;  // coverage: 1
+        name = xmlParseName(ctxt);  // coverage: 1
+	if (name == NULL) {  // coverage: 1
+	    xmlFatalErrMsg(ctxt, XML_ERR_NAME_REQUIRED,
+			   "xmlParseElementDecl: no name for Element\n");
+	    return(-1);
+	}
+	while ((RAW == 0) && (ctxt->inputNr > 1))  // coverage: 2
+	    xmlPopInput(ctxt);
+	if (!IS_BLANK_CH(CUR)) {  // coverage: 1
+	    xmlFatalErrMsg(ctxt, XML_ERR_SPACE_REQUIRED,
+			   "Space required after the element name\n");
+	}
+        SKIP_BLANKS;  // coverage: 1
+	if (CMP5(CUR_PTR, 'E', 'M', 'P', 'T', 'Y')) {  // coverage: 1
+	    SKIP(5);
+	    /*
+	     * Element must always be empty.
+	     */
+	    ret = XML_ELEMENT_TYPE_EMPTY;
+	} else if ((RAW == 'A') && (NXT(1) == 'N') &&  // coverage: 1
+	           (NXT(2) == 'Y')) {
+	    SKIP(3);
+	    /*
+	     * Element is a generic container.
+	     */
+	    ret = XML_ELEMENT_TYPE_ANY;
+	} else if (RAW == '(') {  // coverage: 1
+	    ret = xmlParseElementContentDecl(ctxt, name, &content);  // coverage: 1
+	} else {  // coverage: 1
+	    /*
+	     * [ WFC: PEs in Internal Subset ] error handling.
+	     */
+	    if ((RAW == '%') && (ctxt->external == 0) &&
+	        (ctxt->inputNr == 1)) {
+		xmlFatalErrMsg(ctxt, XML_ERR_PEREF_IN_INT_SUBSET,
+	  "PEReference: forbidden within markup decl in internal subset\n");
+	    } else {
+		xmlFatalErrMsg(ctxt, XML_ERR_ELEMCONTENT_NOT_STARTED,
+		      "xmlParseElementDecl: 'EMPTY', 'ANY' or '(' expected\n");
+            }
+	    return(-1);
+	}
+
+	SKIP_BLANKS;  // coverage: 1
+	/*  // coverage: 1
+	 * Pop-up of finished entities.  // coverage: 1
+	 */  // coverage: 1
+	while ((RAW == 0) && (ctxt->inputNr > 1))  // coverage: 2
+	    xmlPopInput(ctxt);
+	SKIP_BLANKS;  // coverage: 1
+  // coverage: 1
+	if (RAW != '>') {  // coverage: 1
+	    xmlFatalErr(ctxt, XML_ERR_GT_REQUIRED, NULL);
+	    if (content != NULL) {
+		xmlFreeDocElementContent(ctxt->myDoc, content);
+	    }
+	} else {
+	    if (input != ctxt->input) {  // coverage: 1
+		xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_BOUNDARY,
+    "Element declaration doesn't start and stop in the same entity\n");
+	    }
+
+	    NEXT;  // coverage: 1
+	    if ((ctxt->sax != NULL) && (!ctxt->disableSAX) &&  // coverage: 2
+		(ctxt->sax->elementDecl != NULL)) {  // coverage: 1
+		if (content != NULL)  // coverage: 1
+		    content->parent = NULL;  // coverage: 1
+	        ctxt->sax->elementDecl(ctxt->userData, name, ret,  // coverage: 1
+		                       content);  // coverage: 1
+		if ((content != NULL) && (content->parent == NULL)) {  // coverage: 2
+		    /*
+		     * this is a trick: if xmlAddElementDecl is called,
+		     * instead of copying the full tree it is plugged directly
+		     * if called from the parser. Avoid duplicating the
+		     * interfaces or change the API/ABI
+		     */
+		    xmlFreeDocElementContent(ctxt->myDoc, content);
+		}
+	    } else if (content != NULL) {  // coverage: 1
+		xmlFreeDocElementContent(ctxt->myDoc, content);
+	    }
+	}
+    }  // coverage: 1
+    return(ret);  // coverage: 1
+}  // coverage: 1
+
+xmlParseElementContentDecl(xmlParserCtxtPtr ctxt, const xmlChar *name,  // coverage: 1
+                           xmlElementContentPtr *result) {  // coverage: 1
+  // coverage: 1
+    xmlElementContentPtr tree = NULL;  // coverage: 1
+    int inputid = ctxt->input->id;  // coverage: 1
+    int res;  // coverage: 1
+  // coverage: 1
+    *result = NULL;  // coverage: 1
+  // coverage: 1
+    if (RAW != '(') {  // coverage: 1
+	xmlFatalErrMsgStr(ctxt, XML_ERR_ELEMCONTENT_NOT_STARTED,
+		"xmlParseElementContentDecl : %s '(' expected\n", name);
+	return(-1);
+    }
+    NEXT;  // coverage: 1
+    GROW;  // coverage: 3
+    if (ctxt->instate == XML_PARSER_EOF)  // coverage: 1
+        return(-1);
+    SKIP_BLANKS;  // coverage: 1
+    if (CMP7(CUR_PTR, '#', 'P', 'C', 'D', 'A', 'T', 'A')) {  // coverage: 7
+        tree = xmlParseElementMixedContentDecl(ctxt, inputid);  // coverage: 1
+	res = XML_ELEMENT_TYPE_MIXED;  // coverage: 1
+    } else {  // coverage: 1
+        tree = xmlParseElementChildrenContentDeclPriv(ctxt, inputid, 1);
+	res = XML_ELEMENT_TYPE_ELEMENT;
+    }
+    SKIP_BLANKS;  // coverage: 1
+    *result = tree;  // coverage: 1
+    return(res);  // coverage: 1
+}  // coverage: 1
+
+xmlParseElementMixedContentDecl(xmlParserCtxtPtr ctxt, int inputchk) {  // coverage: 1
+    xmlElementContentPtr ret = NULL, cur = NULL, n;  // coverage: 1
+    const xmlChar *elem = NULL;  // coverage: 1
+  // coverage: 1
+    GROW;  // coverage: 3
+    if (CMP7(CUR_PTR, '#', 'P', 'C', 'D', 'A', 'T', 'A')) {  // coverage: 7
+	SKIP(7);  // coverage: 4
+	SKIP_BLANKS;  // coverage: 1
+	SHRINK;  // coverage: 2
+	if (RAW == ')') {  // coverage: 1
+	    if ((ctxt->validate) && (ctxt->input->id != inputchk)) {
+		xmlValidityError(ctxt, XML_ERR_ENTITY_BOUNDARY,
+"Element content declaration doesn't start and stop in the same entity\n",
+                                 NULL, NULL);
+	    }
+	    NEXT;
+	    ret = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_PCDATA);
+	    if (ret == NULL)
+	        return(NULL);
+	    if (RAW == '*') {
+		ret->ocur = XML_ELEMENT_CONTENT_MULT;
+		NEXT;
+	    }
+	    return(ret);
+	}
+	if ((RAW == '(') || (RAW == '|')) {  // coverage: 2
+	    ret = cur = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_PCDATA);  // coverage: 1
+	    if (ret == NULL) return(NULL);  // coverage: 1
+	}  // coverage: 1
+	while ((RAW == '|') && (ctxt->instate != XML_PARSER_EOF)) {  // coverage: 5
+	    NEXT;  // coverage: 1
+	    if (elem == NULL) {  // coverage: 1
+	        ret = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_OR);  // coverage: 1
+		if (ret == NULL) return(NULL);  // coverage: 1
+		ret->c1 = cur;  // coverage: 1
+		if (cur != NULL)  // coverage: 1
+		    cur->parent = ret;  // coverage: 1
+		cur = ret;  // coverage: 1
+	    } else {  // coverage: 1
+	        n = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_OR);
+		if (n == NULL) return(NULL);
+		n->c1 = xmlNewDocElementContent(ctxt->myDoc, elem, XML_ELEMENT_CONTENT_ELEMENT);
+		if (n->c1 != NULL)
+		    n->c1->parent = n;
+	        cur->c2 = n;
+		if (n != NULL)
+		    n->parent = cur;
+		cur = n;
+	    }
+	    SKIP_BLANKS;  // coverage: 1
+	    elem = xmlParseName(ctxt);  // coverage: 1
+	    if (elem == NULL) {  // coverage: 1
+		xmlFatalErrMsg(ctxt, XML_ERR_NAME_REQUIRED,
+			"xmlParseElementMixedContentDecl : Name expected\n");
+		xmlFreeDocElementContent(ctxt->myDoc, cur);
+		return(NULL);
+	    }
+	    SKIP_BLANKS;  // coverage: 1
+	    GROW;  // coverage: 3
+	}
+	if ((RAW == ')') && (NXT(1) == '*')) {  // coverage: 2
+	    if (elem != NULL) {  // coverage: 1
+		cur->c2 = xmlNewDocElementContent(ctxt->myDoc, elem,  // coverage: 1
+		                               XML_ELEMENT_CONTENT_ELEMENT);  // coverage: 1
+		if (cur->c2 != NULL)  // coverage: 1
+		    cur->c2->parent = cur;  // coverage: 1
+            }  // coverage: 1
+            if (ret != NULL)  // coverage: 1
+                ret->ocur = XML_ELEMENT_CONTENT_MULT;  // coverage: 1
+	    if ((ctxt->validate) && (ctxt->input->id != inputchk)) {  // coverage: 1
+		xmlValidityError(ctxt, XML_ERR_ENTITY_BOUNDARY,
+"Element content declaration doesn't start and stop in the same entity\n",
+				 NULL, NULL);
+	    }
+	    SKIP(2);  // coverage: 4
+	} else {  // coverage: 1
+	    xmlFreeDocElementContent(ctxt->myDoc, ret);
+	    xmlFatalErr(ctxt, XML_ERR_MIXED_NOT_STARTED, NULL);
+	    return(NULL);
+	}
+
+    } else {  // coverage: 1
+	xmlFatalErr(ctxt, XML_ERR_PCDATA_REQUIRED, NULL);
+    }
+    return(ret);  // coverage: 1
+}  // coverage: 1
+

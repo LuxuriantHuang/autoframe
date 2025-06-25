@@ -1,0 +1,597 @@
+You are a professional program code analyst. Your task is to analyze the
+provided code snippet and develop a Python script to generate test cases.
+
+### Task
+
+Your Task is to write a generator of test cases for
+```LLVMFuzzerTestOneInput```. The generator should generate an
+input that can call xmlParseElementMixedContentDecl called in the function xmlParseElementContentDecl.
+
+### Instrument
+
+Generate the input case that ```LLVMFuzzerTestOneInput``` can
+accept. The struct and file format should be accepted by
+```LLVMFuzzerTestOneInput```.
+
+### Code Snippet
+
+int main(int argc, char* argv[]) {
+    // open file
+    FILE *f = fopen(argv[1], "rb");
+
+    // get file size
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+
+    // read file contents
+    fseek(f, 0, SEEK_SET);
+    char *string = (char*)malloc(fsize + 1);
+    fread(string, 1, fsize, f);
+    fclose(f);
+
+    // Now call into the harness
+    int retval = LLVMFuzzerTestOneInput((const uint8_t *)string, fsize);
+
+    free(string);
+    return retval;
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  xmlSetGenericErrorFunc(NULL, &ignore);
+  if (auto doc = xmlReadMemory(reinterpret_cast<const char *>(data), size,
+                               "noname.xml", NULL, 0))
+    xmlFreeDoc(doc);
+  return 0;
+xmlReadMemory(const char *buffer, int size, const char *URL, const char *encoding, int options)
+{
+    xmlParserCtxtPtr ctxt;
+
+    xmlInitParser();
+    ctxt = xmlCreateMemoryParserCtxt(buffer, size);
+    if (ctxt == NULL)
+        return (NULL);
+    return (xmlDoRead(ctxt, URL, encoding, options, 0));
+}
+xmlDoRead(xmlParserCtxtPtr ctxt, const char *URL, const char *encoding,
+          int options, int reuse)
+{
+    xmlDocPtr ret;
+
+    xmlCtxtUseOptionsInternal(ctxt, options, encoding);
+    if (encoding != NULL) {
+        xmlCharEncodingHandlerPtr hdlr;
+
+	hdlr = xmlFindCharEncodingHandler(encoding);
+	if (hdlr != NULL)
+	    xmlSwitchToEncoding(ctxt, hdlr);
+    }
+    if ((URL != NULL) && (ctxt->input != NULL) &&
+        (ctxt->input->filename == NULL))
+        ctxt->input->filename = (char *) xmlStrdup((const xmlChar *) URL);
+    xmlParseDocument(ctxt);
+    if ((ctxt->wellFormed) || ctxt->recovery)
+        ret = ctxt->myDoc;
+    else {
+        ret = NULL;
+	if (ctxt->myDoc != NULL) {
+	    xmlFreeDoc(ctxt->myDoc);
+	}
+    }
+    ctxt->myDoc = NULL;
+    if (!reuse) {
+	xmlFreeParserCtxt(ctxt);
+    }
+
+    return (ret);
+xmlParseDocument(xmlParserCtxtPtr ctxt) {
+    xmlChar start[4];
+    xmlCharEncoding enc;
+
+    xmlInitParser();
+
+    if ((ctxt == NULL) || (ctxt->input == NULL))
+        return(-1);
+
+    GROW;
+
+    /*
+     * SAX: detecting the level.
+     */
+    xmlDetectSAX2(ctxt);
+
+    /*
+     * SAX: beginning of the document processing.
+     */
+    if ((ctxt->sax) && (ctxt->sax->setDocumentLocator))
+        ctxt->sax->setDocumentLocator(ctxt->userData, &xmlDefaultSAXLocator);
+    if (ctxt->instate == XML_PARSER_EOF)
+	return(-1);
+
+    if ((ctxt->encoding == NULL) &&
+        ((ctxt->input->end - ctxt->input->cur) >= 4)) {
+	/*
+	 * Get the 4 first bytes and decode the charset
+	 * if enc != XML_CHAR_ENCODING_NONE
+	 * plug some encoding conversion routines.
+	 */
+	start[0] = RAW;
+	start[1] = NXT(1);
+	start[2] = NXT(2);
+	start[3] = NXT(3);
+	enc = xmlDetectCharEncoding(&start[0], 4);
+	if (enc != XML_CHAR_ENCODING_NONE) {
+	    xmlSwitchEncoding(ctxt, enc);
+	}
+    }
+
+
+    if (CUR == 0) {
+	xmlFatalErr(ctxt, XML_ERR_DOCUMENT_EMPTY, NULL);
+    }
+
+    /*
+     * Check for the XMLDecl in the Prolog.
+     * do not GROW here to avoid the detected encoder to decode more
+     * than just the first line, unless the amount of data is really
+     * too small to hold "<?xml version="1.0" encoding="foo"
+     */
+    if ((ctxt->input->end - ctxt->input->cur) < 35) {
+       GROW;
+    }
+    if ((CMP5(CUR_PTR, '<', '?', 'x', 'm', 'l')) && (IS_BLANK_CH(NXT(5)))) {
+
+	/*
+	 * Note that we will switch encoding on the fly.
+	 */
+	xmlParseXMLDecl(ctxt);
+	if (ctxt->errNo == XML_ERR_UNSUPPORTED_ENCODING) {
+	    /*
+	     * The XML REC instructs us to stop parsing right here
+	     */
+	    return(-1);
+	}
+	ctxt->standalone = ctxt->input->standalone;
+	SKIP_BLANKS;
+    } else {
+	ctxt->version = xmlCharStrdup(XML_DEFAULT_VERSION);
+    }
+    if ((ctxt->sax) && (ctxt->sax->startDocument) && (!ctxt->disableSAX))
+        ctxt->sax->startDocument(ctxt->userData);
+    if (ctxt->instate == XML_PARSER_EOF)
+	return(-1);
+    if ((ctxt->myDoc != NULL) && (ctxt->input != NULL) &&
+        (ctxt->input->buf != NULL) && (ctxt->input->buf->compressed >= 0)) {
+	ctxt->myDoc->compression = ctxt->input->buf->compressed;
+    }
+
+    /*
+     * The Misc part of the Prolog
+     */
+    GROW;
+    xmlParseMisc(ctxt);
+
+    /*
+     * Then possibly doc type declaration(s) and more Misc
+     * (doctypedecl Misc*)?
+     */
+    GROW;
+    if (CMP9(CUR_PTR, '<', '!', 'D', 'O', 'C', 'T', 'Y', 'P', 'E')) {
+
+	ctxt->inSubset = 1;
+	xmlParseDocTypeDecl(ctxt);
+	if (RAW == '[') {
+	    ctxt->instate = XML_PARSER_DTD;
+	    xmlParseInternalSubset(ctxt);
+	    if (ctxt->instate == XML_PARSER_EOF)
+		return(-1);
+	}
+
+	/*
+	 * Create and update the external subset.
+	 */
+	ctxt->inSubset = 2;
+	if ((ctxt->sax != NULL) && (ctxt->sax->externalSubset != NULL) &&
+	    (!ctxt->disableSAX))
+	    ctxt->sax->externalSubset(ctxt->userData, ctxt->intSubName,
+	                              ctxt->extSubSystem, ctxt->extSubURI);
+	if (ctxt->instate == XML_PARSER_EOF)
+	    return(-1);
+	ctxt->inSubset = 0;
+
+        xmlCleanSpecialAttr(ctxt);
+
+	ctxt->instate = XML_PARSER_PROLOG;
+	xmlParseMisc(ctxt);
+    }
+
+    /*
+     * Time to start parsing the tree itself
+     */
+    GROW;
+    if (RAW != '<') {
+	xmlFatalErrMsg(ctxt, XML_ERR_DOCUMENT_EMPTY,
+		       "Start tag expected, '<' not found\n");
+    } else {
+	ctxt->instate = XML_PARSER_CONTENT;
+	xmlParseElement(ctxt);
+	ctxt->instate = XML_PARSER_EPILOG;
+
+
+	/*
+	 * The Misc part at the end
+	 */
+	xmlParseMisc(ctxt);
+
+	if (RAW != 0) {
+	    xmlFatalErr(ctxt, XML_ERR_DOCUMENT_END, NULL);
+	}
+	ctxt->instate = XML_PARSER_EOF;
+    }
+
+    /*
+     * SAX: end of the document processing.
+     */
+    if ((ctxt->sax) && (ctxt->sax->endDocument != NULL))
+        ctxt->sax->endDocument(ctxt->userData);
+
+    /*
+     * Remove locally kept entity definitions if the tree was not built
+     */
+    if ((ctxt->myDoc != NULL) &&
+	(xmlStrEqual(ctxt->myDoc->version, SAX_COMPAT_MODE))) {
+	xmlFreeDoc(ctxt->myDoc);
+	ctxt->myDoc = NULL;
+    }
+
+    if ((ctxt->wellFormed) && (ctxt->myDoc != NULL)) {
+        ctxt->myDoc->properties |= XML_DOC_WELLFORMED;
+	if (ctxt->valid)
+	    ctxt->myDoc->properties |= XML_DOC_DTDVALID;
+	if (ctxt->nsWellFormed)
+	    ctxt->myDoc->properties |= XML_DOC_NSVALID;
+	if (ctxt->options & XML_PARSE_OLD10)
+	    ctxt->myDoc->properties |= XML_DOC_OLD10;
+    }
+    if (! ctxt->wellFormed) {
+	ctxt->valid = 0;
+	return(-1);
+    }
+    return(0);
+}
+xmlParseInternalSubset(xmlParserCtxtPtr ctxt) {
+    /*
+     * Is there any DTD definition ?
+     */
+    if (RAW == '[') {
+        ctxt->instate = XML_PARSER_DTD;
+        NEXT;
+	/*
+	 * Parse the succession of Markup declarations and
+	 * PEReferences.
+	 * Subsequence (markupdecl | PEReference | S)*
+	 */
+	while ((RAW != ']') && (ctxt->instate != XML_PARSER_EOF)) {
+	    const xmlChar *check = CUR_PTR;
+	    unsigned int cons = ctxt->input->consumed;
+
+	    SKIP_BLANKS;
+	    xmlParseMarkupDecl(ctxt);
+	    xmlParsePEReference(ctxt);
+
+	    /*
+	     * Pop-up of finished entities.
+	     */
+	    while ((RAW == 0) && (ctxt->inputNr > 1))
+		xmlPopInput(ctxt);
+
+	    if ((CUR_PTR == check) && (cons == ctxt->input->consumed)) {
+		xmlFatalErr(ctxt, XML_ERR_INTERNAL_ERROR,
+	     "xmlParseInternalSubset: error detected in Markup declaration\n");
+		break;
+	    }
+	}
+	if (RAW == ']') {
+	    NEXT;
+	    SKIP_BLANKS;
+	}
+    }
+
+    /*
+     * We should be at the end of the DOCTYPE declaration.
+     */
+    if (RAW != '>') {
+	xmlFatalErr(ctxt, XML_ERR_DOCTYPE_NOT_FINISHED, NULL);
+    }
+    NEXT;
+}
+xmlParseMarkupDecl(xmlParserCtxtPtr ctxt) {
+    GROW;
+    if (CUR == '<') {
+        if (NXT(1) == '!') {
+	    switch (NXT(2)) {
+	        case 'E':
+		    if (NXT(3) == 'L')
+			xmlParseElementDecl(ctxt);
+		    else if (NXT(3) == 'N')
+			xmlParseEntityDecl(ctxt);
+		    break;
+	        case 'A':
+		    xmlParseAttributeListDecl(ctxt);
+		    break;
+	        case 'N':
+		    xmlParseNotationDecl(ctxt);
+		    break;
+	        case '-':
+		    xmlParseComment(ctxt);
+		    break;
+		default:
+		    /* there is an error but it will be detected later */
+		    break;
+	    }
+	} else if (NXT(1) == '?') {
+	    xmlParsePI(ctxt);
+	}
+    }
+    /*
+     * This is only for internal subset. On external entities,
+     * the replacement is done before parsing stage
+     */
+    if ((ctxt->external == 0) && (ctxt->inputNr == 1))
+	xmlParsePEReference(ctxt);
+
+    /*
+     * Conditional sections are allowed from entities included
+     * by PE References in the internal subset.
+     */
+    if ((ctxt->external == 0) && (ctxt->inputNr > 1)) {
+        if ((RAW == '<') && (NXT(1) == '!') && (NXT(2) == '[')) {
+	    xmlParseConditionalSections(ctxt);
+	}
+    }
+
+    ctxt->instate = XML_PARSER_DTD;
+}
+xmlParseElementDecl(xmlParserCtxtPtr ctxt) {
+    const xmlChar *name;
+    int ret = -1;
+    xmlElementContentPtr content  = NULL;
+
+    /* GROW; done in the caller */
+    if (CMP9(CUR_PTR, '<', '!', 'E', 'L', 'E', 'M', 'E', 'N', 'T')) {
+	xmlParserInputPtr input = ctxt->input;
+
+	SKIP(9);
+	if (!IS_BLANK_CH(CUR)) {
+	    xmlFatalErrMsg(ctxt, XML_ERR_SPACE_REQUIRED,
+		           "Space required after 'ELEMENT'\n");
+	}
+        SKIP_BLANKS;
+        name = xmlParseName(ctxt);
+	if (name == NULL) {
+	    xmlFatalErrMsg(ctxt, XML_ERR_NAME_REQUIRED,
+			   "xmlParseElementDecl: no name for Element\n");
+	    return(-1);
+	}
+	while ((RAW == 0) && (ctxt->inputNr > 1))
+	    xmlPopInput(ctxt);
+	if (!IS_BLANK_CH(CUR)) {
+	    xmlFatalErrMsg(ctxt, XML_ERR_SPACE_REQUIRED,
+			   "Space required after the element name\n");
+	}
+        SKIP_BLANKS;
+	if (CMP5(CUR_PTR, 'E', 'M', 'P', 'T', 'Y')) {
+	    SKIP(5);
+	    /*
+	     * Element must always be empty.
+	     */
+	    ret = XML_ELEMENT_TYPE_EMPTY;
+	} else if ((RAW == 'A') && (NXT(1) == 'N') &&
+	           (NXT(2) == 'Y')) {
+	    SKIP(3);
+	    /*
+	     * Element is a generic container.
+	     */
+	    ret = XML_ELEMENT_TYPE_ANY;
+	} else if (RAW == '(') {
+	    ret = xmlParseElementContentDecl(ctxt, name, &content);
+	} else {
+	    /*
+	     * [ WFC: PEs in Internal Subset ] error handling.
+	     */
+	    if ((RAW == '%') && (ctxt->external == 0) &&
+	        (ctxt->inputNr == 1)) {
+		xmlFatalErrMsg(ctxt, XML_ERR_PEREF_IN_INT_SUBSET,
+	  "PEReference: forbidden within markup decl in internal subset\n");
+	    } else {
+		xmlFatalErrMsg(ctxt, XML_ERR_ELEMCONTENT_NOT_STARTED,
+		      "xmlParseElementDecl: 'EMPTY', 'ANY' or '(' expected\n");
+            }
+	    return(-1);
+	}
+
+	SKIP_BLANKS;
+	/*
+	 * Pop-up of finished entities.
+	 */
+	while ((RAW == 0) && (ctxt->inputNr > 1))
+	    xmlPopInput(ctxt);
+	SKIP_BLANKS;
+
+	if (RAW != '>') {
+	    xmlFatalErr(ctxt, XML_ERR_GT_REQUIRED, NULL);
+	    if (content != NULL) {
+		xmlFreeDocElementContent(ctxt->myDoc, content);
+	    }
+	} else {
+	    if (input != ctxt->input) {
+		xmlFatalErrMsg(ctxt, XML_ERR_ENTITY_BOUNDARY,
+    "Element declaration doesn't start and stop in the same entity\n");
+	    }
+
+	    NEXT;
+	    if ((ctxt->sax != NULL) && (!ctxt->disableSAX) &&
+		(ctxt->sax->elementDecl != NULL)) {
+		if (content != NULL)
+		    content->parent = NULL;
+	        ctxt->sax->elementDecl(ctxt->userData, name, ret,
+		                       content);
+		if ((content != NULL) && (content->parent == NULL)) {
+		    /*
+		     * this is a trick: if xmlAddElementDecl is called,
+		     * instead of copying the full tree it is plugged directly
+		     * if called from the parser. Avoid duplicating the
+		     * interfaces or change the API/ABI
+		     */
+		    xmlFreeDocElementContent(ctxt->myDoc, content);
+		}
+	    } else if (content != NULL) {
+		xmlFreeDocElementContent(ctxt->myDoc, content);
+	    }
+	}
+    }
+    return(ret);
+}
+xmlParseElementContentDecl(xmlParserCtxtPtr ctxt, const xmlChar *name,
+                           xmlElementContentPtr *result) {
+
+    xmlElementContentPtr tree = NULL;
+    int inputid = ctxt->input->id;
+    int res;
+
+    *result = NULL;
+
+    if (RAW != '(') {
+	xmlFatalErrMsgStr(ctxt, XML_ERR_ELEMCONTENT_NOT_STARTED,
+		"xmlParseElementContentDecl : %s '(' expected\n", name);
+	return(-1);
+    }
+    NEXT;
+    GROW;
+    if (ctxt->instate == XML_PARSER_EOF)
+        return(-1);
+    SKIP_BLANKS;
+    if (CMP7(CUR_PTR, '#', 'P', 'C', 'D', 'A', 'T', 'A')) {
+        tree = xmlParseElementMixedContentDecl(ctxt, inputid);
+	res = XML_ELEMENT_TYPE_MIXED;
+    } else {
+        tree = xmlParseElementChildrenContentDeclPriv(ctxt, inputid, 1);
+	res = XML_ELEMENT_TYPE_ELEMENT;
+    }
+    SKIP_BLANKS;
+    *result = tree;
+    return(res);
+}
+xmlParseElementMixedContentDecl(xmlParserCtxtPtr ctxt, int inputchk) {
+    xmlElementContentPtr ret = NULL, cur = NULL, n;
+    const xmlChar *elem = NULL;
+
+    GROW;
+    if (CMP7(CUR_PTR, '#', 'P', 'C', 'D', 'A', 'T', 'A')) {
+	SKIP(7);
+	SKIP_BLANKS;
+	SHRINK;
+	if (RAW == ')') {
+	    if ((ctxt->validate) && (ctxt->input->id != inputchk)) {
+		xmlValidityError(ctxt, XML_ERR_ENTITY_BOUNDARY,
+"Element content declaration doesn't start and stop in the same entity\n",
+                                 NULL, NULL);
+	    }
+	    NEXT;
+	    ret = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_PCDATA);
+	    if (ret == NULL)
+	        return(NULL);
+	    if (RAW == '*') {
+		ret->ocur = XML_ELEMENT_CONTENT_MULT;
+		NEXT;
+	    }
+	    return(ret);
+	}
+	if ((RAW == '(') || (RAW == '|')) {
+	    ret = cur = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_PCDATA);
+	    if (ret == NULL) return(NULL);
+	}
+	while ((RAW == '|') && (ctxt->instate != XML_PARSER_EOF)) {
+	    NEXT;
+	    if (elem == NULL) {
+	        ret = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_OR);
+		if (ret == NULL) return(NULL);
+		ret->c1 = cur;
+		if (cur != NULL)
+		    cur->parent = ret;
+		cur = ret;
+	    } else {
+	        n = xmlNewDocElementContent(ctxt->myDoc, NULL, XML_ELEMENT_CONTENT_OR);
+		if (n == NULL) return(NULL);
+		n->c1 = xmlNewDocElementContent(ctxt->myDoc, elem, XML_ELEMENT_CONTENT_ELEMENT);
+		if (n->c1 != NULL)
+		    n->c1->parent = n;
+	        cur->c2 = n;
+		if (n != NULL)
+		    n->parent = cur;
+		cur = n;
+	    }
+	    SKIP_BLANKS;
+	    elem = xmlParseName(ctxt);
+	    if (elem == NULL) {
+		xmlFatalErrMsg(ctxt, XML_ERR_NAME_REQUIRED,
+			"xmlParseElementMixedContentDecl : Name expected\n");
+		xmlFreeDocElementContent(ctxt->myDoc, cur);
+		return(NULL);
+	    }
+	    SKIP_BLANKS;
+	    GROW;
+	}
+	if ((RAW == ')') && (NXT(1) == '*')) {
+	    if (elem != NULL) {
+		cur->c2 = xmlNewDocElementContent(ctxt->myDoc, elem,
+		                               XML_ELEMENT_CONTENT_ELEMENT);
+		if (cur->c2 != NULL)
+		    cur->c2->parent = cur;
+            }
+            if (ret != NULL)
+                ret->ocur = XML_ELEMENT_CONTENT_MULT;
+	    if ((ctxt->validate) && (ctxt->input->id != inputchk)) {
+		xmlValidityError(ctxt, XML_ERR_ENTITY_BOUNDARY,
+"Element content declaration doesn't start and stop in the same entity\n",
+				 NULL, NULL);
+	    }
+	    SKIP(2);
+	} else {
+	    xmlFreeDocElementContent(ctxt->myDoc, ret);
+	    xmlFatalErr(ctxt, XML_ERR_MIXED_NOT_STARTED, NULL);
+	    return(NULL);
+	}
+
+    } else {
+	xmlFatalErr(ctxt, XML_ERR_PCDATA_REQUIRED, NULL);
+    }
+    return(ret);
+}
+
+
+### Additional Notes
+
+- Your code MUST generate input cases automatically because the code
+will become an integrated part of an automated system.
+
+- You MUST give the generated code in the following format, so we can
+extract the code conveniently:
+
+```Python
+{your code}
+```
+You MUST include the full valid Python script in your response.
+
+- One python code ONLY generates one case.
+
+Example of a generator
+```python
+# Some libraries that should be imported
+def case_generator(out):
+    # generative process of cases
+if **name** == **main** :
+    if(len(sys.argv)<2):
+        print("usage: python3 generator.py <output_path>")
+        sys.exit(1)
+    # Some setup codes
+    with open(sys.argv[1],'wb') as f:
+        case_generator(f)
+```

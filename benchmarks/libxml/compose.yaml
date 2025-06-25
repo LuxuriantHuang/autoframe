@@ -1,0 +1,17 @@
+services:
+  symbolic:
+    image: contest:symbolic
+    container_name: symbolic_c
+    tty: true
+    stdin_open: true
+    volumes:
+      - ${PROJECT}:/root/Project
+    # depends_on:
+    #     - web-app
+    #     - aflpp
+    environment:
+      - TARGET_ARGS=${TARGET_ARGS}
+      - FUZZING_ENGINE=symcc
+#      - LIBFUZZER_SRC=/root/Project/driver_lib/driver
+    command: >
+             bash -c "/root/init.sh; tail -f /dev/null"

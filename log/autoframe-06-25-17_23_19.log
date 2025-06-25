@@ -1,0 +1,8 @@
+2025-06-25 17:23:20,015 - AutomationFramework@__main__ - INFO - 本次运行中，input_dir：/home/lab420/Desktop/autoframe/benchmarks/libxml/in
+2025-06-25 17:23:20,015 - AutomationFramework@__main__ - INFO - 本次运行中，output_dir：benchmarks/libxml/out
+2025-06-25 17:23:20,015 - AutomationFramework@__main__ - INFO - 本次运行中，fuzzing_args：@@
+2025-06-25 17:23:20,015 - AutomationFramework@__main__ - INFO - 本次运行中，target_prog：/home/lab420/Desktop/autoframe/benchmarks/libxml/target/afl/libxml_fuzz
+2025-06-25 17:23:20,015 - AutomationFramework@__main__ - INFO - 本次运行中，trace_prog：/home/lab420/Desktop/autoframe/benchmarks/libxml/target/trace/libxml_trace
+2025-06-25 17:23:20,015 - AutomationFramework@__main__ - INFO - fuzzer已开始运行
+2025-06-25 17:23:30,953 - AutomationFramework@__main__ - INFO - 检测到用户中断(Ctrl+C)，正在终止...
+2025-06-25 17:23:30,953 - AutomationFramework@__main__ - INFO - fuzzer 已终止
