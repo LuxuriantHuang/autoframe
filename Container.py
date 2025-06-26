@@ -6,6 +6,7 @@ from config import LOGGER_NAME
 
 logger = logging.getLogger(LOGGER_NAME + __name__)
 
+
 class Container:
     def __init__(self, image_name: str, tag='latest', volume=None):
         if volume is None:
@@ -38,8 +39,9 @@ class Container:
 
     def start(self):
         if self.container_already_exist():
-            print(f'{self.container_name} already exists.')
+            logger.info(f'{self.container_name} already exists.')
             self.container = self.client.containers.get(self.container_name)
+            # self.finish()
             return
         try:
             # create and run a container from an local image
@@ -50,13 +52,13 @@ class Container:
                 command='bash -c "/root/init.sh; tail -f /dev/null"',
                 detach=True
             )
-            print(f"Container {self.container.id} started.")
+            logger.info(f"Container {self.container.id} started.")
         except docker.errors.ImageNotFound:
-            print(f"Image {self.image_name}:{self.tag} not found.")
+            logger.info(f"Image {self.image_name}:{self.tag} not found.")
             self.image_not_found = True
             exit(1)
         except docker.errors.APIError as ae:
-            print(f"APIError: {ae}")
+            logger.info(f"APIError: {ae}")
             exit(1)
 
     def run(self, cmd: str, env: dict, process_id: str):
@@ -71,14 +73,15 @@ class Container:
                 stream=True, stdout=True, stderr=True, tty=True
             )
             for output in exec_log[1]:
-                print("1111111111", "stdout_" + process_id, output.decode('utf-8').strip())
+                # print("1111111111", "stdout_" + process_id, output.decode('utf-8').strip())
                 logger.info(output.decode('utf-8').strip())
                 result_log.append(output.decode('utf-8').strip())
                 # sockets.emit("stdout_" + process_id, output.decode('utf-8').strip())
-            print(f"done")
+            # print(f"done")
 
         except docker.errors.APIError as ae:
             print(f"APIError: {ae}")
+            logger.error(f"APIError: {ae}")
             exit()
         except KeyboardInterrupt or SystemExit:
             return

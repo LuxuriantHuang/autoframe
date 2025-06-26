@@ -1,4 +1,3 @@
-import os
 import subprocess
 import tempfile
 from collections import deque
@@ -71,7 +70,7 @@ def find_all_call_chains(functions, target_id, current_chain, all_chains, visite
 
 def get_call_chain(roadblock):
     bb = next((item for item in bbs if item.get("id") == roadblock), None)
-    f = next((item for item in funcs if item.get("id") == bbs["function"]), None)
+    f = next((item for item in funcs if item.get("id") == bb["function"]), None)
     fname = f["name"]
     call_chain = get_all_call_chains(static, fname)
     return call_chain
@@ -84,9 +83,10 @@ def get_code_snippet(call_chain: list, bottleneck_id):
         file = f['file_name']
         start = f['lineStart']
         end = f['lineEnd']
-        with open(os.path.join('/', 'root', 'Project', 'src', file)) as f:
+        # with open(os.path.join('/', 'root', 'Project', 'src', file)) as f:
+        with open(Path(PROJECT_HOME) / "src" / file) as f:
             code = f.readlines()
-        function_snippet_list = code[start - 1:end]
+        function_snippet_list = code[start - 1:end + 1]
         function_snippet = ''.join(function_snippet_list)
         code_snippet += function_snippet
         if i == len(call_chain) - 1:
@@ -122,7 +122,7 @@ class CoverageTracer:
     def get_edge_count(self) -> set:
         if not SHOWMAP_PATH.exists():
             logger.error(f"afl-showmap not found at {SHOWMAP_PATH}")
-        return afl_cov(prog=self.target_prog, input_dir=self.input_dir)
+        return afl_cov(prog=self.target_prog, input_dir=self.output_dir)
 
     def check_coverage_growth(self):
         """通过滑动窗口获得瓶颈时间"""
@@ -148,7 +148,7 @@ class CoverageTracer:
         seed_lst_to_run, resume_data_to_load, last_scan_time = get_new_seeds(seed_dir, read_files, last_scan_time)
         if len(seed_lst_to_run) <= 0:
             logging.error("为什么在没有更新的情况下触发了get_trace？")
-            return False, last_scan_time, "在没有更新的情况下触发了get_trace"
+            return False, last_scan_time, "在没有更新的情况下触发了get_trace", self.info.bitmap.bitmap
         seed_tracer = SeedTracer.SeedTracer(self.trace_prog, " ".join(self.fuzzing_args))
         logger.info(f"本次添加共{len(seed_lst_to_run)}个新种子")
         for (i, seed_path) in tqdm(enumerate(seed_lst_to_run), total=len(seed_lst_to_run)):
@@ -156,7 +156,9 @@ class CoverageTracer:
             logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
             self.info.add(trace_data, bbs, "default", seed_path)
             logger.info(f"Tracer {i}: 完成种子覆盖整合")
-        return True, last_scan_time, ""
+            self.info.dump_single(seed_path)
+
+        return True, last_scan_time, "", self.info.bitmap.bitmap
 
     def get_roadblocks(self, static_path) -> list:
         if not self.cfg_loader:

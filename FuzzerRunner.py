@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 
 from config import *
@@ -24,7 +25,8 @@ class FuzzerRunner:
             *self.fuzzing_args
         ]
         logger.info(f"Fuzzer执行命令：{' '.join(cmd)}")
-        self.fuzzer_process = subprocess.Popen(cmd, env={"AFL_NO_UI":"1","AFL_QUIET":"1"})
+        self.fuzzer_process = subprocess.Popen(cmd, env={"AFL_NO_UI": "1", "AFL_QUIET": "1"}, stdout=subprocess.DEVNULL,
+                                               stderr=subprocess.DEVNULL)
         logger.info(f"fuzzer在系统中的pid：{self.fuzzer_process.pid}")
 
     def terminate(self):
@@ -48,5 +50,17 @@ class FuzzerRunner:
             return False
         return self.fuzzer_process.poll() is None
 
-    def add_seed(self):
-        pass
+    def add_seed_LLM(self, id, bid):
+        os.makedirs(LLM_TARGET_PATH, exist_ok=True)
+        n = len(os.listdir(DSE_TARGET_PATH))
+        src_file = os.path.join(LLM_TMP_PATH, f"id:{int(id):06},bid:{int(bid):06}")
+        dest_file = os.path.join(LLM_TARGET_PATH, f"id:{n + 1},bid:{int(bid):06}")
+        shutil.move(src_file, dest_file)
+
+    def add_seed_DSE(self):
+        os.makedirs(DSE_TARGET_PATH, exist_ok=True)
+        n = len(os.listdir(DSE_TARGET_PATH))
+        for i, filename in enumerate(os.listdir(DSE_TMP_PATH)):
+            src_file = os.path.join(DSE_TMP_PATH, filename)
+            dest_file = os.path.join(DSE_TARGET_PATH, f"id:{int(n + i):06}")
+            shutil.move(src_file, dest_file)

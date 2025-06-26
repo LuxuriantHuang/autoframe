@@ -1,6 +1,7 @@
 import logging
 import time
 from pathlib import Path
+
 import ujson
 
 # logger config
@@ -11,10 +12,10 @@ LOGGER_FILE_NAME = "autoframe-" + time.strftime("%m-%d-%H_%M_%S", time.localtime
 LOGGING_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 # coverage tracer config
+PWD = "/home/lab420/Desktop/autoframe"
 AFL_PATH = Path("/home/lab420/Desktop/autoframe/AFLplusplus")
 SHOWMAP_PATH = AFL_PATH / "afl-showmap"
-AFL_MAP_SHM_ENV = "__AFL_SHM_ID"
-MAP_SIZE = 18  # 通常为 64KB
+MAP_SIZE = 18
 THRESHOLD_TIME = 5  # 覆盖率无增长超过90s
 THRESHOLD_COV_DELTA = 1  # 至少需要增加 1 个 edge 才算有效增长
 CHECK_INTERVAL = 5  # 每 5 秒检查一次
@@ -35,9 +36,17 @@ FUZZER_NAME = "default"
 
 # DSE config
 DSE_SEEDS_NUM = 3
+DSE_DOCKER_TMP_PATH = "/root/Project/sym_tmp"
+DSE_TMP_PATH = PROJECT_HOME + "/sym_tmp"
+DSE_TARGET_PATH = PROJECT_HOME + "/out/symbolic/queue"
+DSE_PROGRAM = PROJECT_HOME + "/target/symbolic/target_binary"
 
 # LLM config
 MODEL = "deepseek-chat"
 API_KEY = "sk-440547e4c10e4c82b09d848a68d3b078"
-base_url = "https://api.deepseek.com"
+BASE_URL = "https://api.deepseek.com"
 MAX_TIME = 3
+LLM_TMP_PATH = PROJECT_HOME + "/llm_tmp"
+LLM_TARGET_PATH = PROJECT_HOME + "/out/LLM/queue"
+
+test = True

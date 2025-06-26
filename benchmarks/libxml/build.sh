@@ -31,6 +31,8 @@ apt update
 apt install -y locales
 locale-gen en_US.UTF-8
 update-locale LANG=en_US.UTF-8
+ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+echo "Asia/Shanghai" > /etc/timezone
 apt install liblzma-dev zlib1g-dev autoconf libtool build-essential pkg-config -y
 apt install /root/Project/automake_1.16.5-1.3_all.deb
 

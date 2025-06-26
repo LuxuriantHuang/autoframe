@@ -1,8 +1,0 @@
-# environment variables:
-AFL_CUSTOM_INFO_PROGRAM=./targets/libxml/libxml_fuzz
-AFL_CUSTOM_INFO_PROGRAM_ARGV=@@
-AFL_CUSTOM_INFO_OUT=output/libxml_test/default
-AFL_NO_UI=1
-AFL_QUIET=1
-# command line:
-'../AFLplusplus/afl-fuzz' '-i' 'seed/xml' '-o' 'output/libxml_test' '-m' 'none' '-t' '5000' '--' './targets/libxml/libxml_fuzz' '@@'
