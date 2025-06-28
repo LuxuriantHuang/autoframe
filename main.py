@@ -2,7 +2,6 @@ import os
 import random
 import re
 import traceback
-from argparse import ArgumentParser
 
 import config
 from CoverageTracer import CoverageTracer
@@ -10,7 +9,6 @@ from DSE_util import DSEUtil
 from FuzzerRunner import FuzzerRunner
 from LLM.LLM_util import LLM_util
 from config import *
-from utils import valid_path
 
 
 def setup_logger():
@@ -31,14 +29,14 @@ def setup_logger():
     logger.addHandler(console_handler)
 
 
-def parse_args():
-    parse = ArgumentParser(description="The automation framework of fuzzing with LLM and Symbolic exec")
-    parse.add_argument("-i", dest="input_dir", required=True, type=valid_path, help="init corpus path")
-    parse.add_argument("-o", dest="output_dir", required=True, type=Path, help="fuzzing output path")
-    parse.add_argument("-a", dest="fuzzing_args", required=True, type=str, help="fuzzing args")
-    parse.add_argument("-t", dest="target_prog", required=True, type=valid_path, help="program under test path")
-    parse.add_argument("-t1", dest="trace_prog", required=True, type=valid_path, help="trace program under test path")
-    return parse.parse_args()
+# def parse_args():
+#     parse = ArgumentParser(description="The automation framework of fuzzing with LLM and Symbolic exec")
+#     parse.add_argument("-i", dest="input_dir", required=True, type=valid_path, help="init corpus path")
+#     parse.add_argument("-o", dest="output_dir", required=True, type=Path, help="fuzzing output path")
+#     parse.add_argument("-a", dest="fuzzing_args", required=True, type=str, help="fuzzing args")
+#     parse.add_argument("-t", dest="target_prog", required=True, type=valid_path, help="program under test path")
+#     parse.add_argument("-t1", dest="trace_prog", required=True, type=valid_path, help="trace program under test path")
+#     return parse.parse_args()
 
 
 def handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global, trace_prog):
@@ -46,14 +44,14 @@ def handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global, trace_p
     rb_file, rb_line = tracer.get_rb_file_and_line(roadblock)
 
     for seed in random.sample(sorted(seeds), min(DSE_SEEDS_NUM, len(seeds))):
-        logs = dse_util.dse_runner(seed, rb_file, rb_line)
-        if any("New testcase" in log for log in logs):
-            # fuzzer.add_seed_DSE()
-            return True, "DSE", None
+        # logs = dse_util.dse_runner(seed, rb_file, rb_line)
+        # if any("New testcase" in log for log in logs):
+        #     # fuzzer.add_seed_DSE()
+        #     return True, "DSE", None
 
         call_chain, code_slice, bcode = tracer.get_slice(roadblock, seed)
-        seed_id = len(os.listdir(LLM_TMP_PATH))
         os.makedirs(LLM_TMP_PATH, exist_ok=True)
+        seed_id = len(os.listdir(LLM_TMP_PATH))
 
         solved, times = False, 0
         messages = None
@@ -84,7 +82,8 @@ def handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global, trace_p
 def resolve_coverage_stuck(tracer, last_scan_time, read_files):
     ret, last_scan_time, error_info, freq_global = tracer.get_trace(read_files, last_scan_time)
     if not ret:
-        raise Exception(error_info)
+        logger.fatal(error_info)
+        # raise Exception(error_info)
 
     roadblocks = tracer.get_roadblocks(STATIC_PATH)
     dse_util = DSEUtil()
@@ -97,49 +96,55 @@ def resolve_coverage_stuck(tracer, last_scan_time, read_files):
                 fuzzer.add_seed_DSE()
             else:
                 fuzzer.add_seed_LLM(id, roadblock)
-            return True  # 成功解决了一个瓶颈，返回继续运行
+            return True, last_scan_time, read_files  # 成功解决了一个瓶颈，返回继续运行
 
-    return False  # 所有瓶颈都未能解决
+    return False, last_scan_time, read_files  # 所有瓶颈都未能解决
 
 
 def main():
     global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
-    args = parse_args()
+    # args = parse_args()
     read_files = set()  # 记录已读取的文件集合
     last_scan_time = 0  # 记录上次扫描时间戳
-    input_dir = args.input_dir
-    output_dir = args.output_dir
-    fuzzing_args = args.fuzzing_args.split(sep=" ")
-    target_prog = args.target_prog
-    trace_prog = args.trace_prog
+    input_dir = os.fspath(PROJECT_HOME / "in")
+    output_dir = os.fspath(PROJECT_HOME / "out")
+    fuzzing_args = EXEC_ARGS.split(sep=" ")
+    target_prog = PROJECT_HOME / "target" / "afl" / f"{PROJECT}_fuzz"
+    trace_prog = PROJECT_HOME / "target" / "trace" / f"{PROJECT}_trace"
+    # input_dir = args.input_dir
+    # output_dir = args.output_dir
+    # fuzzing_args = args.fuzzing_args.split(sep=" ")
+    # target_prog = args.target_prog
+    # trace_prog = args.trace_prog
     logger.info(f"本次运行中，input_dir：{input_dir}")
     logger.info(f"本次运行中，output_dir：{output_dir}")
-    logger.info(f"本次运行中，fuzzing_args：{args.fuzzing_args}")
+    logger.info(f"本次运行中，fuzzing_args：{EXEC_ARGS}")
     logger.info(f"本次运行中，target_prog：{target_prog}")
     logger.info(f"本次运行中，trace_prog：{trace_prog}")
-    fuzzer = FuzzerRunner(input_dir, output_dir, target_prog, fuzzing_args)
-    if not config.test:
+    with FuzzerRunner(input_dir, output_dir, target_prog, fuzzing_args) as fuzzer:
+        # if not config.test:
         fuzzer.run()
         logger.info("fuzzer已开始运行")
-    try:
-        tracer = CoverageTracer(input_dir, output_dir, fuzzing_args, target_prog, trace_prog, bbs, funcs)
-        while True:
-            stuck_time = tracer.check_coverage_growth()
-            if stuck_time < THRESHOLD_TIME:
-                time.sleep(CHECK_INTERVAL)
-                continue
-            success = resolve_coverage_stuck(tracer, last_scan_time, read_files)
-            if success:
-                continue
-    except KeyboardInterrupt:
-        logger.info("检测到用户中断(Ctrl+C)，正在终止...")
-    except Exception as e:
-        logger.exception(e)
-        traceback.print_exc()
-    finally:
-        if not config.test:
-            fuzzer.terminate()
-            logger.info("fuzzer 已终止")
+        time.sleep(1)  # 尚未生成种子，需要缓冲时间
+        try:
+            tracer = CoverageTracer(input_dir, output_dir, fuzzing_args, target_prog, trace_prog, bbs, funcs)
+            while True:
+                stuck_time = tracer.check_coverage_growth()
+                if stuck_time < THRESHOLD_TIME:
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                success, last_scan_time, read_files = resolve_coverage_stuck(tracer, last_scan_time, read_files)
+                if success:
+                    continue
+        except KeyboardInterrupt:
+            logger.info("检测到用户中断(Ctrl+C)，正在终止...")
+        except Exception as e:
+            logger.exception(e)
+            traceback.print_exc()
+        finally:
+            if not config.test:
+                fuzzer.terminate()
+                logger.info("fuzzer 已终止")
 
 
 setup_logger()

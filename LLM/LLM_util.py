@@ -1,12 +1,11 @@
 import logging
-import logging
 import os
 import re
 import subprocess
+from pathlib import Path
 
 from openai import OpenAI
 
-import config
 from config import LOGGER_NAME, PROJECT_HOME, LLM_TMP_PATH, EXEC_ARGS, bbs, funcs
 from pyTracer.CodeHeat import CodeHeat
 from pyTracer.InfoProcessor import Bitmap
@@ -39,6 +38,7 @@ Lets take a deep breath and think step by step. Please show your thoughts in eac
 Instructions:
 - For necessary operation results, please use inverse operation instead of using the result.
 - One python code ONLY generates one case.
+- No need for mutating the seed, just give the direct answer that satisfies the constraints in the code.
 
 
 Example generator:
@@ -86,7 +86,7 @@ def run_generator(generator, bottleneck_id, id):
         )
         return result.stdout, result.stderr, new_seed_id
     except Exception as e:
-        print(f"运行generator代码的子线程异常: {e}")
+        logger.error(f"运行generator代码的子线程异常: {e}")
         return None
 
 
@@ -97,23 +97,23 @@ class LLM_util:
         pass
 
     def solve(self, call_chain, code_slice, roadblock_code, roadblock_id, seedid, info, messages):
-        if not config.test:
-            prompt = construct_prompt_generator(call_chain, code_slice, roadblock_code)
-            logger.info(f"prompt如下：{prompt}")
+        # if not config.test:
+        prompt = construct_prompt_generator(call_chain, code_slice, roadblock_code)
+        logger.info(f"prompt如下：{prompt}")
 
-            print("start generate python script", flush=True)
-            response, messages = self.generate_seed(prompt, info, messages)
-            logger.info(f"response如下：{response}")
-            print("extracting python script", flush=True)
-            generator = extract_generator(response)
-        else:
-            with open(os.path.join(PROJECT_HOME, "generator.py"), "r", encoding="utf-8") as f:
-                generator = f.read()
+        logger.info("start generate python script")
+        response, messages = self.generate_seed(prompt, info, messages)
+        logger.info(f"response如下：{response}")
+        logger.info("extracting python script")
+        generator = extract_generator(response)
+        # else:
+        #     with open(os.path.join(PROJECT_HOME, "generator.py"), "r", encoding="utf-8") as f:
+        #         generator = f.read()
         # generator = None
-        print("running python script", flush=True)
+        logger.info("running python script")
         out, err, new_seed_path = run_generator(generator, roadblock_id, seedid)
         while err:
-            print("fixing python scripts", flush=True)
+            logger.info("fixing python scripts")
             response = self.fix_generator(generator, messages, err)
             generator = extract_generator(response)
             out, err, new_seed_path = run_generator(generator, roadblock_id, seedid)
@@ -127,7 +127,7 @@ class LLM_util:
             messages.append({"role": "user", "content": info})
 
         try:
-            print("chatting with llm", flush=True)
+            logger.info("chatting with llm")
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -135,7 +135,7 @@ class LLM_util:
                 stream=False,
                 temperature=0
             )
-            print("end chat", flush=True)
+            logger.info("end chat")
             # response = client.ChatCompletion.create(
             #     model="deepseek-chat",
             #     messages=messages,
@@ -184,14 +184,14 @@ class LLM_util:
             })
 
         try:
-            print("fixing with LLM", flush=True)
+            logger.info("fixing with LLM")
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=message,
                 temperature=0,
                 max_tokens=8192
             )
-            print("end fixing", flush=True)
+            logger.info("end fixing")
             assistant_message = response.choices[0].message
             message.append(assistant_message)
             fix_text = assistant_message.content.strip()
@@ -217,7 +217,7 @@ class LLM_util:
         })
 
         try:
-            print("improving generator", flush=True)
+            logger.info("improving generator")
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
@@ -249,7 +249,7 @@ class LLM_util:
         })
 
         try:
-            print("improving generator", flush=True)
+            logger.info("improving generator")
             # print(prompt_template)
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -282,9 +282,9 @@ class LLM_util:
         bottleneck_next = bb_static[int(bid)]
         successor = bottleneck_next['successors']
         if len(successor) != 2:
-            print("skip")
+            # print("skip")
             return True, bb_data
-        print(successor[0], successor[1])
+        # print(successor[0], successor[1])
         bitmap = Bitmap()
         bitmap.merge({"seed": seed_id, "info": trace_data})
         bb_freq1 = bitmap.bitmap
@@ -316,7 +316,7 @@ class LLM_util:
             start = f['lineStart']
             end = f['lineEnd']
             fid = f['id']
-            with open(os.path.join('/', 'root', 'Project', 'src', filename)) as f:
+            with open(Path(PROJECT_HOME) / "src" / filename) as f:
                 code = [line.rstrip('\n') for line in f.readlines()]
             file_heat = code_heat.code_heat[filename]
             # print(code)
@@ -333,7 +333,7 @@ class LLM_util:
         f = next((item for item in funcs if item.get("id") == bb["function"]), None)
         filename = f["file_name"]
         fname = f['name']
-        with open(os.path.join('/', 'root', 'Project', 'src', filename)) as f:
+        with open(Path(PROJECT_HOME) / "src" / filename) as f:
             code = [line.rstrip('\n') for line in f.readlines()]
         bottleneck_code = code[bb['lineEnd'] - 1]
         if len(not_exec_bid) > 1:

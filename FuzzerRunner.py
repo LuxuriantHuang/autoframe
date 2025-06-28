@@ -16,6 +16,9 @@ class FuzzerRunner:
         self.fuzzing_args = fuzzing_args
         self.fuzzer_process = None
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.terminate()
+
     def run(self):
         cmd = [
             os.fspath(AFL_PATH / "afl-fuzz"),
@@ -52,9 +55,9 @@ class FuzzerRunner:
 
     def add_seed_LLM(self, id, bid):
         os.makedirs(LLM_TARGET_PATH, exist_ok=True)
-        n = len(os.listdir(DSE_TARGET_PATH))
+        n = len(os.listdir(LLM_TARGET_PATH))
         src_file = os.path.join(LLM_TMP_PATH, f"id:{int(id):06},bid:{int(bid):06}")
-        dest_file = os.path.join(LLM_TARGET_PATH, f"id:{n + 1},bid:{int(bid):06}")
+        dest_file = os.path.join(LLM_TARGET_PATH, f"id:{int(n):06},bid:{int(bid):06}")
         shutil.move(src_file, dest_file)
 
     def add_seed_DSE(self):

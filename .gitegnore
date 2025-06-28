@@ -1,3 +1,4 @@
 ./libxml
 ./libxml2
 ./benchmarks_old
+./log

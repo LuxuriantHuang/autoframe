@@ -1,8 +1,5 @@
+import re
 import subprocess
-import tempfile
-from collections import deque
-
-from tqdm import tqdm
 
 from config import *
 from pyTracer import SeedTracer, InfoProcessor, cfg_loader
@@ -11,17 +8,49 @@ logger = logging.getLogger(LOGGER_NAME + __name__)
 
 
 def afl_cov(prog, input_dir):
-    with tempfile.NamedTemporaryFile() as f:
-        cov_file = f.name
-        cmd = [SHOWMAP_PATH, '-q', '-i', input_dir, '-o', cov_file, '-m', 'none', '-t', '5000', '-C', '--', prog, '@@']
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env={'AFL_QUIET': '1'}
-        )
-        with open(cov_file, 'r') as f:
-            return set(l.strip() for l in f)
+    cmd = [
+        SHOWMAP_PATH,
+        "-q", "-i", Path(input_dir) / "default" / "queue",
+        "-o", "/dev/null",
+        "-m", "none",
+        "-C",
+        "--", prog, "@@"
+    ]
+
+    # 执行命令
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,  # 忽略错误输出
+        text=True
+    )
+
+    output = result.stdout
+    # logger.info(f"afl-showmap 输出: {output}")
+
+    # 正则匹配关键指标
+    captured_match = re.search(r"coverage of (\d+) edges were achieved out of (\d+)", output)
+    percent_match = re.search(r"\(([\d.]+)%\)", output)
+
+    if not captured_match or not percent_match:
+        raise ValueError("无法从 afl-showmap 输出中提取覆盖率信息")
+
+    captured = int(captured_match.group(1))
+    # total = int(captured_match.group(2))
+    # percent = float(percent_match.group(1))
+
+    return captured
+    # with tempfile.NamedTemporaryFile() as f:
+    #     cov_file = f.name
+    #     cmd = [SHOWMAP_PATH, '-q', '-i', input_dir, '-o', cov_file, '-m', 'none', '-C', '--', prog, '@@']
+    #     subprocess.run(
+    #         cmd,
+    #         stdout=subprocess.DEVNULL,
+    #         stderr=subprocess.DEVNULL,
+    #         env={'AFL_QUIET': '1'}
+    #     )
+    #     with open(cov_file, 'r') as f1:
+    #         return set(line.strip() for line in f1)
 
 
 def get_all_call_chains(data, target_function_name):
@@ -96,16 +125,6 @@ def get_code_snippet(call_chain: list, bottleneck_id):
 
 class CoverageTracer:
     def __init__(self, input_dir, output_dir, fuzzing_args, target_prog, trace_prog, bb, func):
-        # self.shm_id = os.getenv(AFL_MAP_SHM_ENV)
-        # if not self.shm_id:
-        #     logger.error(f"环境变量${AFL_MAP_SHM_ENV}未配置，请先运行AFL再进行配置")
-        #     raise EnvironmentError(f"环境变量${AFL_MAP_SHM_ENV}未配置，请先运行AFL再进行配置")
-        # self.shm_id = int(self.shm_id)
-        # logger.info(f"共享内存id：${self.shm_id}")
-
-        # self.map = sysv_ipc.SharedMemory(self.shm_id)
-
-        self.coverage_history = deque(maxlen=WINDOW_SIZE)
         self.last_coverage = 0
         self.last_growth_time = time.time()
 
@@ -119,7 +138,7 @@ class CoverageTracer:
         self.func = func
         self.cfg_loader = None
 
-    def get_edge_count(self) -> set:
+    def get_edge_count(self):
         if not SHOWMAP_PATH.exists():
             logger.error(f"afl-showmap not found at {SHOWMAP_PATH}")
         return afl_cov(prog=self.target_prog, input_dir=self.output_dir)
@@ -127,36 +146,44 @@ class CoverageTracer:
     def check_coverage_growth(self):
         """通过滑动窗口获得瓶颈时间"""
         # 需要调用get_edge_count获得当前瓶颈，并利用时间基本单位返回统计的瓶颈时间(s)
-        cov = self.get_edge_count()
-        current_coverage = len(cov)
+        current_coverage = self.get_edge_count()
+        # logger.info(f"当前覆盖率: {current_coverage}")
+        # current_coverage = len(cov)
         growth = current_coverage - self.last_coverage
         now = time.time()
-        self.coverage_history.append((now, current_coverage))
-        if growth > THRESHOLD_COV_DELTA:
+        if growth >= THRESHOLD_COV_DELTA:
             logger.info(f"覆盖率增加到 {current_coverage} (新增 {growth} 条路径)")
             self.last_coverage = current_coverage
             self.last_growth_time = now
             return 0
         else:
             stagnation_time = now - self.last_growth_time
-            logger.debug(f"无增长时间: {stagnation_time:.1f}s")
+            logger.info(f"无增长时间: {stagnation_time:.1f}s")
             return stagnation_time
 
     def get_trace(self, read_files: set, last_scan_time: int):  # 后续修改为多进程
         st = time.time()
-        seed_dir = Path.joinpath(self.output_dir, FUZZER_NAME, "queue")
+        seed_dir = Path.joinpath(Path(self.output_dir), FUZZER_NAME, "queue")
         seed_lst_to_run, resume_data_to_load, last_scan_time = get_new_seeds(seed_dir, read_files, last_scan_time)
         if len(seed_lst_to_run) <= 0:
-            logging.error("为什么在没有更新的情况下触发了get_trace？")
-            return False, last_scan_time, "在没有更新的情况下触发了get_trace", self.info.bitmap.bitmap
+            logging.error("为什么在没有更新seed的情况下触发了get_trace？")
+            return False, last_scan_time, "在没有seed更新的情况下触发了get_trace", self.info.bitmap.bitmap
         seed_tracer = SeedTracer.SeedTracer(self.trace_prog, " ".join(self.fuzzing_args))
         logger.info(f"本次添加共{len(seed_lst_to_run)}个新种子")
-        for (i, seed_path) in tqdm(enumerate(seed_lst_to_run), total=len(seed_lst_to_run)):
-            trace_data, retcode = seed_tracer.trace_seed(str(seed_path), TIMEOUT)
-            logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
-            self.info.add(trace_data, bbs, "default", seed_path)
-            logger.info(f"Tracer {i}: 完成种子覆盖整合")
-            self.info.dump_single(seed_path)
+        # for (i, seed_path) in tqdm(enumerate(seed_lst_to_run), total=len(seed_lst_to_run)):
+        # tasks = []
+        # for (i, seed_path) in enumerate(seed_lst_to_run):
+        #     if i % 100 == 0 or i == len(seed_lst_to_run) - 1:
+        #         logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
+        #     trace_data, retcode = seed_tracer.trace_seed(str(seed_path), TIMEOUT)
+        #     tasks.append((trace_data, "default", seed_path))
+
+        self.info.parallel_add(seed_lst_to_run, seed_tracer, 32)
+
+        # logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
+        # self.info.add(trace_data, bbs, "default", seed_path)
+        # logger.info(f"Tracer {i}: 完成种子覆盖整合")
+        # self.info.dump_single(seed_path)
 
         return True, last_scan_time, "", self.info.bitmap.bitmap
 
@@ -198,11 +225,6 @@ def get_new_seeds(directory, read_files, last_scan_time):  # 添加去数据库�
             ''' last scan time and read_files should not influence by resume data'''
             last_scan_time = max(last_scan_time, file_path.stat().st_mtime)
             read_files.add(file_path)
-            # if rerun == False:
-            #     resume_data_dir = Path.joinpath(Path(OUTPUT_PATH), "single", file_path.name)
-            #     if resume_data_dir.exists() and check_resume_data(resume_data_dir):
-            #         files_to_load.append(resume_data_dir)
-            #         continue
             files_to_run.append(file_path)
 
     return files_to_run, files_to_load, last_scan_time
