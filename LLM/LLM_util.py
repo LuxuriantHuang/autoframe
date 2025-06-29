@@ -99,11 +99,14 @@ class LLM_util:
     def solve(self, call_chain, code_slice, roadblock_code, roadblock_id, seedid, info, messages):
         # if not config.test:
         prompt = construct_prompt_generator(call_chain, code_slice, roadblock_code)
-        logger.info(f"prompt如下：{prompt}")
+        # logger.info(f"prompt如下：{prompt}")
 
         logger.info("start generate python script")
         response, messages = self.generate_seed(prompt, info, messages)
-        logger.info(f"response如下：{response}")
+        if "Error generating seed" in response:
+            logger.error(response)
+
+        # logger.info(f"response如下：{response}")
         logger.info("extracting python script")
         generator = extract_generator(response)
         # else:
@@ -114,37 +117,34 @@ class LLM_util:
         out, err, new_seed_path = run_generator(generator, roadblock_id, seedid)
         while err:
             logger.info("fixing python scripts")
-            response = self.fix_generator(generator, messages, err)
+            response, _ = self.fix_generator(generator, messages, err)
+            if "Error fixing generator" in response:
+                continue
             generator = extract_generator(response)
             out, err, new_seed_path = run_generator(generator, roadblock_id, seedid)
 
         return out, err, new_seed_path, messages
 
+    def get_response(self, messages, temperature=0):
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=False,
+            temperature=temperature
+        )
+        return completion
+
     def generate_seed(self, prompt, info, messages):
         if messages is None:
             messages = [{"role": "user", "content": prompt}]
-        else:
-            messages.append({"role": "user", "content": info})
 
         try:
             logger.info("chatting with llm")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=8192,
-                stream=False,
-                temperature=0
-            )
+            response = self.get_response(messages)
             logger.info("end chat")
-            # response = client.ChatCompletion.create(
-            #     model="deepseek-chat",
-            #     messages=messages,
-            #     max_tokens=8192
-            # )
 
-            assistant_message = response.choices[0].message
-            messages.append(assistant_message)
-            seed = assistant_message.content.strip()
+            seed = response.choices[0].message.content
+            messages.append({"role": "assistant", "content": seed})
 
             return seed, messages
 
@@ -185,17 +185,11 @@ class LLM_util:
 
         try:
             logger.info("fixing with LLM")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=message,
-                temperature=0,
-                max_tokens=8192
-            )
+            response = self.get_response(message)
             logger.info("end fixing")
-            assistant_message = response.choices[0].message
-            message.append(assistant_message)
-            fix_text = assistant_message.content.strip()
-            return fix_text
+            assistant_message = response.choices[0].message.content
+            message.append({"role": "assistant", "content": assistant_message})
+            return assistant_message, message
 
         except Exception as e:
             return f"Error fixing generator: {str(e)}", message
@@ -218,15 +212,11 @@ class LLM_util:
 
         try:
             logger.info("improving generator")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                # temperature=0.3,
-                max_tokens=8192
-            )
+            response = self.get_response(messages)
 
             assistant_message = response.choices[0].message
-            messages.append(assistant_message)
+            improve_text = assistant_message.content
+            messages.append({"role": "assistant", "content": improve_text})
             # improve_text = assistant_message.content.strip()
             # return improve_text
             return messages
@@ -251,15 +241,10 @@ class LLM_util:
         try:
             logger.info("improving generator")
             # print(prompt_template)
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=1,
-                max_tokens=8192
-            )
+            response = self.get_response(messages, 1)
 
-            assistant_message = response.choices[0].message
-            messages.append(assistant_message)
+            assistant_message = response.choices[0].message.content
+            messages.append({"role": "assistant", "content": assistant_message})
             # improve_text = assistant_message.content.strip()
             # return improve_text
 
@@ -283,7 +268,7 @@ class LLM_util:
         successor = bottleneck_next['successors']
         if len(successor) != 2:
             # print("skip")
-            return True, bb_data
+            return True, bb_data, []
         # print(successor[0], successor[1])
         bitmap = Bitmap()
         bitmap.merge({"seed": seed_id, "info": trace_data})
@@ -309,7 +294,6 @@ class LLM_util:
         function_coverage = ""
         code_heat = CodeHeat()
         code_heat.merge(execution_path, bbs)
-        # print(code_heat.code_heat)
         for fname in call_chain:
             f = next((item for item in funcs if item.get("name") == fname), None)
             filename = f['file_name']

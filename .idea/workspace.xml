@@ -4,12 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a455882d-2ad5-46d1-b0e7-3a1d36f8b2a7" name="更改" comment="update basic code of dse and llm">
+    <list default="true" id="a455882d-2ad5-46d1-b0e7-3a1d36f8b2a7" name="更改" comment="fix some bugs">
       <change beforePath="$PROJECT_DIR$/.afl-showmap-temp-4066925" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.gitegnore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitegnore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/Container.py" beforeDir="false" afterPath="$PROJECT_DIR$/Container.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/CoverageTracer.py" beforeDir="false" afterPath="$PROJECT_DIR$/CoverageTracer.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/FuzzerRunner.py" beforeDir="false" afterPath="$PROJECT_DIR$/FuzzerRunner.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/LLM/LLM_util.py" beforeDir="false" afterPath="$PROJECT_DIR$/LLM/LLM_util.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/benchmarks/libxml/static/bottlenecks.json" beforeDir="false" afterPath="$PROJECT_DIR$/benchmarks/libxml/static/bottlenecks.json" afterDir="false" />
@@ -86,7 +83,7 @@
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
-    "Python.main.executor": "Debug",
+    "Python.main.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
     "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager": "true",
     "SHARE_PROJECT_CONFIGURATION_FILES": "true",
@@ -115,9 +112,9 @@
       <window_info id="Commit_Guest" show_stripe_button="false" />
       <window_info id="Pull Requests" show_stripe_button="false" />
       <window_info id="Learn" show_stripe_button="false" />
-      <window_info content_ui="combo" id="Project" order="0" sideWeight="0.50074625" weight="0.2878418" />
-      <window_info active="true" id="Commit" order="1" visible="true" weight="0.2878418" />
-      <window_info id="Structure" order="2" side_tool="true" weight="0.25" />
+      <window_info active="true" content_ui="combo" id="Project" order="0" sideWeight="0.50074625" visible="true" weight="0.16674805" />
+      <window_info id="Commit" order="1" weight="0.2878418" />
+      <window_info active="true" id="Structure" order="2" sideWeight="0.49925375" side_tool="true" visible="true" weight="0.16674805" />
       <window_info x="343" y="200" width="1032" height="603" id="Find" order="3" sideWeight="0.49925375" side_tool="true" type="FLOATING" weight="0.22827148" />
       <window_info anchor="bottom" id="Database Changes" show_stripe_button="false" />
       <window_info anchor="bottom" id="TypeScript" show_stripe_button="false" />
@@ -126,14 +123,15 @@
       <window_info anchor="bottom" id="Version Control" order="0" />
       <window_info anchor="bottom" id="Problems" order="1" />
       <window_info anchor="bottom" id="Problems View" order="2" weight="0.48777175" />
-      <window_info active="true" anchor="bottom" id="Terminal" order="3" visible="true" weight="0.29846013" />
+      <window_info anchor="bottom" id="Terminal" order="3" weight="0.34103262" />
       <window_info anchor="bottom" id="Services" order="4" />
       <window_info anchor="bottom" id="Python Packages" order="5" weight="0.29393116" />
-      <window_info anchor="bottom" id="Debug" order="6" weight="0.29846013" />
+      <window_info active="true" anchor="bottom" id="Debug" order="6" visible="true" weight="0.33016306" />
       <window_info anchor="bottom" id="TODO" order="7" weight="0.29393116" />
       <window_info anchor="bottom" id="Python Console" order="8" weight="0.29393116" />
-      <window_info anchor="bottom" id="Run" order="9" weight="0.29846013" />
+      <window_info active="true" anchor="bottom" id="Run" order="9" visible="true" weight="0.33016306" />
       <window_info anchor="right" id="Endpoints" show_stripe_button="false" />
+      <window_info anchor="right" id="documentation.v2" side_tool="true" />
       <window_info anchor="right" id="Coverage" show_stripe_button="false" side_tool="true" />
       <window_info anchor="right" id="SciView" show_stripe_button="false" />
       <window_info anchor="right" id="Jupyter Variables" side_tool="true" />
@@ -225,7 +223,10 @@
       <workItem from="1751009293089" duration="886000" />
       <workItem from="1751095215240" duration="36000" />
       <workItem from="1751095257627" duration="896000" />
-      <workItem from="1751096253531" duration="6217000" />
+      <workItem from="1751096253531" duration="18317000" />
+      <workItem from="1751121332934" duration="1310000" />
+      <workItem from="1751122665945" duration="3437000" />
+      <workItem from="1751127051641" duration="7129000" />
     </task>
     <task id="LOCAL-00001" summary="implementation of cov trace">
       <option name="closed" value="true" />
@@ -259,7 +260,15 @@
       <option name="project" value="LOCAL" />
       <updated>1750939341093</updated>
     </task>
-    <option name="localTasksCounter" value="5" />
+    <task id="LOCAL-00005" summary="fix some bugs">
+      <option name="closed" value="true" />
+      <created>1751102479408</created>
+      <option name="number" value="00005" />
+      <option name="presentableId" value="LOCAL-00005" />
+      <option name="project" value="LOCAL" />
+      <updated>1751102479408</updated>
+    </task>
+    <option name="localTasksCounter" value="6" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -270,37 +279,58 @@
     <MESSAGE value="implementation of cov trace" />
     <MESSAGE value="update basic code of dse and llm" />
     <MESSAGE value="finish basic function" />
-    <option name="LAST_COMMIT_MESSAGE" value="finish basic function" />
+    <MESSAGE value="fix some bugs" />
+    <option name="LAST_COMMIT_MESSAGE" value="fix some bugs" />
     <option name="OPTIMIZE_IMPORTS_BEFORE_PROJECT_COMMIT" value="true" />
     <option name="REFORMAT_BEFORE_PROJECT_COMMIT" value="true" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>
       <breakpoints>
-        <line-breakpoint suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/main.py</url>
-          <line>126</line>
-          <option name="timeStamp" value="36" />
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>232</line>
+          <option name="timeStamp" value="49" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/main.py</url>
-          <line>56</line>
-          <option name="timeStamp" value="42" />
-        </line-breakpoint>
-        <line-breakpoint suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/main.py</url>
-          <line>49</line>
-          <option name="timeStamp" value="43" />
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>203</line>
+          <option name="timeStamp" value="50" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/main.py</url>
-          <line>63</line>
-          <option name="timeStamp" value="46" />
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>160</line>
+          <option name="timeStamp" value="51" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>137</line>
+          <option name="timeStamp" value="52" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>152</line>
+          <option name="timeStamp" value="53" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>328</line>
+          <option name="timeStamp" value="56" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>213</line>
+          <option name="timeStamp" value="57" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>108</line>
+          <option name="timeStamp" value="58" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/autoframe$main.coverage" NAME="main 覆盖结果" MODIFIED="1751100811494" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/autoframe$main.coverage" NAME="main 覆盖结果" MODIFIED="1751129424753" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>

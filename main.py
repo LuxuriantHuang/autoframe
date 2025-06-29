@@ -3,7 +3,6 @@ import random
 import re
 import traceback
 
-import config
 from CoverageTracer import CoverageTracer
 from DSE_util import DSEUtil
 from FuzzerRunner import FuzzerRunner
@@ -58,6 +57,9 @@ def handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global, trace_p
         while not solved and times < MAX_TIME:
             out, err, new_seed_path, messages = llm_util.solve(call_chain, code_slice, bcode, roadblock, seed_id, None,
                                                                messages)
+            if err:
+                messages = None
+                continue
             match = re.match(r"id:(\d+),bid:(\d+)", Path(new_seed_path).name)
             if not match:
                 raise ValueError("Invalid seed name format")
@@ -76,7 +78,7 @@ def handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global, trace_p
             logger.info(f"Bottleneck {roadblock} is resolved.")
             return True, "LLM", id
 
-    return False
+    return False, "", 0
 
 
 def resolve_coverage_stuck(tracer, last_scan_time, read_files):
@@ -121,30 +123,31 @@ def main():
     logger.info(f"本次运行中，fuzzing_args：{EXEC_ARGS}")
     logger.info(f"本次运行中，target_prog：{target_prog}")
     logger.info(f"本次运行中，trace_prog：{trace_prog}")
-    with FuzzerRunner(input_dir, output_dir, target_prog, fuzzing_args) as fuzzer:
-        # if not config.test:
-        fuzzer.run()
-        logger.info("fuzzer已开始运行")
-        time.sleep(1)  # 尚未生成种子，需要缓冲时间
-        try:
-            tracer = CoverageTracer(input_dir, output_dir, fuzzing_args, target_prog, trace_prog, bbs, funcs)
-            while True:
-                stuck_time = tracer.check_coverage_growth()
-                if stuck_time < THRESHOLD_TIME:
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-                success, last_scan_time, read_files = resolve_coverage_stuck(tracer, last_scan_time, read_files)
-                if success:
-                    continue
-        except KeyboardInterrupt:
-            logger.info("检测到用户中断(Ctrl+C)，正在终止...")
-        except Exception as e:
-            logger.exception(e)
-            traceback.print_exc()
-        finally:
-            if not config.test:
-                fuzzer.terminate()
-                logger.info("fuzzer 已终止")
+    # with FuzzerRunner(input_dir, output_dir, target_prog, fuzzing_args) as fuzzer:
+    fuzzer = FuzzerRunner(input_dir, output_dir, target_prog, fuzzing_args)
+    # if not config.test:
+    fuzzer.run()
+    logger.info("fuzzer已开始运行")
+    time.sleep(1)  # 尚未生成种子，需要缓冲时间
+    try:
+        tracer = CoverageTracer(input_dir, output_dir, fuzzing_args, target_prog, trace_prog, bbs, funcs)
+        while True:
+            stuck_time = tracer.check_coverage_growth()
+            if stuck_time < THRESHOLD_TIME:
+                time.sleep(CHECK_INTERVAL)
+                continue
+            success, last_scan_time, read_files = resolve_coverage_stuck(tracer, last_scan_time, read_files)
+            if success:
+                continue
+    except KeyboardInterrupt:
+        logger.info("检测到用户中断(Ctrl+C)，正在终止...")
+    except Exception as e:
+        logger.exception(e)
+        traceback.print_exc()
+    # finally:
+    #     if not config.test:
+    # fuzzer.terminate()
+    # logger.info("fuzzer 已终止")
 
 
 setup_logger()

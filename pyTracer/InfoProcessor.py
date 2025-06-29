@@ -4,8 +4,6 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
-import numpy as np
-
 from config import *
 
 logger = logging.getLogger(LOGGER_NAME + __name__)
@@ -13,7 +11,8 @@ logger = logging.getLogger(LOGGER_NAME + __name__)
 
 class Bitmap:
     def __init__(self) -> None:
-        self.bitmap = np.zeros((1 << MAP_SIZE), dtype=np.int32)
+        # self.bitmap = np.zeros((1 << MAP_SIZE), dtype=np.int32)
+        self.bitmap = defaultdict(int)
         # self.bb_hit_count = 0
         # self.branch_hit_count = 0
         # self.branch_ids = defaultdict(int)
@@ -37,7 +36,9 @@ class Bitmap:
     def merge_corpus(self, other: 'Bitmap'):
         # self.bb_hit_count += other.bb_hit_count
         # self.branch_hit_count += other.branch_hit_count
-        self.bitmap = self.bitmap + other.bitmap
+        # self.bitmap = self.bitmap + other.bitmap
+        for bb_id, count in other.bitmap.items():
+            self.bitmap[bb_id] += count
         # for k, v in other.branch_ids.items():
         #     self.branch_ids[k] = v if k not in self.branch_ids else self.branch_ids[k] + v
 
@@ -65,44 +66,6 @@ class HitSeed:
     def merge_corpus(self, other: 'HitSeed'):
         for bb_id, filenames in other.hit_seed.items():
             self.hit_seed[bb_id].update(filenames)
-        # for k1, file_content in other.hit_seed.items():
-        #     if k1 not in self.hit_seed:
-        #         self.hit_seed[k1] = file_content
-        #         continue
-        #     for k2, line_seed_list in file_content.items():
-        #         if k2 not in self.hit_seed[k1]:
-        #             self.hit_seed[k1][k2] = line_seed_list
-        #             continue
-        #         self.hit_seed[k1][k2] = list(set(self.hit_seed[k1][k2]) | set(line_seed_list))
-
-
-class CodeHeat:
-    def __init__(self) -> None:
-        self.code_heat = defaultdict()  # dict[str][str] = int
-
-    def merge(self, other, basic_block, batch_size=50):
-        _, seed_info = other.values()
-        for bb in seed_info['basic_blocks']:
-            start = basic_block[bb["id"]]["lineStart"]
-            end = basic_block[bb["id"]]["lineEnd"]
-            if start == 0 or end == 0:
-                continue
-            for line in range(start, end + 1):
-                name = bb['name']
-                if name not in self.code_heat:
-                    self.code_heat[name] = defaultdict(int)
-                if line not in self.code_heat[name]:
-                    self.code_heat[name][line] = 0
-                self.code_heat[bb['name']][line] += 1
-
-    def merge_corpus(self, other: 'CodeHeat'):
-        for k1, file_content in other.code_heat.items():
-            if k1 not in self.code_heat:
-                self.code_heat[k1] = file_content
-                continue
-            for k2, line_hit_count in file_content.items():
-                self.code_heat[k1][k2] = line_hit_count if k2 not in self.code_heat[k1] else self.code_heat[k1][
-                                                                                                 k2] + line_hit_count
 
 
 class InfoProcesser:
@@ -133,9 +96,9 @@ class InfoProcesser:
         if trace_data:
             local_bitmap.merge(new_info)
             local_hitseed.merge(new_info)
-            block_freq = {"freq": self._bitmap.bitmap.tolist()}
-            with open(Path.joinpath(dir_path, 'block_freq.json'), 'w') as f:
-                ujson.dump(block_freq, f)
+            # block_freq = {"freq": self._bitmap.bitmap}
+            # with open(Path.joinpath(dir_path, 'block_freq.json'), 'w') as f:
+            #     ujson.dump(block_freq, f)
 
         return local_bitmap, local_hitseed
 
@@ -146,8 +109,10 @@ class InfoProcesser:
         #         logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
         #     trace_data, retcode = seed_tracer.trace_seed(str(seed_path), TIMEOUT)
         #     tasks.append((trace_data, "default", seed_path))
+        local_bitmaps = []
+        local_hitseeds = []
+        futures = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
             for (i, seed_path) in enumerate(seed_lst_to_run):
                 if i % 100 == 0 or i == len(seed_lst_to_run) - 1:
                     logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
@@ -156,10 +121,16 @@ class InfoProcesser:
                 futures.append(future)
             for future in as_completed(futures):
                 local_bitmap, local_hitseed = future.result()
-                with self._bitmap_lock:
-                    self._bitmap.merge_corpus(local_bitmap)
-                with self._hit_seed_lock:
-                    self._hit_seed.merge_corpus(local_hitseed)
+                local_bitmaps.append(local_bitmap)
+                local_hitseeds.append(local_hitseed)
+        for lb in local_bitmaps:
+            self._bitmap.merge_corpus(lb)
+        for hs in local_hitseeds:
+            self._hit_seed.merge_corpus(hs)
+            # with self._bitmap_lock:
+            #     self._bitmap.merge_corpus(local_bitmap)
+            # with self._hit_seed_lock:
+            #     self._hit_seed.merge_corpus(local_hitseed)
             # for args in tasks:
             #     future = executor.submit(self.process_single_data, *args)
             #     futures.append(future)

@@ -1,5 +1,7 @@
+import atexit
 import os
 import shutil
+import signal
 import subprocess
 
 from config import *
@@ -16,8 +18,16 @@ class FuzzerRunner:
         self.fuzzing_args = fuzzing_args
         self.fuzzer_process = None
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.terminate()
+        atexit.register(self.terminate)
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    # def __enter__(self):
+    #     self.run()
+    #     return self
+    #
+    # def __exit__(self, exc_type, exc_val, exc_tb):
+    #     self.terminate()
 
     def run(self):
         cmd = [
@@ -52,6 +62,12 @@ class FuzzerRunner:
         if self.fuzzer_process is None:
             return False
         return self.fuzzer_process.poll() is None
+
+    def _signal_handler(self, sig, frame):
+        logger.info(f"收到信号 {sig}，正在终止 fuzzer...")
+        self.terminate()
+        logger.info("fuzzer 已终止")
+        exit(0)
 
     def add_seed_LLM(self, id, bid):
         os.makedirs(LLM_TARGET_PATH, exist_ok=True)
