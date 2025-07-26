@@ -4,21 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a455882d-2ad5-46d1-b0e7-3a1d36f8b2a7" name="更改" comment="fix some bugs 6.29">
-      <change afterPath="$PROJECT_DIR$/Excep/ScriptNotFoundError.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Excep/SeedNotFoundError.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/Excep/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/LLM/LLMUtil.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/LLM/prompt_constructor.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/plot_progress.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.afl-showmap-temp-4066925" beforeDir="false" afterPath="$PROJECT_DIR$/Excep/ScriptExtractError.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.gitegnore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitegnore" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/CoverageTracer.py" beforeDir="false" afterPath="$PROJECT_DIR$/CoverageTracer.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/LLM/LLM_util.py" beforeDir="false" afterPath="$PROJECT_DIR$/LLM/LLM_util.py" afterDir="false" />
+    <list default="true" id="a455882d-2ad5-46d1-b0e7-3a1d36f8b2a7" name="更改" comment="change to single round chat 7.26">
       <change beforePath="$PROJECT_DIR$/benchmarks/libxml/build.sh" beforeDir="false" afterPath="$PROJECT_DIR$/benchmarks/libxml/build.sh" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/benchmarks/libxml/static/bottlenecks.json" beforeDir="false" afterPath="$PROJECT_DIR$/benchmarks/libxml/static/bottlenecks.json" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/config.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/cov.test" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/log/autoframe-06-24-21_50_45.log" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/log/autoframe-06-24-21_52_49.log" beforeDir="false" />
@@ -45,8 +33,6 @@
       <change beforePath="$PROJECT_DIR$/log/autoframe-06-25-18_11_12.log" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/log/autoframe-06-25-18_12_15.log" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/log/autoframe-06-25-18_13_43.log" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/pyTracer/InfoProcessor.py" beforeDir="false" afterPath="$PROJECT_DIR$/pyTracer/InfoProcessor.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -302,7 +288,7 @@
       <workItem from="1753181514626" duration="1665000" />
       <workItem from="1753268681957" duration="9276000" />
       <workItem from="1753517002743" duration="740000" />
-      <workItem from="1753518478959" duration="3946000" />
+      <workItem from="1753518478959" duration="4662000" />
     </task>
     <task id="LOCAL-00001" summary="implementation of cov trace">
       <option name="closed" value="true" />
@@ -352,7 +338,15 @@
       <option name="project" value="LOCAL" />
       <updated>1751166661891</updated>
     </task>
-    <option name="localTasksCounter" value="7" />
+    <task id="LOCAL-00007" summary="change to single round chat 7.26">
+      <option name="closed" value="true" />
+      <created>1753522836209</created>
+      <option name="number" value="00007" />
+      <option name="presentableId" value="LOCAL-00007" />
+      <option name="project" value="LOCAL" />
+      <updated>1753522836209</updated>
+    </task>
+    <option name="localTasksCounter" value="8" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -388,7 +382,8 @@
     <MESSAGE value="finish basic function" />
     <MESSAGE value="fix some bugs" />
     <MESSAGE value="fix some bugs 6.29" />
-    <option name="LAST_COMMIT_MESSAGE" value="fix some bugs 6.29" />
+    <MESSAGE value="change to single round chat 7.26" />
+    <option name="LAST_COMMIT_MESSAGE" value="change to single round chat 7.26" />
     <option name="OPTIMIZE_IMPORTS_BEFORE_PROJECT_COMMIT" value="true" />
     <option name="REFORMAT_BEFORE_PROJECT_COMMIT" value="true" />
   </component>
