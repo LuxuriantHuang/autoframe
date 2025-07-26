@@ -6,6 +6,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
+import config
 from config import LOGGER_NAME, PROJECT_HOME, LLM_TMP_PATH, EXEC_ARGS, bbs, funcs
 from pyTracer.CodeHeat import CodeHeat
 from pyTracer.InfoProcessor import Bitmap
@@ -14,34 +15,53 @@ from pyTracer.SeedTracer import SeedTracer
 logger = logging.getLogger(LOGGER_NAME + __name__)
 
 
+def get_sys_prompt():
+    return """As a professional security engineer,your task is to develop a Python script that generates a new test casefile.\
+This file should adhere to the format required by the fuzzing harness code and pass the specified constraint in the snippet.\
+The script will play a crucial role in creating diverse and effective test cases for thorough security testing."""
+
+
+def get_prefix():
+    return """```python\n"""
+
+
+def get_suffix():
+    return """if __name__ == __main__ :
+    if(len(sys.argv)<2):
+        print("usage: python3 generator.py <output_path>")
+        sys.exit(1)
+    # Some setup codes
+    with open(sys.argv[1],'wb') as f:
+        case_generator(f)
+```"""
+
+
 def construct_prompt_generator(call_chain, code_snippet, bcode):
     if len(call_chain) < 1:
         raise ValueError("call_chain must contain at least one element")
     callee = call_chain[-1]
-    caller = call_chain[-2] if len(call_chain) >= 2 else "unknown_caller"
+    # caller = call_chain[-2] if len(call_chain) >= 2 else "unknown_caller"
 
-    template = f"""You are a professional program code analyst. Given a code snippet with full call chain and the bottleneck constraint, please generate a python script step by step which can pass the specified constraint in the snippet:
+    template = f"""## STEPS:
 1. Understand the core functionality of the program from the code snippet.
 2. Analyze the key constraints in the call chain execution and use them to guide subsequent steps.
 3. Hypothetically analyze What characteristics does seeds need to meet to meet these constraints. You should consider all of the key constraints.
 4. Provide the python script that can generate seeds satisfying these constraints. Remember the generated seeds should functioning correctly.
-5. Ensure the final output is enclosed with ``` ```.
 
-Given the code snippet as follows:
-```
-{code_snippet}
-```
-, the bottleneck constraint is ```{bcode}``` in function ```{callee}```. What is the python script?
-
-Lets take a deep breath and think step by step. Please show your thoughts in each step.
-
-Instructions:
-- For necessary operation results, please use inverse operation instead of using the result.
-- One python code ONLY generates one case.
-- No need for mutating the seed, just give the direct answer that satisfies the constraints in the code.
-
-
-Example generator:
+## code snippet
+```{code_snippet}```
+the bottleneck constraint is ```{bcode}``` in function ```{callee}```.
+As an integrated component of an automated system , you should \
+perform the tasks without seeking human confirmation or \
+help.
+## Instructions
+The script should:
+1. enclosed with ``` ```.
+2. include the full valid Python script in your response.
+3. Has one argument , which is the output file path.
+4. Generate one test case and write it to the output file.
+5. The generated test case should be compatible with the fuzzing harness code provided and pass the specified constraint in the snippet.
+## Example
 ```python
 # Some libraries that should be imported
 def case_generator(out):
@@ -96,13 +116,13 @@ class LLM_util:
         self.client = OpenAI(api_key=key, base_url=base_url)
         pass
 
-    def solve(self, call_chain, code_slice, roadblock_code, roadblock_id, seedid, info, messages):
+    def solve(self, call_chain, code_slice, roadblock_code, roadblock_id, seedid):
         # if not config.test:
         prompt = construct_prompt_generator(call_chain, code_slice, roadblock_code)
-        # logger.info(f"prompt如下：{prompt}")
+        logger.info(f"prompt如下：{prompt}")
 
         logger.info("start generate python script")
-        response, messages = self.generate_seed(prompt, info, messages)
+        response, messages = self.generate_seed(prompt)
         if "Error generating seed" in response:
             logger.error(response)
 
@@ -117,13 +137,18 @@ class LLM_util:
         out, err, new_seed_path = run_generator(generator, roadblock_id, seedid)
         while err:
             logger.info("fixing python scripts")
-            response, _ = self.fix_generator(generator, messages, err)
+            response = self.fix_generator(generator, err)
             if "Error fixing generator" in response:
                 continue
             generator = extract_generator(response)
             out, err, new_seed_path = run_generator(generator, roadblock_id, seedid)
 
-        return out, err, new_seed_path, messages
+        messages.append({
+            'role': 'assistant',
+            'content': response
+        })
+
+        return out, err, new_seed_path, messages, generator  # 返回的是带脚本的messages，没有错误修正相关的对话
 
     def get_response(self, messages, temperature=0):
         completion = self.client.chat.completions.create(
@@ -134,77 +159,113 @@ class LLM_util:
         )
         return completion
 
-    def generate_seed(self, prompt, info, messages):
-        if messages is None:
-            messages = [{"role": "user", "content": prompt}]
+    def generate_seed(self, user_prompt):
+        messages = [{
+            "role": "system",
+            "content": get_sys_prompt()
+        }, {
+            "role": "user",
+            "content": user_prompt
+        }]
+
+        if "deepseek" in config.model:
+            messages.append({
+                'role': 'assistant',
+                'content': get_prefix(),
+                'prefix': True
+            })
+        elif "qwen" in config.model:
+            messages.append({
+                'role': 'assistant',
+                'content': get_prefix(),
+                'partial': True
+            })
 
         try:
             logger.info("chatting with llm")
-            response = self.get_response(messages)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0,
+                stop=[get_suffix()]
+            )
             logger.info("end chat")
 
-            seed = response.choices[0].message.content
-            messages.append({"role": "assistant", "content": seed})
-
+            seed = get_prefix() + response.choices[0].message.content
+            messages.pop()
             return seed, messages
 
         except Exception as e:
             return f"Error generating seed: {str(e)}", messages
 
-    def fix_generator(self, generator, message, stderr):
+    def fix_generator(self, generator, stderr):
         prompt_template = f"""You generated the following Python code, but it encounters some issues
-    during execution and raises an error. Please modify the code to make it
-    run correctly and optimize it where possible. Below are the code and the
-    error message:
+during execution and raises an error. Please modify the code to make it
+run correctly and optimize it where possible. Below are the code and the
+error message:
 
-    ### Code:
-    {generator}
+### Code:
+{generator}
 
-    ### Error Message:
-    {stderr}
+### Error Message:
+{stderr}
 
-    Please address the following in your response:
-    1. Fix the error in the code so that it runs correctly.
-    2. If possible, optimize the code for better performance, readability, or logic.
-    3. DON'T provide any explanations for the changes made. just give the python code in the following format:
-    ```python
-    <your code here>
-    ```
-    """
+Please address the following in your response:
+1. Fix the error in the code so that it runs correctly.
+2. If possible, optimize the code for better performance, readability, or logic.
+3. DON'T provide any explanations for the changes made. just give the python code in the following format:
+```python
+<your code here>
+```
+"""
 
-        if not message:
-            message = [{
-                "role": "user",
-                "content": prompt_template
-            }]
-        else:
-            message.append({
-                "role": "user",
-                "content": prompt_template
+        messages = [{
+            "role": "system",
+            "content": get_sys_prompt()
+        }, {
+            "role": "user",
+            "content": prompt_template
+        }]
+        if "deepseek" in config.model:
+            messages.append({
+                'role': 'assistant',
+                'content': get_prefix(),
+                'prefix': True
+            })
+        elif "qwen" in config.model:
+            messages.append({
+                'role': 'assistant',
+                'content': get_prefix(),
+                'partial': True
             })
 
         try:
             logger.info("fixing with LLM")
-            response = self.get_response(message)
+            # response = self.get_response(message)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stop=[get_suffix()],
+                temperature=0
+            )
             logger.info("end fixing")
-            assistant_message = response.choices[0].message.content
-            message.append({"role": "assistant", "content": assistant_message})
-            return assistant_message, message
+            new_script = get_prefix() + response.choices[0].message.content
+            return new_script
 
         except Exception as e:
-            return f"Error fixing generator: {str(e)}", message
+            return f"Error fixing generator: {str(e)}"
 
     def improve_both_no_cover(self, messages, bottleneck_code, funcname, not_cover, coverage):
         not_cover_lines = ','.join(not_cover)
-        prompt_template = f'''You have generated a generator to finish the task, but the final goal for the generator is to break the bottleneck located in the line ```{bottleneck_code}``` in function ```{funcname}```. The both branch after the bottleneck has not been run, which are ```{not_cover_lines}``` in the code. The specific code coverage is as follows:
-    ```
-    {coverage}
-    ```
-    The number of times the seed generated by the generator covers each line of code is marked with "//coverage:" after the code.
-    please give some suggestions to help generator breaking through the bottleneck mentioned above, including:
-    - A 2-3 short sentences summary of the relationship between the script and the coverage. For example, "The script not cover part X because it generates only Y type of data."
-    - A 2-3 short sentences general guideline on how to improve the script based on the coverage information received. You don’t need to provide a new script, just some advice on how to improve the current one.
-    '''
+        prompt_template = f'''The code information of your generator is as follows:
+```
+{coverage}
+```
+The number of times the seed generated by the generator covers each line of code is marked with "//coverage:" after the code.
+please give some suggestions to help generator breaking through the bottleneck mentioned above, including:
+- A 2-3 short sentences summary of the relationship between the script and the coverage. For example, "The script not cover part X because it generates only Y type of data."
+- A 2-3 short sentences general guideline on how to improve the script based on the coverage information received. You don’t need to provide a new script, just some advice on how to improve the current one.
+'''
         messages.append({
             "role": "user",
             "content": prompt_template
@@ -212,27 +273,25 @@ class LLM_util:
 
         try:
             logger.info("improving generator")
-            response = self.get_response(messages)
+            response = self.get_response(messages, 1)
 
             assistant_message = response.choices[0].message
             improve_text = assistant_message.content
-            messages.append({"role": "assistant", "content": improve_text})
-            # improve_text = assistant_message.content.strip()
-            # return improve_text
-            return messages
+            # messages.append({"role": "assistant", "content": improve_text})
+            return improve_text, messages
         except Exception as e:
             return f"Error improving generator: {str(e)}", messages
 
     def improve_geneator(self, messages, bottleneck_code, funcname, not_cover, coverage):
         prompt_template = f'''You have generated a generator to finish the task, but the final goal for the generator is to break the bottleneck located in the line ```{bottleneck_code}``` in function ```{funcname}```. The branch that has not been run begins at line ```{not_cover}```. The specific code coverage is as follows:
-    ```
-    {coverage}
-    ```
-    The number of times the seed generated by the generator covers each line of code is marked with "//coverage:" after the code.
-    please give some suggestions to help generator breaking through the bottleneck mentioned above, including:
-    - A 2-3 short sentences summary of the relationship between the script and the coverage. For example, "The script not cover part X because it generates only Y type of data."
-    - A 2-3 short sentences general guideline on how to improve the script based on the coverage information received. You don’t need to provide a new script, just some advice on how to improve the current one.
-    '''
+```
+{coverage}
+```
+The number of times the seed generated by the generator covers each line of code is marked with "//coverage:" after the code.
+please give some suggestions to help generator breaking through the bottleneck mentioned above, including:
+- A 2-3 short sentences summary of the relationship between the script and the coverage. For example, "The script not cover part X because it generates only Y type of data."
+- A 2-3 short sentences general guideline on how to improve the script based on the coverage information received. You don’t need to provide a new script, just some advice on how to improve the current one.
+'''
         messages.append({
             "role": "user",
             "content": prompt_template
@@ -243,12 +302,13 @@ class LLM_util:
             # print(prompt_template)
             response = self.get_response(messages, 1)
 
-            assistant_message = response.choices[0].message.content
-            messages.append({"role": "assistant", "content": assistant_message})
+            assistant_message = response.choices[0].message
+            improve_text = assistant_message.content
+            # messages.append({"role": "assistant", "content": assistant_message})
             # improve_text = assistant_message.content.strip()
             # return improve_text
 
-            return messages
+            return improve_text, messages
         except Exception as e:
             return f"Error improving generator: {str(e)}", messages
 
@@ -325,8 +385,53 @@ class LLM_util:
             not_cover = []
             for i in not_exec_bid:
                 not_cover.append(code[bbs[int(i)]['lineStart'] - 1])
-            advices = self.improve_both_no_cover(messages, bottleneck_code, fname, not_cover, function_coverage)
-            return advices
+            advices, messages = self.improve_both_no_cover(messages, bottleneck_code, fname, not_cover,
+                                                           function_coverage)
+            return advices, function_coverage
         not_cover = code[bbs[int(not_exec_bid[0])]['lineStart'] - 1]
-        advices = self.improve_geneator(messages, bottleneck_code, fname, not_cover, function_coverage)
-        return advices
+        advices, messages = self.improve_geneator(messages, bottleneck_code, fname, not_cover, function_coverage)
+        return advices, function_coverage
+
+    def improve_script(self, generator, coverage, message):
+        prompt = f"""Here is a seed generation script:
+```
+{generator}
+```
+Our coverage report indicates that the generated seeds with this script cover parts of the code:
+```
+{coverage}
+```
+(In the report,static functions and initializers are marked as uncovered. This is intentional,as these elements are not meant to be included in fuzzer coverage.)
+To enhance code coverage,consider refining the script to produce more effective seeds. Here is someadvice to help you improve the script:
+```
+{message}
+```"""
+        messages = [{
+            "role": "system",
+            "content": get_sys_prompt()
+        }, {
+            "role": "user",
+            "content": prompt
+        }]
+
+        if "deepseek" in config.model:
+            messages.append({
+                'role': 'assistant',
+                'content': get_prefix(),
+                'prefix': True
+            })
+        elif "qwen" in config.model:
+            messages.append({
+                'role': 'assistant',
+                'content': get_prefix(),
+                'partial': True
+            })
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stop=[get_suffix()],
+            temperature=0
+        )
+
+        return get_prefix() + response.choices[0].message.content

@@ -4,6 +4,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
+from tqdm import tqdm
+
 from config import *
 
 logger = logging.getLogger(LOGGER_NAME + __name__)
@@ -82,13 +84,6 @@ class InfoProcesser:
             Path.mkdir(self.addi)
 
     def process_single_data(self, trace_data, fuzzer_name, seed_name):
-        addi = Path.joinpath(self._output_dir, "single")
-        if not Path.exists(addi):
-            Path.mkdir(addi)
-
-        dir_path = Path.joinpath(addi, seed_name.name)
-        if not Path.exists(dir_path):
-            Path.mkdir(dir_path)
         local_bitmap = Bitmap()
         local_hitseed = HitSeed()
 
@@ -96,60 +91,38 @@ class InfoProcesser:
         if trace_data:
             local_bitmap.merge(new_info)
             local_hitseed.merge(new_info)
-            # block_freq = {"freq": self._bitmap.bitmap}
-            # with open(Path.joinpath(dir_path, 'block_freq.json'), 'w') as f:
-            #     ujson.dump(block_freq, f)
 
         return local_bitmap, local_hitseed
 
+    def process_seed(self, seed_path, seed_tracer, TIMEOUT):
+        trace_data, retcode = seed_tracer.trace_seed(str(seed_path), TIMEOUT)
+        # 假设 self.process_single_data 是无状态的，可以作为普通函数调用
+        local_bitmap, local_hitseed = self.process_single_data(trace_data, "default", seed_path)
+        return local_bitmap, local_hitseed
+
     def parallel_add(self, seed_lst_to_run, seed_tracer, max_workers=4):
-        # tasks = []
-        # for (i, seed_path) in enumerate(seed_lst_to_run):
-        #     if i % 100 == 0 or i == len(seed_lst_to_run) - 1:
-        #         logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
-        #     trace_data, retcode = seed_tracer.trace_seed(str(seed_path), TIMEOUT)
-        #     tasks.append((trace_data, "default", seed_path))
         local_bitmaps = []
         local_hitseeds = []
         futures = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for (i, seed_path) in enumerate(seed_lst_to_run):
-                if i % 100 == 0 or i == len(seed_lst_to_run) - 1:
-                    logger.info(f"Tracer {i}: 完成种子覆盖信息采集")
-                trace_data, retcode = seed_tracer.trace_seed(str(seed_path), TIMEOUT)
-                future = executor.submit(self.process_single_data, trace_data, "default", seed_path)
-                futures.append(future)
-            for future in as_completed(futures):
-                local_bitmap, local_hitseed = future.result()
-                local_bitmaps.append(local_bitmap)
-                local_hitseeds.append(local_hitseed)
-        for lb in local_bitmaps:
-            self._bitmap.merge_corpus(lb)
-        for hs in local_hitseeds:
-            self._hit_seed.merge_corpus(hs)
-            # with self._bitmap_lock:
-            #     self._bitmap.merge_corpus(local_bitmap)
-            # with self._hit_seed_lock:
-            #     self._hit_seed.merge_corpus(local_hitseed)
-            # for args in tasks:
-            #     future = executor.submit(self.process_single_data, *args)
-            #     futures.append(future)
-            #
+            futures = {
+                executor.submit(self.process_seed, seed_path, seed_tracer, TIMEOUT): seed_path
+                for seed_path in seed_lst_to_run
+            }
             # for future in as_completed(futures):
-            #     local_bitmap, local_hitseed = future.result()
-            #     with self._bitmap_lock:
-            #         self._bitmap.merge_corpus(local_bitmap)
-            #     with self._hit_seed_lock:
-            #         self._hit_seed.merge_corpus(local_hitseed)
+            for future in tqdm(as_completed(futures), total=len(futures)):
+                try:
+                    local_bitmap, local_hitseed = future.result()
+                    local_bitmaps.append(local_bitmap)
+                    local_hitseeds.append(local_hitseed)
+                except Exception as exc:
+                    seed_path = futures[future]
+                    logger.error(f"Seed {seed_path} generated an exception: {exc}")
+        for lb in tqdm(local_bitmaps, total=len(local_bitmaps)):
+            self._bitmap.merge_corpus(lb)
+        for hs in tqdm(local_hitseeds, total=len(local_hitseeds)):
+            self._hit_seed.merge_corpus(hs)
 
-    # def add(self, trace_data, basic_block, fuzzer_name, seed_name):  # 将结果添加到数据库中
-    #     if not trace_data:
-    #         return
-    #     new_info = {"seed": seed_name, "info": trace_data}
-    #     self._bitmap.merge(new_info)
-    #     self._hit_seed.merge(new_info, self._output_dir, basic_block, fuzzer_name)
-    #     # self._call_edges.merge(new_info)
-    #
     def dump_single(self, seed_path=None):
         addi = Path.joinpath(self._output_dir, "single")
         if not Path.exists(addi):

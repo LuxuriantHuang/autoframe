@@ -1,12 +1,16 @@
 import os
 import random
 import re
+import sys
 import traceback
 
 from CoverageTracer import CoverageTracer
 from DSE_util import DSEUtil
+from Excep.ScriptExtractError import ScriptExtractError
+from Excep.ScriptNotFoundError import ScriptNotFoundError
+from Excep.SeedNotFoundError import SeedNotFoundError
 from FuzzerRunner import FuzzerRunner
-from LLM.LLM_util import LLM_util
+from LLM.LLMUtil import LLMUtil, extract_generator, run_generator, get_coverage_report
 from config import *
 
 
@@ -38,61 +42,107 @@ def setup_logger():
 #     return parse.parse_args()
 
 
-def handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global, trace_prog):
+pass_roadblock = []
+
+
+def extract_and_test(llm_util, resp, roadblock, seed_id, freq_global):
+    global pass_roadblock
+    global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
+    logger.info("extracting python script")
+    script = extract_generator(resp)
+    logger.info("running python script")
+    stdout, stderr, new_seed_path = run_generator(script, roadblock, seed_id)
+    while stderr:
+        logger.info("fixing python scripts")
+        fix_resp = llm_util.fix_chat(script, stderr)
+        if "Error fixing seed" in fix_resp:
+            continue
+        fixed_generator_script = extract_generator(fix_resp)
+        stdout, stderr, new_seed_path = run_generator(script, roadblock, seed_id)
+        script = fixed_generator_script
+    pattern = re.compile(r"id:(\d+),bid:(\d+)")
+    match = re.match(pattern, Path(new_seed_path).name)
+    if not match:
+        raise SeedNotFoundError("种子命名格式不对")
+    solved, execution_path, not_exec_bid = llm_util.test_seed(Path(new_seed_path).name, roadblock,
+                                                              freq_global, trace_prog)
+    return solved, execution_path, not_exec_bid, script
+
+
+def handle_roadblock(roadblock, tracer: CoverageTracer, dse_util, llm_util: LLMUtil, freq_global):
+    global pass_roadblock
+    global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
+    logger.info(f"正处理roadblock{roadblock}")
     seeds = tracer.get_rb_seed(roadblock)
-    rb_file, rb_line = tracer.get_rb_file_and_line(roadblock)
+    rb_file, rb_line, rb_fname = tracer.get_rb_file_and_line(roadblock)
 
     for seed in random.sample(sorted(seeds), min(DSE_SEEDS_NUM, len(seeds))):
-        # logs = dse_util.dse_runner(seed, rb_file, rb_line)
-        # if any("New testcase" in log for log in logs):
-        #     # fuzzer.add_seed_DSE()
-        #     return True, "DSE", None
+        logger.info(f"正使用seed{seed}进行突破")
 
         call_chain, code_slice, bcode = tracer.get_slice(roadblock, seed)
+        logger.info(f"本次执行的call_chain：{'->'.join(call_chain)}")
         os.makedirs(LLM_TMP_PATH, exist_ok=True)
         seed_id = len(os.listdir(LLM_TMP_PATH))
 
         solved, times = False, 0
-        messages = None
-        while not solved and times < MAX_TIME:
-            out, err, new_seed_path, messages = llm_util.solve(call_chain, code_slice, bcode, roadblock, seed_id, None,
-                                                               messages)
-            if err:
-                messages = None
-                continue
-            match = re.match(r"id:(\d+),bid:(\d+)", Path(new_seed_path).name)
-            if not match:
-                raise ValueError("Invalid seed name format")
-
-            id, _ = match.groups()
-            solved, execution_path, not_exec_bid = llm_util.test_seed(Path(new_seed_path).name, freq_global, trace_prog)
-
-            if not solved:
-                logger.info("Getting advices to improve Python script")
-                messages = llm_util.refine(roadblock, execution_path, messages, call_chain, not_exec_bid)
-                messages.append(
-                    {"role": "user", "content": "Please improve the Python script you generated previously."})
+        script = None
+        try:
+            logger.info("start generate python script")
+            first_resp = llm_util.first_solve(code_slice, call_chain, bcode)
+            if "Error generating seed" in first_resp:
                 times += 1
+                continue
+            solved, execution_path, not_exec_bid, script = extract_and_test(llm_util, first_resp, roadblock, seed_id,
+                                                                            freq_global)
+            if solved:
+                pass_roadblock.append(roadblock)
+                break
+            rb_info = {"file": rb_file, "func_name": rb_fname, "code": rb_line}
+            while not solved and times < MAX_TIME:
+                coverage = get_coverage_report(execution_path, call_chain)
+                advice = llm_util.get_advice(rb_info, not_exec_bid, coverage, script)
+                improve_resp = llm_util.improve_script(script, coverage, advice)
+                if "Error improve script" in improve_resp:
+                    times += 1
+                    continue
+                solved, execution_path, not_exec_bid, script = extract_and_test(llm_util, first_resp, roadblock,
+                                                                                seed_id, freq_global)
+
+        except ScriptNotFoundError:
+            # 利用大模型更正为包含代码的script
+            pass
+        except ScriptExtractError:
+            # 重试跑脚本
+            pass
 
         if solved:
             logger.info(f"Bottleneck {roadblock} is resolved.")
             return True, "LLM", id
 
-    return False, "", 0
+    return False, "", -1
 
 
-def resolve_coverage_stuck(tracer, last_scan_time, read_files):
-    ret, last_scan_time, error_info, freq_global = tracer.get_trace(read_files, last_scan_time)
+def resolve_coverage_stuck(tracer: CoverageTracer, last_scan_time, read_files):
+    global pass_roadblock
+    global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
+    ret, last_scan_time, error_info, freq_global = tracer.get_trace(read_files, last_scan_time)  # 慢，如何解决
     if not ret:
         logger.fatal(error_info)
         # raise Exception(error_info)
 
     roadblocks = tracer.get_roadblocks(STATIC_PATH)
     dse_util = DSEUtil()
-    llm_util = LLM_util(MODEL, API_KEY, BASE_URL)
+    # llm_util = LLM_util(MODEL, API_KEY, BASE_URL)
+    llm_util = LLMUtil(MODEL, API_KEY, BASE_URL)
 
+    roadblocks = [rb for rb in roadblocks if rb not in pass_roadblock][:10]
+
+    if not roadblocks:
+        logger.info("没有roadblock需要突破了，程序即将退出")
+        sys.exit(0)
+    logger.info(f"roadblocks: {roadblocks}")
     for roadblock in roadblocks:
-        ret, mode, id = handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global, trace_prog)
+        ret, mode, id = handle_roadblock(roadblock, tracer, dse_util, llm_util, freq_global)
         if ret:
             if mode == "DSE":
                 fuzzer.add_seed_DSE()
@@ -125,8 +175,8 @@ def main():
     logger.info(f"本次运行中，trace_prog：{trace_prog}")
     # with FuzzerRunner(input_dir, output_dir, target_prog, fuzzing_args) as fuzzer:
     fuzzer = FuzzerRunner(input_dir, output_dir, target_prog, fuzzing_args)
-    # if not config.test:
-    fuzzer.run()
+    if not test:
+        fuzzer.run()
     logger.info("fuzzer已开始运行")
     time.sleep(1)  # 尚未生成种子，需要缓冲时间
     try:

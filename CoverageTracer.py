@@ -151,8 +151,9 @@ class CoverageTracer:
         # current_coverage = len(cov)
         growth = current_coverage - self.last_coverage
         now = time.time()
+        logger.info(f"当前覆盖率为{current_coverage}")
         if growth >= THRESHOLD_COV_DELTA:
-            logger.info(f"覆盖率增加到 {current_coverage} (新增 {growth} 条路径)")
+            logger.info(f"新增 {growth} 条路径")
             self.last_coverage = current_coverage
             self.last_growth_time = now
             return 0
@@ -195,7 +196,7 @@ class CoverageTracer:
         self.cfg_loader.calculate_depth()
         bottlenecks = [x for x in self.cfg_loader.get_roadblocks(DEPTH_THRESHOLD)]
         self.cfg_loader.dump(bottlenecks)
-        return bottlenecks[:10]
+        return bottlenecks
 
     def get_rb_seed(self, roadblock_id):
         # 去数据库中搜索种子名(直接本地搜索？)
@@ -212,8 +213,9 @@ class CoverageTracer:
     def get_rb_file_and_line(self, roadblock):
         rb_bb = self.bb[roadblock]
         rb_line = rb_bb["lineEnd"]
+        rb_fname = self.func[rb_bb["function"]]['name']
         rb_file = self.func[rb_bb["function"]]['file_name']
-        return rb_file, int(rb_line)
+        return rb_file, int(rb_line), rb_fname
 
 
 def get_new_seeds(directory, read_files, last_scan_time):  # 添加去数据库找的功能

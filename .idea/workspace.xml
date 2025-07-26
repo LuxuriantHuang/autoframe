@@ -4,11 +4,19 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="a455882d-2ad5-46d1-b0e7-3a1d36f8b2a7" name="更改" comment="fix some bugs">
-      <change beforePath="$PROJECT_DIR$/.afl-showmap-temp-4066925" beforeDir="false" />
+    <list default="true" id="a455882d-2ad5-46d1-b0e7-3a1d36f8b2a7" name="更改" comment="fix some bugs 6.29">
+      <change afterPath="$PROJECT_DIR$/Excep/ScriptNotFoundError.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/Excep/SeedNotFoundError.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/Excep/__init__.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/LLM/LLMUtil.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/LLM/prompt_constructor.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/plot_progress.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.afl-showmap-temp-4066925" beforeDir="false" afterPath="$PROJECT_DIR$/Excep/ScriptExtractError.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitegnore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitegnore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/FuzzerRunner.py" beforeDir="false" afterPath="$PROJECT_DIR$/FuzzerRunner.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/CoverageTracer.py" beforeDir="false" afterPath="$PROJECT_DIR$/CoverageTracer.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/LLM/LLM_util.py" beforeDir="false" afterPath="$PROJECT_DIR$/LLM/LLM_util.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/benchmarks/libxml/build.sh" beforeDir="false" afterPath="$PROJECT_DIR$/benchmarks/libxml/build.sh" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/benchmarks/libxml/static/bottlenecks.json" beforeDir="false" afterPath="$PROJECT_DIR$/benchmarks/libxml/static/bottlenecks.json" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/config.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/cov.test" beforeDir="false" />
@@ -81,29 +89,32 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Python.main.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager": "true",
-    "SHARE_PROJECT_CONFIGURATION_FILES": "true",
-    "SHELLCHECK.PATH": "我会在意",
-    "git-widget-placeholder": "main",
-    "last_opened_file_path": "/home/lab420/Desktop/autoframe/benchmarks/transform",
-    "node.js.detected.package.eslint": "true",
-    "node.js.detected.package.tslint": "true",
-    "node.js.selected.package.eslint": "(autodetect)",
-    "node.js.selected.package.tslint": "(autodetect)",
-    "nodejs_package_manager_path": "npm",
-    "settings.editor.selected.configurable": "preferences.keymap",
-    "vue.rearranger.settings.migration": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Python 测试.pytest (test_LLM.py 内).executor&quot;: &quot;Run&quot;,
+    &quot;Python.LLM_test.executor&quot;: &quot;Run&quot;,
+    &quot;Python.main.executor&quot;: &quot;Debug&quot;,
+    &quot;Python.plot_progress.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,
+    &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
+    &quot;SHELLCHECK.PATH&quot;: &quot;我会在意&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/home/lab420/Desktop/symdict&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.keymap&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   },
-  "keyToStringList": {
-    "com.intellij.ide.scratch.ScratchImplUtil$2/新建临时文件": [
-      "CommandLine"
+  &quot;keyToStringList&quot;: {
+    &quot;com.intellij.ide.scratch.ScratchImplUtil$2/新建临时文件&quot;: [
+      &quot;CommandLine&quot;
     ]
   }
-}]]></component>
+}</component>
   <component name="RdControllerToolWindowsLayoutState" isNewUi="true">
     <layout>
       <window_info id="Bookmarks" show_stripe_button="false" side_tool="true" />
@@ -112,55 +123,79 @@
       <window_info id="Commit_Guest" show_stripe_button="false" />
       <window_info id="Pull Requests" show_stripe_button="false" />
       <window_info id="Learn" show_stripe_button="false" />
-      <window_info active="true" content_ui="combo" id="Project" order="0" sideWeight="0.50074625" visible="true" weight="0.16674805" />
-      <window_info id="Commit" order="1" weight="0.2878418" />
-      <window_info active="true" id="Structure" order="2" sideWeight="0.49925375" side_tool="true" visible="true" weight="0.16674805" />
-      <window_info x="343" y="200" width="1032" height="603" id="Find" order="3" sideWeight="0.49925375" side_tool="true" type="FLOATING" weight="0.22827148" />
+      <window_info active="true" content_ui="combo" id="Project" order="0" sideWeight="0.50074625" visible="true" weight="0.13354492" />
+      <window_info id="Commit" order="1" sideWeight="0.5004836" weight="0.13354492" />
+      <window_info id="Structure" order="2" sideWeight="0.49951643" side_tool="true" weight="0.32983398" />
+      <window_info x="343" y="200" width="1032" height="603" id="Find" order="3" sideWeight="0.49925375" side_tool="true" type="FLOATING" weight="0.2097168" />
+      <window_info id="VcsChanges" order="4" weight="0.13305664" />
       <window_info anchor="bottom" id="Database Changes" show_stripe_button="false" />
       <window_info anchor="bottom" id="TypeScript" show_stripe_button="false" />
       <window_info anchor="bottom" id="File Transfer" show_stripe_button="false" />
       <window_info anchor="bottom" id="HfCacheToolWindow" />
-      <window_info anchor="bottom" id="Version Control" order="0" />
+      <window_info anchor="bottom" id="Version Control" order="0" weight="0.33016306" />
       <window_info anchor="bottom" id="Problems" order="1" />
       <window_info anchor="bottom" id="Problems View" order="2" weight="0.48777175" />
-      <window_info anchor="bottom" id="Terminal" order="3" weight="0.34103262" />
+      <window_info anchor="bottom" id="Terminal" order="3" weight="0.3138587" />
       <window_info anchor="bottom" id="Services" order="4" />
       <window_info anchor="bottom" id="Python Packages" order="5" weight="0.29393116" />
-      <window_info active="true" anchor="bottom" id="Debug" order="6" visible="true" weight="0.33016306" />
+      <window_info anchor="bottom" id="Debug" order="6" weight="0.36639494" />
       <window_info anchor="bottom" id="TODO" order="7" weight="0.29393116" />
-      <window_info anchor="bottom" id="Python Console" order="8" weight="0.29393116" />
-      <window_info active="true" anchor="bottom" id="Run" order="9" visible="true" weight="0.33016306" />
+      <window_info anchor="bottom" id="Python Console" order="8" weight="0.33016306" />
+      <window_info active="true" anchor="bottom" id="Run" order="9" visible="true" weight="0.3138587" />
       <window_info anchor="right" id="Endpoints" show_stripe_button="false" />
       <window_info anchor="right" id="documentation.v2" side_tool="true" />
       <window_info anchor="right" id="Coverage" show_stripe_button="false" side_tool="true" />
       <window_info anchor="right" id="SciView" show_stripe_button="false" />
       <window_info anchor="right" id="Jupyter Variables" side_tool="true" />
-      <window_info anchor="right" content_ui="combo" id="Notifications" order="0" weight="0.25" />
+      <window_info anchor="right" id="Notifications" order="0" weight="0.33032227" />
       <window_info anchor="right" id="AIAssistant" order="1" weight="0.25" />
       <window_info anchor="right" id="Database" order="2" weight="0.25" />
       <window_info anchor="right" id="Gradle" order="3" weight="0.25" />
       <window_info anchor="right" id="Maven" order="4" weight="0.25" />
-      <window_info anchor="right" id="Plots" order="5" weight="0.1" />
+      <window_info anchor="right" id="Plots" order="5" weight="0.33040363" />
       <window_info anchor="right" id="Trae AI" order="6" show_stripe_button="false" weight="0.22973633" />
     </layout>
   </component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/benchmarks/libxml-bench/src/fuzz" />
+      <recent name="$PROJECT_DIR$/benchmarks/libxml-bench" />
+      <recent name="$PROJECT_DIR$/benchmarks/libxml-bench/build/trace/fuzz" />
+      <recent name="$PROJECT_DIR$/benchmarks/libxml-bench/build/fuzz/fuzz" />
       <recent name="$PROJECT_DIR$/benchmarks/transform" />
-      <recent name="$PROJECT_DIR$/benchmarks/libxml/out/default/queue" />
-      <recent name="$PROJECT_DIR$/benchmarks/libxml/out" />
-      <recent name="$PROJECT_DIR$/benchmarks/libxml/src" />
-      <recent name="$PROJECT_DIR$/benchmarks" />
     </key>
     <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$" />
+      <recent name="$PROJECT_DIR$/test" />
       <recent name="$PROJECT_DIR$/benchmarks/libxml/out" />
       <recent name="$PROJECT_DIR$/benchmarks/libxml" />
       <recent name="$PROJECT_DIR$/benchmarks/libxml/out_bak" />
-      <recent name="$PROJECT_DIR$/LLM" />
-      <recent name="$PROJECT_DIR$/benchmarks/output/libxml_test/default" />
     </key>
   </component>
-  <component name="RunManager">
+  <component name="RunManager" selected="Python.LLM_test">
+    <configuration name="LLM_test" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="autoframe" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/test" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/test/LLM_test.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <configuration name="main" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
       <module name="autoframe" />
       <option name="ENV_FILES" value="" />
@@ -185,12 +220,41 @@
       <option name="INPUT_FILE" value="" />
       <method v="2" />
     </configuration>
+    <configuration name="plot_progress" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="autoframe" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <EXTENSION ID="PythonCoverageRunConfigurationExtension" runner="coverage.py" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/plot_progress.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
     <configuration default="true" type="docker-deploy" factoryName="docker-compose.yml" temporary="true">
       <deployment type="docker-compose.yml">
         <settings />
       </deployment>
       <method v="2" />
     </configuration>
+    <recent_temporary>
+      <list>
+        <item itemvalue="Python.LLM_test" />
+        <item itemvalue="Python.plot_progress" />
+      </list>
+    </recent_temporary>
   </component>
   <component name="SharedIndexes">
     <attachedChunks>
@@ -227,6 +291,18 @@
       <workItem from="1751121332934" duration="1310000" />
       <workItem from="1751122665945" duration="3437000" />
       <workItem from="1751127051641" duration="7129000" />
+      <workItem from="1751166614065" duration="1935000" />
+      <workItem from="1751353598387" duration="310000" />
+      <workItem from="1751354238597" duration="327000" />
+      <workItem from="1751354595937" duration="3875000" />
+      <workItem from="1751439669282" duration="28253000" />
+      <workItem from="1751625105157" duration="5644000" />
+      <workItem from="1752366926986" duration="625000" />
+      <workItem from="1752914844883" duration="47747000" />
+      <workItem from="1753181514626" duration="1665000" />
+      <workItem from="1753268681957" duration="9276000" />
+      <workItem from="1753517002743" duration="740000" />
+      <workItem from="1753518478959" duration="3946000" />
     </task>
     <task id="LOCAL-00001" summary="implementation of cov trace">
       <option name="closed" value="true" />
@@ -268,11 +344,42 @@
       <option name="project" value="LOCAL" />
       <updated>1751102479408</updated>
     </task>
-    <option name="localTasksCounter" value="6" />
+    <task id="LOCAL-00006" summary="fix some bugs 6.29">
+      <option name="closed" value="true" />
+      <created>1751166661890</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1751166661891</updated>
+    </task>
+    <option name="localTasksCounter" value="7" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="main" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+            </State>
+          </value>
+        </entry>
+      </map>
+    </option>
   </component>
   <component name="VcsManagerConfiguration">
     <option name="CHECK_NEW_TODO" value="false" />
@@ -280,7 +387,8 @@
     <MESSAGE value="update basic code of dse and llm" />
     <MESSAGE value="finish basic function" />
     <MESSAGE value="fix some bugs" />
-    <option name="LAST_COMMIT_MESSAGE" value="fix some bugs" />
+    <MESSAGE value="fix some bugs 6.29" />
+    <option name="LAST_COMMIT_MESSAGE" value="fix some bugs 6.29" />
     <option name="OPTIMIZE_IMPORTS_BEFORE_PROJECT_COMMIT" value="true" />
     <option name="REFORMAT_BEFORE_PROJECT_COMMIT" value="true" />
   </component>
@@ -289,48 +397,46 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>232</line>
+          <line>291</line>
           <option name="timeStamp" value="49" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>203</line>
+          <line>264</line>
           <option name="timeStamp" value="50" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>160</line>
+          <line>207</line>
           <option name="timeStamp" value="51" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>137</line>
-          <option name="timeStamp" value="52" />
-        </line-breakpoint>
-        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>152</line>
-          <option name="timeStamp" value="53" />
-        </line-breakpoint>
-        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
-          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>328</line>
+          <line>389</line>
           <option name="timeStamp" value="56" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>213</line>
+          <line>274</line>
           <option name="timeStamp" value="57" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
-          <line>108</line>
-          <option name="timeStamp" value="58" />
+          <line>123</line>
+          <option name="timeStamp" value="59" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/LLM/LLM_util.py</url>
+          <line>200</line>
+          <option name="timeStamp" value="61" />
         </line-breakpoint>
       </breakpoints>
     </breakpoint-manager>
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
-    <SUITE FILE_PATH="coverage/autoframe$main.coverage" NAME="main 覆盖结果" MODIFIED="1751129424753" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/autoframe$plot_progress.coverage" NAME="plot_progress 覆盖结果" MODIFIED="1751444557518" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/autoframe$pytest__test_LLM_py__.coverage" NAME="pytest (test_LLM.py 内) 覆盖结果" MODIFIED="1752922314070" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/autoframe$LLM_test.coverage" NAME="LLM_test 覆盖结果" MODIFIED="1752934653248" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$/test" />
+    <SUITE FILE_PATH="coverage/autoframe$main.coverage" NAME="main 覆盖结果" MODIFIED="1752926392439" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
   </component>
 </project>
