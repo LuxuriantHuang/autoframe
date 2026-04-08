@@ -1,0 +1,3 @@
+[submodule "ipl-modeling"]
+	path = ipl-modeling
+	url = git@github.com:LuxuriantHuang/ipl-modeling.git

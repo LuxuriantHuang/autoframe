@@ -25,7 +25,6 @@ AFLplusplus/
 llvm-project/
 tracer/
 svf/third_party/SVF/
-ipl-modeling/
 
 *.log
 *.db
