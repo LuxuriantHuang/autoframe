@@ -1767,12 +1767,38 @@ class CoverageTracer:
         else:
             profdata_cmd = f"{LLVM_PROFDATA_BIN} merge -sparse -o {self.main_profdata_path.resolve().as_posix()} {profdir}/*.profraw"
         p = subprocess.Popen(profdata_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=profdir)
-        _, __ = p.communicate()
+        prof_stdout, prof_stderr = p.communicate()
+        if p.returncode != 0:
+            logger.error(
+                "[TRACE] llvm-profdata merge failed (bin=%s, rc=%s): %s",
+                LLVM_PROFDATA_BIN,
+                p.returncode,
+                prof_stderr.decode("utf-8", errors="ignore").strip()[:800],
+            )
+            return False, last_scan_time, "llvm-profdata merge failed", []
         export_cmd = f"{LLVM_COV_BIN} export {COV_TARGET_PATH} -format=text -instr-profile={self.main_profdata_path.as_posix()} --json-only-one-sided-branches --json-skip-low-value-guards"
         p = subprocess.Popen(split(export_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.trace_dir)
-        stdout, __ = p.communicate()
+        stdout, stderr = p.communicate()
+        if p.returncode != 0:
+            logger.error(
+                "[TRACE] llvm-cov export failed (bin=%s, rc=%s): %s",
+                LLVM_COV_BIN,
+                p.returncode,
+                stderr.decode("utf-8", errors="ignore").strip()[:800],
+            )
+            return False, last_scan_time, "llvm-cov export failed", []
 
-        payload = json.loads(stdout)
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "[TRACE] Failed to parse llvm-cov export JSON (bin=%s): %s; stdout=%r; stderr=%r",
+                LLVM_COV_BIN,
+                exc,
+                stdout[:400],
+                stderr[:400],
+            )
+            return False, last_scan_time, "llvm-cov export returned invalid json", []
         branch_entries = payload.get('data', [{}])[0].get('files', [])
         result_sided_branch = []
         seen_branch_keys: set[tuple[str, int, object]] = set()

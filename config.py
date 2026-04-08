@@ -94,20 +94,21 @@ SVF_SLICE_PATH = _resolve_existing_path(
     ROOT_DIR / "svf" / "build",
 )
 
-# Prefer lightweight in-repo tools that are safe to publish, then local forks,
-# then system installations.
+# Keep the old workflow for coverage tools:
+# - prefer the in-repo llvm-project build for llvm-cov
+# - prefer system llvm-profdata (older versions may be required by gclang traces)
 LLVM_COV_BIN = _resolve_tool_path(
     "AF_LLVM_COV_BIN",
     [
-        LLVM_BIN_PATH / "llvm-cov",
         ROOT_DIR / "llvm-project" / "build" / "bin" / "llvm-cov",
+        LLVM_BIN_PATH / "llvm-cov",
     ],
-    ["llvm-cov"],
+    ["llvm-cov-10", "llvm-cov", "llvm-cov-14"],
 )
 LLVM_PROFDATA_BIN = _resolve_tool_path(
     "AF_LLVM_PROFDATA_BIN",
-    [LLVM_BIN_PATH / "llvm-profdata"],
-    ["llvm-profdata"],
+    [],
+    ["llvm-profdata-14", "llvm-profdata", "llvm-profdata-10", "llvm-profdata-11", "llvm-profdata-18"],
 )
 LLVM_OPT_BIN = _resolve_tool_path(
     "AF_LLVM_OPT_BIN",
@@ -588,6 +589,14 @@ SETUP_FUNC_CACHE_SIZE = 200  # Maximum number of cached setup functions
 # 启用状态驱动映射作为 Path B
 # 设为 False 时完全跳过 StateDrivenMapper，直接使用原有 Path B/C
 ENABLE_STATE_DRIVEN_PATH_B = True
+
+# Simplified roadblock breakthrough path toggles for ablation.
+ENABLE_SIMPLIFIED_FLAG_PATH = True
+ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH = True
+ENABLE_SIMPLIFIED_STATE_DRIVEN_PATH = True
+ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH = True
+ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH = True
+ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH = True
 
 # v2 流程前置判断开关
 # True: 执行 judge_conflict_v2 前置判断

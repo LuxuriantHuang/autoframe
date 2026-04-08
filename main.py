@@ -113,6 +113,27 @@ class DirectTextSeedResult:
     failure_reason: Optional[str] = None
 
 
+@dataclass
+class SimplifiedAttemptContext:
+    roadblock: dict[str, Any]
+    roadblock_id: int | str
+    roadblock_key: str
+    tracer: CoverageTracer
+    llm_util: LLMUtil
+    call_chain: list[str]
+    code_slice: str
+    constraints: str
+    summary: str
+    bcode: str
+    seed: Optional[str]
+    orig: Optional[str]
+    fields: Optional[dict[str, Any]]
+    relevant_info: Optional[dict[str, Any]]
+    harness_for_mode: str | None
+    state_hints: list[Any]
+    generation_mode: str
+
+
 def setup_logger():
     global _logger_initialized
     # Skip if already initialized to prevent creating multiple log files
@@ -6813,6 +6834,409 @@ def create_batch_mutation_seed_dir(seed_dir: str, target_dir: str | Path | None 
     return os.fspath(filtered_dir), selected_count
 
 
+def process_relevant_fields_for_simplified_path(
+    seed: str,
+    *,
+    roadblock_id: int | str,
+    rb_file: str,
+    rb_line: int,
+    enable_semantic_parsing: bool = True,
+) -> tuple[Optional[dict[str, Any]], Optional[str], Optional[dict[str, Any]]]:
+    global taint_extraction_failures
+
+    taint_dir = config.get_taint_artifact_dir(seed, roadblock_id)
+    semantic_dir = config.get_semantic_fields_artifact_dir(seed, roadblock_id)
+    taint_dir.mkdir(parents=True, exist_ok=True)
+    semantic_dir.mkdir(parents=True, exist_ok=True)
+    tseed_isi_path = taint_dir / "tseed.isi"
+    tseed_isi_json_path = taint_dir / "tseed.isi.json"
+    result_json_path = semantic_dir / "result.json"
+    relevant_field_json_path = taint_dir / "relevant_field.json"
+    seed_path = config.find_seed_path(seed)
+    if seed_path is None:
+        return None, None, None
+
+    root_seed_path = find_seed_root(seed_path.parent.as_posix(), seed_path.name, OUTPUT_PATH.as_posix())
+    resolved_seed_path = Path(root_seed_path) if root_seed_path else seed_path
+    if not resolved_seed_path.exists():
+        return None, None, None
+
+    shutil.copy2(resolved_seed_path, tseed_isi_path)
+    env = os.environ.copy()
+    env['LD_LIBRARY_PATH'] = os.path.expanduser(
+        "~/Desktop/autoframe/ipl-modeling/install/lib") + ':' + os.environ.get('LD_LIBRARY_PATH', '')
+    env['DFSAN_OPTIONS'] = "warn_unimplemented=0"
+    env['TARGET_BRANCH'] = f'{os.path.basename(rb_file)}:{rb_line}'
+
+    if taint_extraction_failures >= TAINT_EXTRACTION_FAILURE_THRESHOLD:
+        logger.warning(
+            f"[{LogOp.ROADBLOCK}] Taint extraction disabled for this session after "
+            f"{taint_extraction_failures} consecutive failures"
+        )
+        return None, None, None
+
+    cmd_extract = [IPL_TARGET_PATH, tseed_isi_path]
+    subprocess.run(cmd_extract, env=env, stderr=subprocess.DEVNULL)
+
+    isi_json_path = tseed_isi_json_path
+    if not os.path.exists(isi_json_path):
+        taint_extraction_failures += 1
+        return None, None, None
+    taint_extraction_failures = 0
+
+    fields = None
+    if enable_semantic_parsing:
+        fields = build_semantic_fields(
+            project=PROJECT,
+            seed_path=resolved_seed_path,
+            isi_json_path=isi_json_path,
+            out_path=result_json_path,
+            harness_code=get_harness_code(),
+        )
+        if fields and 'error' in fields:
+            fields = None
+
+    env['BRANCH_FIELD_EXPORT'] = relevant_field_json_path.as_posix()
+    if fields and os.path.exists(result_json_path):
+        env['FIELD_CONFIG_FILE'] = result_json_path.as_posix()
+
+    subprocess.run(cmd_extract, env=env, stderr=subprocess.DEVNULL)
+    if not os.path.exists(relevant_field_json_path):
+        taint_extraction_failures += 1
+        return None, None, None
+    taint_extraction_failures = 0
+
+    with open(relevant_field_json_path, 'r') as f:
+        rel_json = ujson.load(f)
+    return rel_json['branches'][0], resolved_seed_path.name, fields
+
+
+def attempt_simplified_flag_path(
+    ctx: SimplifiedAttemptContext,
+    relevant_flags: list[dict[str, Any]],
+    constant_groups: dict[str, Any],
+) -> bool:
+    global fuzzer, output_dir
+
+    if not (ENABLE_SIMPLIFIED_FLAG_PATH and relevant_flags):
+        return False
+
+    try:
+        flag_reachable, flag_result = solve_with_flags(
+            ctx.code_slice,
+            ctx.roadblock,
+            ctx.constraints,
+            relevant_flags,
+            constant_groups,
+            ctx.llm_util,
+            prompts
+        )
+        if not (flag_reachable and flag_result):
+            return False
+        script = extract_script_from_flag_result(flag_result)
+        if not script:
+            return False
+        llm_target_path = Path(output_dir) / "LLM" / "queue"
+        os.makedirs(llm_target_path, exist_ok=True)
+        seed_id = len(os.listdir(llm_target_path))
+        solved, _, dest_file = extract_and_test(
+            ctx.llm_util,
+            script,
+            ctx.roadblock_id,
+            seed_id,
+            ctx.tracer,
+            fuzzer,
+            roadblock=ctx.roadblock,
+            call_chain=ctx.call_chain,
+            code_slice=ctx.code_slice,
+        )
+        return solved or bool(dest_file)
+    except Exception as e:
+        logger.error(f"[{LogOp.ROADBLOCK}] Flag-based solving error: {e}", exc_info=True)
+        return False
+
+
+def attempt_simplified_taint_mutation_path(ctx: SimplifiedAttemptContext, pattern_json: str) -> bool:
+    global fuzzer, output_dir
+
+    if not (ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH and ctx.seed and ctx.relevant_info and ctx.relevant_info.get('ranges')):
+        return False
+
+    try:
+        mut_target_path = Path(output_dir) / "mut" / "queue"
+        os.makedirs(mut_target_path, exist_ok=True)
+        seed_id = len(os.listdir(mut_target_path))
+        field = ctx.relevant_info['fields']
+        byte_range = [dict(item) for item in ctx.relevant_info['ranges']]
+        if byte_range:
+            byte_range[0]['end'] = str(int(byte_range[0]['end']) - 1)
+        suggestions = mutate_suggest_with_taint(
+            ctx.code_slice, ctx.constraints, field if field else "", byte_range, ctx.llm_util, pattern_json
+        )
+        if not suggestions['passable']:
+            return False
+        script = get_mutate_script(
+            suggestions['input_modifications'],
+            ctx.llm_util,
+            fields=ctx.fields,
+            harness_code=ctx.harness_for_mode,
+            preferred_seed=ctx.seed,
+        )
+        if not script:
+            return False
+        solved, _, dest_file = mutate_and_test(
+            ctx.llm_util,
+            script,
+            seed_id,
+            ctx.seed,
+            fuzzer,
+            ctx.tracer,
+            roadblock=ctx.roadblock,
+            call_chain=ctx.call_chain,
+        )
+        return solved or bool(dest_file)
+    except Exception as e:
+        logger.error(f"[{LogOp.ROADBLOCK}] Simplified Path A error: {e}", exc_info=True)
+        return False
+
+
+def attempt_simplified_state_driven_path(ctx: SimplifiedAttemptContext) -> bool:
+    global fuzzer, output_dir
+
+    if not (ENABLE_SIMPLIFIED_STATE_DRIVEN_PATH and ENABLE_STATE_DRIVEN_PATH_B and ctx.seed is not None):
+        return False
+
+    try:
+        mut_target_path = Path(output_dir) / "mut" / "queue"
+        os.makedirs(mut_target_path, exist_ok=True)
+        seed_id = len(os.listdir(mut_target_path))
+        state_mapper = StateDrivenMapper(ctx.llm_util)
+        sample_seed_path = Path(output_dir) / 'default' / 'queue' / ctx.seed
+        taint_info = {'branches': [ctx.relevant_info]} if ctx.relevant_info and ctx.relevant_info.get('ranges') else None
+        known_format_info = {'format_info': cached_format_info} if cached_format_info else None
+        mapping_result = state_mapper.analyze(
+            code_slice=ctx.code_slice,
+            roadblock=ctx.roadblock,
+            sample_seed_path=sample_seed_path,
+            taint_info=taint_info,
+            known_format_info=known_format_info
+        )
+        if not (mapping_result and mapping_result.get('state_mappings')):
+            return False
+        script = state_mapper.generate_mutation_script(
+            mappings=mapping_result,
+            constraints=ctx.constraints,
+            output_path=MUT_TMP_PATH / f"state_{ctx.roadblock_id}"
+        )
+        if not script:
+            return False
+        script = extract_generator(script)
+        solved, _, dest_file = mutate_and_test(
+            ctx.llm_util,
+            script,
+            seed_id,
+            ctx.orig if ctx.orig else ctx.seed,
+            fuzzer,
+            ctx.tracer,
+            roadblock=ctx.roadblock,
+            call_chain=ctx.call_chain,
+        )
+        return solved or bool(dest_file)
+    except Exception as e:
+        logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path B state-driven error: {e}", exc_info=True)
+        return False
+
+
+def attempt_simplified_field_mutation_path(ctx: SimplifiedAttemptContext, pattern_json: str) -> bool:
+    global fuzzer, output_dir
+
+    if not (ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH and ctx.seed is not None and ctx.fields is not None):
+        return False
+
+    try:
+        mut_target_path = Path(output_dir) / "mut" / "queue"
+        os.makedirs(mut_target_path, exist_ok=True)
+        seed_id = len(os.listdir(mut_target_path))
+        suggestions = mutate_suggest_without_taint(
+            ctx.code_slice,
+            ctx.fields,
+            ctx.bcode,
+            ctx.llm_util,
+            pattern_json
+        )
+        if not suggestions['passable']:
+            return False
+        script = get_mutate_script(
+            suggestions['input_modifications'],
+            ctx.llm_util,
+            fields=ctx.fields,
+            harness_code=ctx.harness_for_mode,
+            preferred_seed=ctx.seed,
+        )
+        if not script:
+            return False
+        solved, _, dest_file = mutate_and_test(
+            ctx.llm_util,
+            script,
+            seed_id,
+            ctx.orig if ctx.orig else ctx.seed,
+            fuzzer,
+            ctx.tracer,
+            roadblock=ctx.roadblock,
+            call_chain=ctx.call_chain,
+        )
+        return solved or bool(dest_file)
+    except Exception as e:
+        logger.error(f"[{LogOp.ROADBLOCK}] Simplified Path B fallback error: {e}", exc_info=True)
+        return False
+
+
+def attempt_simplified_batch_mutation_path(ctx: SimplifiedAttemptContext) -> bool:
+    global output_dir
+
+    if not ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH:
+        return False
+
+    logger.info(f"[{LogOp.ROADBLOCK}] Simplified Path D: trying batch mutation process")
+    try:
+        target_side = "true" if ctx.roadblock['status'] else "false"
+        input_source = identify_input_source(ctx.code_slice)
+        branch_analysis_result = run_branch_analysis(ctx.code_slice, ctx.bcode, input_source, ctx.llm_util)
+        if not (branch_analysis_result and branch_analysis_result.get('passable', False)):
+            return False
+        mutator_rule = run_mutator_rule_gen(branch_analysis_result, target_side, ctx.llm_util)
+        if not (mutator_rule and mutator_rule.get('edits')):
+            return False
+        seed_dir = os.path.join(output_dir, 'default', 'queue')
+        branch_id = mutator_rule.get("branch_id") or "llm_mut"
+        branch_work_dir = config.get_branch_output_dir(branch_id)
+        batch_out_dir = config.get_branch_queue_dir(branch_id)
+        manifest_dir = branch_work_dir
+        filtered_seed_dir = config.get_batch_mutation_filtered_seed_dir(branch_id)
+        filtered_seed_dir, _ = create_batch_mutation_seed_dir(seed_dir, filtered_seed_dir)
+        Path(batch_out_dir).mkdir(parents=True, exist_ok=True)
+        Path(manifest_dir).mkdir(parents=True, exist_ok=True)
+        batch_script = run_mutate_batch_script_gen(
+            mutator_rule,
+            filtered_seed_dir,
+            os.fspath(batch_out_dir),
+            os.fspath(manifest_dir),
+            ctx.llm_util,
+        )
+        if not batch_script:
+            shutil.rmtree(filtered_seed_dir, ignore_errors=True)
+            return False
+        script_path = config.get_batch_mutation_script_path(branch_id)
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(script_path, 'w') as f:
+            f.write(batch_script)
+        result = subprocess.run(
+            ['python3', os.fspath(script_path), filtered_seed_dir, os.fspath(batch_out_dir), os.fspath(manifest_dir)],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        shutil.rmtree(filtered_seed_dir, ignore_errors=True)
+        if result.returncode != 0 or not os.path.exists(batch_out_dir):
+            return False
+        mutated_files = [f for f in os.listdir(batch_out_dir) if not f.startswith('.')]
+        if not mutated_files:
+            return False
+        logger.info(
+            f"[{LogOp.ROADBLOCK}] Simplified Path D generated {len(mutated_files)} candidate seed(s); "
+            f"deferring effectiveness judgment to the outer coverage check"
+        )
+        return True
+    except subprocess.TimeoutExpired:
+        logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path D timeout")
+        return False
+    except Exception as e:
+        logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path D error: {e}", exc_info=True)
+        return False
+
+
+def attempt_simplified_direct_generation_path(ctx: SimplifiedAttemptContext, pattern_json: str) -> bool:
+    global fuzzer, output_dir
+
+    if not ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH:
+        return False
+
+    logger.info(f"[{LogOp.ROADBLOCK}] Simplified Path C: trying direct generation")
+    try:
+        llm_target_path = Path(output_dir) / "LLM" / "queue"
+        os.makedirs(llm_target_path, exist_ok=True)
+        seed_id = len(os.listdir(llm_target_path))
+        if ctx.generation_mode == "text_direct":
+            generation_messages = build_direct_text_generation_messages(
+                ctx.code_slice,
+                ctx.constraints,
+                ctx.summary,
+                fields=ctx.fields,
+                target_branch=ctx.bcode,
+                state_hints=ctx.state_hints,
+                harness_code=ctx.harness_for_mode,
+                preferred_seed=ctx.seed,
+            )
+            seed_path = os.path.join(llm_target_path, f"id:{int(seed_id):06},bid:{int(ctx.roadblock_id):06}")
+            text_result = write_direct_text_seed_and_test(
+                ctx.llm_util,
+                generation_messages,
+                seed_path,
+                roadblock=ctx.roadblock,
+                call_chain=ctx.call_chain,
+                max_attempts=MAX_TIME,
+            )
+            if text_result.attempt_made:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Simplified Path C wrote a direct-text candidate; "
+                    f"deferring effectiveness judgment to the outer coverage check"
+                )
+                if text_result.gate_result:
+                    logger.info(
+                        f"[SEED_GATE] Simplified Path C text decision={text_result.gate_result.decision} "
+                        f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
+                    )
+                return True
+            return False
+
+        generation_messages = build_generate_script_messages(
+            ctx.code_slice,
+            ctx.constraints,
+            ctx.summary,
+            fields=ctx.fields,
+            target_branch=ctx.bcode,
+            state_hints=ctx.state_hints,
+            harness_code=ctx.harness_for_mode,
+            preferred_seed=ctx.seed,
+        )
+        resp = ctx.llm_util.get_response(generation_messages)
+        match = extract_json_with_fallback(resp, pattern_json)
+        if not match:
+            return False
+        res = json.loads(match.group(1).strip())
+        schema_error = validate_generation_result(res)
+        if schema_error:
+            return False
+        script = res['generation_script']
+        if not script:
+            return False
+        solved, _, dest_file = extract_and_test(
+            ctx.llm_util,
+            script,
+            ctx.roadblock_id,
+            seed_id,
+            ctx.tracer,
+            fuzzer,
+            roadblock=ctx.roadblock,
+            call_chain=ctx.call_chain,
+            code_slice=ctx.code_slice,
+        )
+        return solved or bool(dest_file)
+    except Exception as e:
+        logger.error(f"[{LogOp.ROADBLOCK}] Simplified Path C error: {e}", exc_info=True)
+        return False
+
+
 def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
     global inference_stats, attempted_roadblocks
     global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
@@ -6875,73 +7299,6 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
         )
 
     pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
-
-    def process_relevant_fields(seed, enable_semantic_parsing=True):
-        global taint_extraction_failures
-        taint_dir = config.get_taint_artifact_dir(seed, roadblock_id)
-        semantic_dir = config.get_semantic_fields_artifact_dir(seed, roadblock_id)
-        taint_dir.mkdir(parents=True, exist_ok=True)
-        semantic_dir.mkdir(parents=True, exist_ok=True)
-        tseed_isi_path = taint_dir / "tseed.isi"
-        tseed_isi_json_path = taint_dir / "tseed.isi.json"
-        result_json_path = semantic_dir / "result.json"
-        relevant_field_json_path = taint_dir / "relevant_field.json"
-        seed_path = config.find_seed_path(seed)
-        if seed_path is None:
-            return None, None, None
-
-        root_seed_path = find_seed_root(seed_path.parent.as_posix(), seed_path.name, OUTPUT_PATH.as_posix())
-        resolved_seed_path = Path(root_seed_path) if root_seed_path else seed_path
-        if not resolved_seed_path.exists():
-            return None, None, None
-
-        shutil.copy2(resolved_seed_path, tseed_isi_path)
-        env = os.environ.copy()
-        env['LD_LIBRARY_PATH'] = os.path.expanduser(
-            "~/Desktop/autoframe/ipl-modeling/install/lib") + ':' + os.environ.get('LD_LIBRARY_PATH', '')
-        env['DFSAN_OPTIONS'] = "warn_unimplemented=0"
-        env['TARGET_BRANCH'] = f'{os.path.basename(rb_file)}:{rb_line}'
-
-        if taint_extraction_failures >= TAINT_EXTRACTION_FAILURE_THRESHOLD:
-            logger.warning(
-                f"[{LogOp.ROADBLOCK}] Taint extraction disabled for this session after "
-                f"{taint_extraction_failures} consecutive failures"
-            )
-            return None, None, None
-
-        cmd_extract = [IPL_TARGET_PATH, tseed_isi_path]
-        subprocess.run(cmd_extract, env=env, stderr=subprocess.DEVNULL)
-
-        isi_json_path = tseed_isi_json_path
-        if not os.path.exists(isi_json_path):
-            taint_extraction_failures += 1
-            return None, None, None
-        taint_extraction_failures = 0
-
-        fields = None
-        if enable_semantic_parsing:
-            fields = build_semantic_fields(
-                project=PROJECT,
-                seed_path=resolved_seed_path,
-                isi_json_path=isi_json_path,
-                out_path=result_json_path,
-                harness_code=get_harness_code(),
-            )
-            if fields and 'error' in fields:
-                fields = None
-
-        env['BRANCH_FIELD_EXPORT'] = relevant_field_json_path.as_posix()
-        if fields and os.path.exists(result_json_path):
-            env['FIELD_CONFIG_FILE'] = result_json_path.as_posix()
-
-        subprocess.run(cmd_extract, env=env, stderr=subprocess.DEVNULL)
-        if not os.path.exists(relevant_field_json_path):
-            taint_extraction_failures += 1
-            return None, None, None
-        taint_extraction_failures = 0
-        with open(relevant_field_json_path, 'r') as f:
-            rel_json = ujson.load(f)
-        return rel_json['branches'][0], resolved_seed_path.name, fields
 
     for call_chain in call_chains:
         if using_fallback_slice:
@@ -7066,8 +7423,11 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
             enable_semantic = PROJECT in ENABLE_FIELD_PARSING or has_semantic_field_provider(PROJECT)
             for candidate_seed in ranked_seed_names:
                 seed = candidate_seed
-                relevant_info, orig, fields = process_relevant_fields(
+                relevant_info, orig, fields = process_relevant_fields_for_simplified_path(
                     seed,
+                    roadblock_id=roadblock_id,
+                    rb_file=rb_file,
+                    rb_line=rb_line,
                     enable_semantic_parsing=enable_semantic,
                 )
                 if orig is not None:
@@ -7075,267 +7435,46 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
 
         harness_for_mode = get_harness_code()
         generation_mode = infer_input_generation_mode(code_slice, harness_for_mode)
+        attempt_ctx = SimplifiedAttemptContext(
+            roadblock=roadblock,
+            roadblock_id=roadblock_id,
+            roadblock_key=roadblock_key,
+            tracer=tracer,
+            llm_util=llm_util,
+            call_chain=call_chain,
+            code_slice=code_slice,
+            constraints=constraints,
+            summary=summary,
+            bcode=bcode,
+            seed=seed,
+            orig=orig,
+            fields=fields,
+            relevant_info=relevant_info,
+            harness_for_mode=harness_for_mode,
+            state_hints=state_hints,
+            generation_mode=generation_mode,
+        )
+
+        path_attempts = [
+            ("flag", ENABLE_SIMPLIFIED_FLAG_PATH, lambda: attempt_simplified_flag_path(attempt_ctx, relevant_flags, constant_groups)),
+            ("taint_mutation", ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH, lambda: attempt_simplified_taint_mutation_path(attempt_ctx, pattern_json)),
+            ("state_driven", ENABLE_SIMPLIFIED_STATE_DRIVEN_PATH and ENABLE_STATE_DRIVEN_PATH_B, lambda: attempt_simplified_state_driven_path(attempt_ctx)),
+            ("field_mutation", ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH, lambda: attempt_simplified_field_mutation_path(attempt_ctx, pattern_json)),
+            ("batch_mutation", ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH, lambda: attempt_simplified_batch_mutation_path(attempt_ctx)),
+            ("direct_generation", ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH, lambda: attempt_simplified_direct_generation_path(attempt_ctx, pattern_json)),
+        ]
+
         attempt_made = False
-
-        if has_flags and relevant_flags:
-            try:
-                flag_reachable, flag_result = solve_with_flags(
-                    code_slice,
-                    roadblock,
-                    constraints,
-                    relevant_flags,
-                    constant_groups,
-                    llm_util,
-                    prompts
-                )
-                if flag_reachable and flag_result:
-                    script = extract_script_from_flag_result(flag_result)
-                    if script:
-                        llm_target_path = Path(output_dir) / "LLM" / "queue"
-                        os.makedirs(llm_target_path, exist_ok=True)
-                        seed_id = len(os.listdir(llm_target_path))
-                        solved, script, dest_file = extract_and_test(
-                            llm_util,
-                            script,
-                            roadblock_id,
-                            seed_id,
-                            tracer,
-                            fuzzer,
-                            roadblock=roadblock,
-                            call_chain=call_chain,
-                            code_slice=code_slice,
-                        )
-                        attempt_made = attempt_made or solved or bool(dest_file)
-            except Exception as e:
-                logger.error(f"[{LogOp.ROADBLOCK}] Flag-based solving error: {e}", exc_info=True)
-
-        if relevant_info and relevant_info.get('ranges'):
-            try:
-                mut_target_path = Path(output_dir) / "mut" / "queue"
-                os.makedirs(mut_target_path, exist_ok=True)
-                seed_id = len(os.listdir(mut_target_path))
-                field = relevant_info['fields']
-                byte_range = relevant_info['ranges']
-                byte_range[0]['end'] = str(int(byte_range[0]['end']) - 1)
-                suggestions = mutate_suggest_with_taint(
-                    code_slice, constraints, field if field else "", byte_range, llm_util, pattern_json
-                )
-                if suggestions['passable']:
-                    script = get_mutate_script(
-                        suggestions['input_modifications'],
-                        llm_util,
-                        fields=fields,
-                        harness_code=harness_for_mode,
-                        preferred_seed=seed,
-                    )
-                    if script:
-                        solved, script, dest_file = mutate_and_test(
-                            llm_util,
-                            script,
-                            seed_id,
-                            seed,
-                            fuzzer,
-                            tracer,
-                            roadblock=roadblock,
-                            call_chain=call_chain,
-                        )
-                        attempt_made = attempt_made or solved or bool(dest_file)
-            except Exception as e:
-                logger.error(f"[{LogOp.ROADBLOCK}] Simplified Path A error: {e}", exc_info=True)
-
-        if seed is not None:
-            mut_target_path = Path(output_dir) / "mut" / "queue"
-            os.makedirs(mut_target_path, exist_ok=True)
-            seed_id = len(os.listdir(mut_target_path))
-
-            if ENABLE_STATE_DRIVEN_PATH_B:
-                try:
-                    state_mapper = StateDrivenMapper(llm_util)
-                    sample_seed_path = Path(output_dir) / 'default' / 'queue' / seed
-                    taint_info = {'branches': [relevant_info]} if relevant_info and relevant_info.get('ranges') else None
-                    known_format_info = {'format_info': cached_format_info} if cached_format_info else None
-                    mapping_result = state_mapper.analyze(
-                        code_slice=code_slice,
-                        roadblock=roadblock,
-                        sample_seed_path=sample_seed_path,
-                        taint_info=taint_info,
-                        known_format_info=known_format_info
-                    )
-                    if mapping_result and mapping_result.get('state_mappings'):
-                        script = state_mapper.generate_mutation_script(
-                            mappings=mapping_result,
-                            constraints=constraints,
-                            output_path=MUT_TMP_PATH / f"state_{roadblock_id}"
-                        )
-                        if script:
-                            script = extract_generator(script)
-                            solved, script, dest_file = mutate_and_test(
-                                llm_util,
-                                script,
-                                seed_id,
-                                orig if orig else seed,
-                                fuzzer,
-                                tracer,
-                                roadblock=roadblock,
-                                call_chain=call_chain,
-                            )
-                            attempt_made = attempt_made or solved or bool(dest_file)
-                except Exception as e:
-                    logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path B state-driven error: {e}", exc_info=True)
-
-            if fields is not None:
-                try:
-                    suggestions = mutate_suggest_without_taint(
-                        code_slice,
-                        fields,
-                        bcode,
-                        llm_util,
-                        pattern_json
-                    )
-                    if suggestions['passable']:
-                        script = get_mutate_script(
-                            suggestions['input_modifications'],
-                            llm_util,
-                            fields=fields,
-                            harness_code=harness_for_mode,
-                            preferred_seed=seed,
-                        )
-                        if script:
-                            solved, script, dest_file = mutate_and_test(
-                                llm_util,
-                                script,
-                                seed_id,
-                                orig if orig else seed,
-                                fuzzer,
-                                tracer,
-                                roadblock=roadblock,
-                                call_chain=call_chain,
-                            )
-                            attempt_made = attempt_made or solved or bool(dest_file)
-                except Exception as e:
-                    logger.error(f"[{LogOp.ROADBLOCK}] Simplified Path B fallback error: {e}", exc_info=True)
-
-        logger.info(f"[{LogOp.ROADBLOCK}] Simplified Path D: trying batch mutation process")
-        try:
-            target_branch = bcode
-            target_side = "true" if roadblock['status'] else "false"
-            input_source = identify_input_source(code_slice)
-            branch_analysis_result = run_branch_analysis(code_slice, target_branch, input_source, llm_util)
-            if branch_analysis_result and branch_analysis_result.get('passable', False):
-                mutator_rule = run_mutator_rule_gen(branch_analysis_result, target_side, llm_util)
-                if mutator_rule and mutator_rule.get('edits'):
-                    seed_dir = os.path.join(output_dir, 'default', 'queue')
-                    branch_id = mutator_rule.get("branch_id") or "llm_mut"
-                    branch_work_dir = config.get_branch_output_dir(branch_id)
-                    batch_out_dir = config.get_branch_queue_dir(branch_id)
-                    manifest_dir = branch_work_dir
-                    filtered_seed_dir = config.get_batch_mutation_filtered_seed_dir(branch_id)
-                    filtered_seed_dir, filtered_seed_count = create_batch_mutation_seed_dir(seed_dir, filtered_seed_dir)
-                    Path(batch_out_dir).mkdir(parents=True, exist_ok=True)
-                    Path(manifest_dir).mkdir(parents=True, exist_ok=True)
-                    batch_script = run_mutate_batch_script_gen(
-                        mutator_rule,
-                        filtered_seed_dir,
-                        os.fspath(batch_out_dir),
-                        os.fspath(manifest_dir),
-                        llm_util,
-                    )
-                    if batch_script:
-                        script_path = config.get_batch_mutation_script_path(branch_id)
-                        script_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(script_path, 'w') as f:
-                            f.write(batch_script)
-                        result = subprocess.run(
-                            ['python3', os.fspath(script_path), filtered_seed_dir, os.fspath(batch_out_dir), os.fspath(manifest_dir)],
-                            capture_output=True,
-                            text=True,
-                            timeout=300
-                        )
-                        shutil.rmtree(filtered_seed_dir, ignore_errors=True)
-                        if result.returncode == 0 and os.path.exists(batch_out_dir):
-                            mutated_files = [f for f in os.listdir(batch_out_dir) if not f.startswith('.')]
-                            if mutated_files:
-                                logger.info(
-                                    f"[{LogOp.ROADBLOCK}] Simplified Path D generated {len(mutated_files)} candidate seed(s); "
-                                    f"deferring effectiveness judgment to the outer coverage check"
-                                )
-                                attempt_made = True
-                    else:
-                        shutil.rmtree(filtered_seed_dir, ignore_errors=True)
-        except subprocess.TimeoutExpired:
-            logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path D timeout")
-        except Exception as e:
-            logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path D error: {e}", exc_info=True)
-
-        logger.info(f"[{LogOp.ROADBLOCK}] Simplified Path C: trying direct generation")
-        try:
-            llm_target_path = Path(output_dir) / "LLM" / "queue"
-            os.makedirs(llm_target_path, exist_ok=True)
-            seed_id = len(os.listdir(llm_target_path))
-            if generation_mode == "text_direct":
-                generation_messages = build_direct_text_generation_messages(
-                    code_slice,
-                    constraints,
-                    summary,
-                    fields=fields,
-                    target_branch=bcode,
-                    state_hints=state_hints,
-                    harness_code=harness_for_mode,
-                    preferred_seed=seed,
-                )
-                seed_path = os.path.join(llm_target_path, f"id:{int(seed_id):06},bid:{int(roadblock_id):06}")
-                text_result = write_direct_text_seed_and_test(
-                    llm_util,
-                    generation_messages,
-                    seed_path,
-                    roadblock=roadblock,
-                    call_chain=call_chain,
-                    max_attempts=MAX_TIME,
-                )
-                if text_result.attempt_made:
-                    logger.info(
-                        f"[{LogOp.ROADBLOCK}] Simplified Path C wrote a direct-text candidate; "
-                        f"deferring effectiveness judgment to the outer coverage check"
-                    )
-                    if text_result.gate_result:
-                        logger.info(
-                            f"[SEED_GATE] Simplified Path C text decision={text_result.gate_result.decision} "
-                            f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
-                        )
-                    attempt_made = True
+        for path_name, enabled, path_runner in path_attempts:
+            if not enabled:
+                logger.info(f"[{LogOp.ROADBLOCK}] Simplified path `{path_name}` disabled by config")
+                continue
+            path_attempted = path_runner()
+            if path_attempted:
+                logger.info(f"[{LogOp.ROADBLOCK}] Simplified path `{path_name}` produced candidate output")
             else:
-                generation_messages = build_generate_script_messages(
-                    code_slice,
-                    constraints,
-                    summary,
-                    fields=fields,
-                    target_branch=bcode,
-                    state_hints=state_hints,
-                    harness_code=harness_for_mode,
-                    preferred_seed=seed,
-                )
-                resp = llm_util.get_response(generation_messages)
-                match = extract_json_with_fallback(resp, pattern_json)
-                if match:
-                    res = json.loads(match.group(1).strip())
-                    schema_error = validate_generation_result(res)
-                    if not schema_error:
-                        script = res['generation_script']
-                        if script:
-                            solved, script, dest_file = extract_and_test(
-                                llm_util,
-                                script,
-                                roadblock_id,
-                                seed_id,
-                                tracer,
-                                fuzzer,
-                                roadblock=roadblock,
-                                call_chain=call_chain,
-                                code_slice=code_slice,
-                            )
-                            attempt_made = attempt_made or solved or bool(dest_file)
-        except Exception as e:
-            logger.error(f"[{LogOp.ROADBLOCK}] Simplified Path C error: {e}", exc_info=True)
+                logger.info(f"[{LogOp.ROADBLOCK}] Simplified path `{path_name}` produced no candidate output")
+            attempt_made = attempt_made or path_attempted
 
         return attempt_made, "ATTEMPTED_ALL_PATHS", -1, roadblock_id
 
