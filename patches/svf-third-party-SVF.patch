@@ -1,0 +1,36 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5ce30739..ae43b431 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -54,6 +54,8 @@ INSTALL(
+     FILES_MATCHING
+     PATTERN "**/*.h"
+     )
+-enable_testing()
+-add_subdirectory(Test-Suite)
+-include(CTest)
++if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Test-Suite/CMakeLists.txt")
++    enable_testing()
++    add_subdirectory(Test-Suite)
++    include(CTest)
++endif()
+
+diff --git a/use_svf_llvm10.sh b/use_svf_llvm10.sh
+new file mode 100755
+index 00000000..91edd7b5
+--- /dev/null
++++ b/use_svf_llvm10.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++set -e
++
++SVF_ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
++export LLVM_DIR="/usr/lib/llvm-10/lib/cmake/llvm"
++export Z3_DIR="${SVF_ROOT}/z3.obj"
++export PATH="${SVF_ROOT}/Release-build/bin:/usr/lib/llvm-10/bin:${PATH}"
++export LD_LIBRARY_PATH="${Z3_DIR}/bin:${LD_LIBRARY_PATH}"
++
++echo "SVF_ROOT=${SVF_ROOT}"
++echo "LLVM_DIR=${LLVM_DIR}"
++echo "Z3_DIR=${Z3_DIR}"
++echo "PATH updated with ${SVF_ROOT}/Release-build/bin"

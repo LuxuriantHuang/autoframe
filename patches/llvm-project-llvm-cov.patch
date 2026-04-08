@@ -1,0 +1,1407 @@
+diff --git a/llvm/tools/llvm-cov/CodeCoverage.cpp b/llvm/tools/llvm-cov/CodeCoverage.cpp
+index 6c66858c4..608a218a8 100644
+--- a/llvm/tools/llvm-cov/CodeCoverage.cpp
++++ b/llvm/tools/llvm-cov/CodeCoverage.cpp
+@@ -123,6 +123,11 @@ private:
+   /// (path-equivalence).
+   void remapPathNames(const CoverageMapping &Coverage);
+ 
++  /// Resolve user-provided source paths that did not exist locally at parse
++  /// time, such as basenames or short relative paths, against the coverage
++  /// mapping file list.
++  void resolveDeferredSourceFiles(const CoverageMapping &Coverage);
++
+   /// Remove input source files which aren't mapped by \p Coverage.
+   void removeUnmappedInputs(const CoverageMapping &Coverage);
+ 
+@@ -158,6 +163,10 @@ private:
+   /// A list of input source files.
+   std::vector<std::string> SourceFiles;
+ 
++  /// Input source files that were not found locally when parsed. These may
++  /// still be resolvable once coverage mapping filenames are available.
++  std::vector<std::string> DeferredSourceFiles;
++
+   /// In -path-equivalence mode, this maps the absolute paths from the coverage
+   /// mapping data to the input source files.
+   StringMap<std::string> RemappedFilenames;
+@@ -233,8 +242,10 @@ void CodeCoverageTool::collectPaths(const std::string &Path) {
+   if (!llvm::sys::fs::exists(Status)) {
+     if (PathRemappings)
+       addCollectedPath(Path);
+-    else
+-      warning("Source file doesn't exist, proceeded by ignoring it.", Path);
++    else {
++      DeferredSourceFiles.emplace_back(Path);
++      HadSourceFiles = true;
++    }
+     return;
+   }
+ 
+@@ -484,6 +495,7 @@ std::unique_ptr<CoverageMapping> CodeCoverageTool::load() {
+   }
+ 
+   remapPathNames(*Coverage);
++  resolveDeferredSourceFiles(*Coverage);
+ 
+   if (!SourceFiles.empty())
+     removeUnmappedInputs(*Coverage);
+@@ -543,6 +555,63 @@ void CodeCoverageTool::remapPathNames(const CoverageMapping &Coverage) {
+   }
+ }
+ 
++void CodeCoverageTool::resolveDeferredSourceFiles(const CoverageMapping &Coverage) {
++  if (DeferredSourceFiles.empty())
++    return;
++
++  auto normalizePath = [](StringRef Path) -> std::string {
++    SmallString<128> NativePath(Path);
++    sys::path::native(NativePath);
++    sys::path::remove_dots(NativePath, true);
++    return std::string(NativePath);
++  };
++
++  for (const std::string &InputPath : DeferredSourceFiles) {
++    const std::string NormalizedInput = normalizePath(InputPath);
++    const StringRef InputRef(NormalizedInput);
++    const StringRef InputBase = sys::path::filename(InputRef);
++
++    std::string Match;
++    bool Ambiguous = false;
++
++    for (StringRef CoveredFile : Coverage.getUniqueSourceFiles()) {
++      const std::string NormalizedCovered = normalizePath(CoveredFile);
++      const StringRef CoveredRef(NormalizedCovered);
++
++      bool IsMatch = CoveredRef == InputRef ||
++                     (!InputBase.empty() && sys::path::filename(CoveredRef) == InputBase) ||
++                     CoveredRef.ends_with(InputRef);
++      if (!IsMatch)
++        continue;
++
++      if (Match.empty()) {
++        Match = NormalizedCovered;
++        continue;
++      }
++
++      if (Match != NormalizedCovered) {
++        Ambiguous = true;
++        break;
++      }
++    }
++
++    if (Ambiguous) {
++      warning("Source file is ambiguous, proceeded by ignoring it.", InputPath);
++      continue;
++    }
++
++    if (Match.empty()) {
++      warning("Source file doesn't exist, proceeded by ignoring it.", InputPath);
++      continue;
++    }
++
++    if (!IgnoreFilenameFilters.matchesFilename(Match))
++      SourceFiles.emplace_back(std::move(Match));
++  }
++
++  DeferredSourceFiles.clear();
++}
++
+ void CodeCoverageTool::removeUnmappedInputs(const CoverageMapping &Coverage) {
+   std::vector<StringRef> CoveredFiles = Coverage.getUniqueSourceFiles();
+ 
+@@ -800,6 +869,18 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
+   cl::opt<bool> CheckBinaryIDs(
+       "check-binary-ids", cl::desc("Fail if an object couldn't be found for a "
+                                    "binary ID in the profile"));
++  cl::opt<bool> ExportOnlyOneSidedBranches(
++    "json-only-one-sided-branches",
++    llvm::cl::desc("Only export branches where only one side is executed (JSON output)"),
++    llvm::cl::init(false));
++  cl::opt<bool> ExportZeroCoveredBranches(
++    "json-zero-covered-branches",
++    llvm::cl::desc("Only export branches where both sides are unexecuted (JSON output)"),
++    llvm::cl::init(false));
++  cl::opt<bool> ExportSkipLowValueGuards(
++    "json-skip-low-value-guards",
++    llvm::cl::desc("Skip obvious low-value null-guard branches during JSON export"),
++    llvm::cl::init(false));
+ 
+   auto commandLineParser = [&, this](int argc, const char **argv) -> int {
+     cl::ParseCommandLineOptions(argc, argv, "LLVM code coverage tool\n");
+@@ -966,6 +1047,9 @@ int CodeCoverageTool::run(Command Cmd, int argc, const char **argv) {
+     ViewOpts.ExportSummaryOnly = SummaryOnly;
+     ViewOpts.NumThreads = NumThreads;
+     ViewOpts.CompilationDirectory = CompilationDirectory;
++    ViewOpts.ExportOnlyOneSidedBranches = ExportOnlyOneSidedBranches;
++    ViewOpts.ExportZeroCoveredBranches = ExportZeroCoveredBranches;
++    ViewOpts.ExportSkipLowValueGuards = ExportSkipLowValueGuards;
+ 
+     return 0;
+   };
+diff --git a/llvm/tools/llvm-cov/CoverageExporterJson.cpp b/llvm/tools/llvm-cov/CoverageExporterJson.cpp
+index 06de33dc0..707ba501b 100644
+--- a/llvm/tools/llvm-cov/CoverageExporterJson.cpp
++++ b/llvm/tools/llvm-cov/CoverageExporterJson.cpp
+@@ -56,10 +56,16 @@
+ #include "llvm/Support/JSON.h"
+ #include "llvm/Support/ThreadPool.h"
+ #include "llvm/Support/Threading.h"
++#include "llvm/Support/MemoryBuffer.h"
++#include "llvm/Support/LineIterator.h"
++#include <cctype>
++#include <set>
+ #include <algorithm>
+ #include <limits>
+ #include <mutex>
+ #include <utility>
++#include <string>
++#include <vector>
+ 
+ /// The semantic version combined as a string.
+ #define LLVM_COVERAGE_EXPORT_JSON_STR "3.0.1"
+@@ -248,6 +254,985 @@ json::Array renderFileMCDC(const coverage::CoverageData &FileCoverage,
+   return MCDCRecordArray;
+ }
+ 
++struct FuncRegion {
++  std::string Name;
++  int FileID;
++  int LineStart, ColStart, LineEnd, ColEnd;
++};
++
++static bool isLoopConditionBranch(const coverage::CountedRegion &R,
++                                  const std::vector<std::string> &Lines) {
++  // 行号非法直接返回 false
++  if (R.LineStart == 0 || R.LineStart >= Lines.size())
++    return false;
++
++  llvm::StringRef RawLine(Lines[R.LineStart]);
++
++  // 去掉左侧缩进（空格、Tab 都会被干掉）
++  llvm::StringRef Trimmed = RawLine.ltrim();
++
++  // 这里故意不再用 ColumnStart 了，避免和缩进对不齐。
++  // 只要这一行（去掉缩进）是以 while/for/do 开头，就认为是循环头。
++  return Trimmed.starts_with("while") ||
++         Trimmed.starts_with("for")   ||
++         Trimmed.starts_with("do");
++}
++
++// 仅一侧被执行的判定
++static bool isOneSidedBranch(const coverage::CountedRegion &R) {
++  uint64_t T = R.ExecutionCount;
++  uint64_t F = R.FalseExecutionCount;
++  return (T == 0) != (F == 0);
++}
++
++// 零覆盖分支判定：两侧都未执行
++static bool isZeroCoveredBranch(const coverage::CountedRegion &R) {
++  uint64_t T = R.ExecutionCount;
++  uint64_t F = R.FalseExecutionCount;
++  return (T == 0) && (F == 0);  // 与运算：两者都为0
++}
++
++// 读取整个文件的行（1-based 索引，Lines[0] 留空）
++static std::vector<std::string> loadFileLines(StringRef Filename) {
++  std::vector<std::string> Lines(1);
++  auto MBOrErr = llvm::MemoryBuffer::getFile(Filename);
++  if (!MBOrErr)
++    return Lines;
++  llvm::line_iterator LI(*MBOrErr->get(), /*SkipBlanks=*/false);
++  for (; !LI.is_at_eof(); ++LI)
++    Lines.emplace_back(std::string(*LI));
++  return Lines;
++}
++
++// ============== 新增：分支组类型定义 ==============
++enum BranchGroupType {
++  BGT_SingleIf,        // 简单if语句
++  BGT_IfElseChain,     // if-else if链
++  BGT_Switch,          // switch语句
++  BGT_Unknown
++};
++
++// 只执行一侧的分支点信息结构体（扩展版）
++struct OneSidedBranchPoint {
++  std::string Filename;
++  unsigned Line;
++  unsigned Col;
++  std::string Code;
++  uint64_t TrueCount;
++  uint64_t FalseCount;
++  const char *Status;
++  unsigned NumZeroSuccessors;
++  double SuccessorVariance;
++  double SuccessorAverage;
++
++  // ============== 新增字段：支持分支组 ==============
++  bool IsPartOfGroup;           // 是否属于分支组
++  BranchGroupType GroupType;    // 分支组类型
++  unsigned GroupSize;           // 组内分支总数
++  unsigned GroupIndex;          // 在组中的索引
++  std::string CaseLabel;        // 对于switch: "case 1", "default"等
++
++  // ============== 新增字段：完整上下文信息 ==============
++  std::string SwitchStatement;  // 对于switch case: 对应的switch语句
++  std::string IfStatement;      // 对于else/else if: 对应的if语句
++
++  // ============== 新增字段：case下第一个基本块信息 ==============
++  unsigned CaseBodyLine;        // case下第一个可执行语句的行号
++  std::string CaseBodyCode;     // case下第一个可执行语句的代码
++
++  // ============== 新增字段：switch语句行号 ==============
++  unsigned SwitchStatementLine; // switch语句的行号
++};
++
++// 计算方差
++static double calculateVariance(uint64_t Val1, uint64_t Val2, double Avg) {
++  double Diff1 = static_cast<double>(Val1) - Avg;
++  double Diff2 = static_cast<double>(Val2) - Avg;
++  return (Diff1 * Diff1 + Diff2 * Diff2) / 2.0;
++}
++
++// ============== 新增：分支组识别辅助函数 ==============
++
++// 检测是否是switch语句的case分支
++static bool isSwitchBranch(const coverage::CountedRegion &R,
++                          const std::vector<std::string> &Lines) {
++  if (R.LineStart == 0 || R.LineStart >= Lines.size())
++    return false;
++
++  llvm::StringRef Line(Lines[R.LineStart]);
++  // 去掉缩进
++  llvm::StringRef Trimmed = Line.ltrim();
++
++  // 检查是否包含case或default关键字
++  return Trimmed.starts_with("case") || Trimmed.starts_with("default");
++}
++
++// 检测是否是if-else if链中的后续分支
++static bool isElseIfBranch(const coverage::CountedRegion &R,
++                          const std::vector<std::string> &Lines) {
++  if (R.LineStart == 0 || R.LineStart >= Lines.size())
++    return false;
++
++  llvm::StringRef Line(Lines[R.LineStart]);
++  // 检查是否包含"else if"
++  return Line.contains("else if");
++}
++
++// 提取case标签（用于switch语句）
++static std::string extractCaseLabel(const coverage::CountedRegion &R,
++                                    const std::vector<std::string> &Lines) {
++  if (R.LineStart == 0 || R.LineStart >= Lines.size())
++    return "unknown";
++
++  llvm::StringRef Line(Lines[R.LineStart]);
++
++  // 去掉缩进
++  llvm::StringRef Trimmed = Line.ltrim();
++
++  // 检查case
++  if (Trimmed.starts_with("case")) {
++    size_t ColonPos = Trimmed.find(':');
++    if (ColonPos != llvm::StringRef::npos) {
++      // 提取 "case X" 部分
++      return Trimmed.substr(0, ColonPos + 1).str();
++    }
++  }
++
++  // 检查default
++  if (Trimmed.starts_with("default")) {
++    size_t ColonPos = Trimmed.find(':');
++    if (ColonPos != llvm::StringRef::npos) {
++      return Trimmed.substr(0, ColonPos + 1).str();
++    }
++  }
++
++  return "unknown";
++}
++
++// 查找switch语句的结束行（通过括号匹配）
++static int findSwitchEndLine(unsigned SwitchLine,
++                            const std::vector<std::string> &Lines) {
++  int BraceCount = 0;
++  bool foundSwitchStart = false;
++
++  // 从switch行开始向下查找
++  for (size_t i = SwitchLine; i < Lines.size(); ++i) {
++    llvm::StringRef Line(Lines[i]);
++
++    // 统计括号数量
++    for (size_t j = 0; j < Line.size(); ++j) {
++      if (Line[j] == '{') {
++        BraceCount++;
++        foundSwitchStart = true;
++      } else if (Line[j] == '}') {
++        BraceCount--;
++        if (foundSwitchStart && BraceCount == 0) {
++          return (int)i;  // 返回switch结束行
++        }
++      }
++    }
++  }
++
++  return -1;  // 未找到匹配的结束括号
++}
++
++// 查找对应的switch语句（通过分支组关系查找）
++static std::string findSwitchStatement(unsigned CaseLine,
++                                      const std::vector<std::string> &Lines,
++                                      unsigned &SwitchLineOut,
++                                      const std::vector<const coverage::CountedRegion*> &SwitchGroup) {
++  SwitchLineOut = 0;
++
++  // 方法1: 利用分支组信息 - switch语句应该在第一个case之前
++  // 找到组内行号最小的case
++  unsigned MinCaseLine = CaseLine;
++  for (const auto *BR : SwitchGroup) {
++    if (BR->LineStart < MinCaseLine) {
++      MinCaseLine = BR->LineStart;
++    }
++  }
++
++  // 从第一个case向上查找switch语句（限制范围提高效率）
++  // switch通常离第一个case不远，最多查找50行
++  for (int i = (int)MinCaseLine - 1; i >= 0 && i >= (int)MinCaseLine - 50; --i) {
++    llvm::StringRef Line(Lines[i]);
++    llvm::StringRef Trimmed = Line.trim();
++
++    // 跳过空行和注释行
++    if (Trimmed.empty() || Trimmed.starts_with("//") || Trimmed.starts_with("/*"))
++      continue;
++
++    // 找到switch关键字
++    if (Trimmed.starts_with("switch")) {
++      // 找到switch语句的末尾（通常是{或)）
++      size_t EndPos = Trimmed.find('{');
++      if (EndPos == llvm::StringRef::npos) {
++        EndPos = Trimmed.find(')');
++        if (EndPos != llvm::StringRef::npos) {
++          EndPos++;  // 包含)
++        } else {
++          EndPos = Trimmed.size();
++        }
++      } else {
++        EndPos++;  // 包含{
++      }
++      SwitchLineOut = (unsigned)i;
++      return Trimmed.substr(0, EndPos).str();
++    }
++
++    // 如果遇到其他控制结构关键字，说明switch不在这一段
++    if (Trimmed.starts_with("if") || Trimmed.starts_with("for") ||
++        Trimmed.starts_with("while") || Trimmed.starts_with("do")) {
++      break;
++    }
++  }
++
++  return "";
++}
++
++// 查找对应的if语句（向上查找）
++static std::string findIfStatement(unsigned ElseLine,
++                                   const std::vector<std::string> &Lines) {
++  // 从else行向上查找if语句（最多查找10行）
++  for (int i = (int)ElseLine - 1; i >= 0 && i >= (int)ElseLine - 10; --i) {
++    llvm::StringRef Line(Lines[i]);
++    llvm::StringRef Trimmed = Line.trim();
++
++    // 查找不是else if的if语句
++    if (Trimmed.starts_with("if") && !Trimmed.starts_with("if(") &&
++        !Line.contains("else if")) {
++      // 提取完整的if语句（到{或行尾）
++      size_t EndPos = Trimmed.find('{');
++      if (EndPos == llvm::StringRef::npos) {
++        EndPos = Trimmed.size();
++      } else {
++        EndPos++;  // 包含{
++      }
++      return Trimmed.substr(0, EndPos).str();
++    }
++  }
++
++  return "";
++}
++
++// 检查是否有显式的else语句
++static bool hasExplicitElse(unsigned IfLine,
++                           const std::vector<std::string> &Lines) {
++  // 从if行开始向下查找else（最多查找10行）
++  for (size_t i = IfLine + 1; i < Lines.size() && i < IfLine + 10; ++i) {
++    llvm::StringRef Line(Lines[i]);
++    llvm::StringRef Trimmed = Line.trim();
++
++    // 如果找到else（不是else if），返回true
++    if (Trimmed.starts_with("else") && !Trimmed.starts_with("else if")) {
++      return true;
++    }
++
++    // 如果遇到不相关的语句（如新的if、switch），停止查找
++    // 但不要在遇到else if时停止
++    if ((Trimmed.starts_with("if") && !Trimmed.starts_with("if(")) ||
++        Trimmed.starts_with("switch")) {
++      break;
++    }
++  }
++
++  return false;
++}
++
++static std::string trimLineComment(StringRef Line) {
++  size_t CommentPos = Line.find("//");
++  if (CommentPos != StringRef::npos)
++    Line = Line.substr(0, CommentPos);
++  return Line.trim().str();
++}
++
++static std::string compactLower(StringRef Text) {
++  std::string Out;
++  Out.reserve(Text.size());
++  for (char Ch : Text) {
++    unsigned char U = static_cast<unsigned char>(Ch);
++    if (std::isspace(U))
++      continue;
++    Out.push_back(static_cast<char>(std::tolower(U)));
++  }
++  return Out;
++}
++
++static bool isPointerLikeToken(StringRef Token) {
++  if (Token.empty())
++    return false;
++
++  size_t I = 0;
++  auto consumeIdent = [&](size_t &Pos) -> bool {
++    if (Pos >= Token.size())
++      return false;
++    unsigned char First = static_cast<unsigned char>(Token[Pos]);
++    if (!(std::isalpha(First) || Token[Pos] == '_'))
++      return false;
++    ++Pos;
++    while (Pos < Token.size()) {
++      unsigned char Ch = static_cast<unsigned char>(Token[Pos]);
++      if (!(std::isalnum(Ch) || Token[Pos] == '_'))
++        break;
++      ++Pos;
++    }
++    return true;
++  };
++
++  if (!consumeIdent(I))
++    return false;
++
++  while (I < Token.size()) {
++    if (Token.substr(I).starts_with("->"))
++      I += 2;
++    else if (Token[I] == '.')
++      ++I;
++    else
++      return false;
++
++    if (!consumeIdent(I))
++      return false;
++  }
++
++  return true;
++}
++
++static bool looksLikeNullGuardCondition(StringRef IfCode) {
++  size_t Open = IfCode.find('(');
++  size_t Close = IfCode.rfind(')');
++  if (Open == StringRef::npos || Close == StringRef::npos || Close <= Open)
++    return false;
++
++  std::string Normalized = compactLower(IfCode.slice(Open + 1, Close));
++  if (Normalized.empty())
++    return false;
++
++  if (Normalized.find("==null") != std::string::npos ||
++      Normalized.find("null==") != std::string::npos ||
++      Normalized.find("==nullptr") != std::string::npos ||
++      Normalized.find("nullptr==") != std::string::npos)
++    return true;
++
++  if (!Normalized.empty() && Normalized.front() == '!') {
++    StringRef Inner(Normalized);
++    Inner = Inner.drop_front().trim();
++    if (Inner.starts_with("(") && Inner.ends_with(")"))
++      Inner = Inner.drop_front().drop_back().trim();
++    return isPointerLikeToken(Inner);
++  }
++
++  return false;
++}
++
++static bool isIgnorableControlLine(StringRef Line) {
++  StringRef Trimmed = Line.trim();
++  return Trimmed.empty() || Trimmed == "{" || Trimmed == "}" ||
++         Trimmed.starts_with("//") || Trimmed.starts_with("/*") ||
++         Trimmed.starts_with("*");
++}
++
++static const char *exitKindForStatement(StringRef Line) {
++  StringRef Trimmed = Line.trim();
++  if (Trimmed.starts_with("return"))
++    return "return";
++  if (Trimmed.starts_with("goto"))
++    return "goto";
++  return nullptr;
++}
++
++static const char *findImmediateExitInSingleStatementBlock(
++    unsigned StartLine, const std::vector<std::string> &Lines) {
++  const char *ExitKind = nullptr;
++  for (unsigned I = StartLine; I < Lines.size() && I < StartLine + 8; ++I) {
++    StringRef Trimmed = StringRef(Lines[I]).trim();
++    if (isIgnorableControlLine(Trimmed))
++      continue;
++
++    if (const char *Kind = exitKindForStatement(Trimmed)) {
++      if (ExitKind != nullptr)
++        return nullptr;
++      ExitKind = Kind;
++      continue;
++    }
++
++    if (Trimmed == "}" || Trimmed.ends_with("}"))
++      return ExitKind;
++
++    return nullptr;
++  }
++  return nullptr;
++}
++
++static const char *findImmediateExitOnTrueSide(
++    unsigned IfLine, const std::vector<std::string> &Lines) {
++  if (IfLine >= Lines.size())
++    return nullptr;
++
++  StringRef Trimmed = StringRef(Lines[IfLine]).trim();
++  size_t Close = Trimmed.rfind(')');
++  if (Close != StringRef::npos && Close + 1 < Trimmed.size()) {
++    StringRef Tail = Trimmed.substr(Close + 1).trim();
++    if (const char *Kind = exitKindForStatement(Tail))
++      return Kind;
++    if (Tail.starts_with("{"))
++      return findImmediateExitInSingleStatementBlock(IfLine + 1, Lines);
++  }
++
++  for (unsigned I = IfLine + 1; I < Lines.size() && I < IfLine + 6; ++I) {
++    StringRef Next = StringRef(Lines[I]).trim();
++    if (isIgnorableControlLine(Next))
++      continue;
++    return exitKindForStatement(Next);
++  }
++
++  return nullptr;
++}
++
++static const char *findImmediateExitOnFalseSide(
++    unsigned IfLine, const std::vector<std::string> &Lines) {
++  for (unsigned I = IfLine + 1; I < Lines.size() && I < IfLine + 10; ++I) {
++    StringRef Trimmed = StringRef(Lines[I]).trim();
++    if (Trimmed.empty() || Trimmed.starts_with("//") || Trimmed.starts_with("/*"))
++      continue;
++
++    if (!Trimmed.starts_with("else"))
++      continue;
++
++    StringRef Tail = Trimmed.drop_front(4).trim();
++    if (Tail.starts_with("if"))
++      return nullptr;
++    if (const char *Kind = exitKindForStatement(Tail))
++      return Kind;
++    if (Tail.starts_with("{") || Tail.empty())
++      return findImmediateExitInSingleStatementBlock(I + 1, Lines);
++    return nullptr;
++  }
++
++  return nullptr;
++}
++
++static bool shouldSkipLowValueGuardBranch(
++    const OneSidedBranchPoint &Point,
++    const std::vector<std::string> &Lines) {
++  if (Point.GroupType == BGT_Switch)
++    return false;
++  if (Point.Status == nullptr)
++    return false;
++
++  StringRef Status(Point.Status);
++  if (Status != "only_true" && Status != "only_false")
++    return false;
++  if (Point.Line == 0 || Point.Line >= Lines.size())
++    return false;
++
++  std::string IfCode = trimLineComment(Point.Code);
++  if (IfCode.empty() || !looksLikeNullGuardCondition(IfCode))
++    return false;
++
++  if (Status == "only_false")
++    return findImmediateExitOnTrueSide(Point.Line, Lines) != nullptr;
++  return findImmediateExitOnFalseSide(Point.Line, Lines) != nullptr;
++}
++
++// ============== 新增：查找case下第一个可执行语句 ==============
++// 返回: 第一个可执行语句的行号，如果找不到返回0
++// 注意：
++// - 对于fall-through case，会跳过连续的case/default标签，找到第一个实际语句
++// - 对于单行case（语句和标签在同一行），返回case行本身
++static unsigned findFirstStatementAfterCase(unsigned CaseLine,
++                                            const std::vector<std::string> &Lines,
++                                            std::string &FirstStmtCode) {
++  FirstStmtCode = "";
++
++  // 首先检查case行本身是否包含语句（单行case的情况）
++  if (CaseLine > 0 && CaseLine < Lines.size()) {
++    llvm::StringRef CaseLineStr = Lines[CaseLine];
++
++    // 查找冒号位置
++    size_t ColonPos = CaseLineStr.find(':');
++    if (ColonPos != llvm::StringRef::npos) {
++      // 获取冒号后的内容
++      llvm::StringRef AfterColon = CaseLineStr.substr(ColonPos + 1);
++
++      // 去掉前导空格
++      llvm::StringRef AfterColonTrimmed = AfterColon.ltrim();
++
++      // 检查是否有实际代码（不是空、不是注释、不是右花括号）
++      if (!AfterColonTrimmed.empty() &&
++          !AfterColonTrimmed.starts_with("//") &&
++          !AfterColonTrimmed.starts_with("/*") &&
++          !AfterColonTrimmed.starts_with("}")) {
++        // case行本身包含语句，返回case行号
++        FirstStmtCode = CaseLineStr.str();
++        return CaseLine;
++      }
++    }
++  }
++
++  // 从case行的下一行开始查找
++  // 跳过所有连续的case/default标签（支持fall-through case）
++  for (size_t i = CaseLine + 1; i < Lines.size(); ++i) {
++    llvm::StringRef Line(Lines[i]);
++
++    // 跳过空行
++    if (Line.trim().empty())
++      continue;
++
++    // 跳过注释行
++    llvm::StringRef Trimmed = Line.trim();
++    if (Trimmed.starts_with("//") || Trimmed.starts_with("/*"))
++      continue;
++
++    // 跳过单独的左花括号 {
++    if (Trimmed == "{")
++      continue;
++
++    // 如果遇到右花括号 }，说明switch结束了
++    if (Trimmed.starts_with("}"))
++      return 0;
++
++    // 跳过所有连续的case/default标签（fall-through support）
++    if (Trimmed.starts_with("case") || Trimmed.starts_with("default"))
++      continue;
++
++    // 找到第一个非空、非注释、非case/default的行，这就是case下的第一个语句
++    FirstStmtCode = Line.str();
++    return (unsigned)i;
++  }
++
++  return 0;
++}
++
++// ============== 原有函数备份（用于回退） ==============
++// 输出只执行了一侧的分支，包含行号、起始列、代码文本与覆盖状态
++// 返回原始数据，不进行排序
++static std::vector<OneSidedBranchPoint> collectFileOneSidedBranches_LEGACY(
++    const coverage::CoverageData &FC,
++    llvm::StringRef Filename) {
++  auto Lines = loadFileLines(Filename);
++  std::vector<OneSidedBranchPoint> BranchPoints;
++
++  for (const auto &B : FC.getBranches()) {
++    if (isLoopConditionBranch(B, Lines))
++      continue;
++    if (!isOneSidedBranch(B))
++      continue;
++
++    uint64_t TrueCount = B.ExecutionCount;
++    uint64_t FalseCount = B.FalseExecutionCount;
++
++    // 计算平均值
++    double Average = (static_cast<double>(TrueCount) + static_cast<double>(FalseCount)) / 2.0;
++
++    // 计算方差
++    double Variance = calculateVariance(TrueCount, FalseCount, Average);
++
++    // 1-based, 注意防越界
++    std::string Code;
++    if (B.LineStart > 0 && B.LineStart < Lines.size())
++      Code = Lines[B.LineStart];
++    else
++      Code = "";
++
++    const char *Status = "unknown";
++    if (TrueCount == 0 && FalseCount > 0)
++      Status = "only_false";
++    else if (TrueCount > 0 && FalseCount == 0)
++      Status = "only_true";
++
++    OneSidedBranchPoint Point;
++    Point.Filename = Filename.str();  // 保存文件名
++    Point.Line = B.LineStart;
++    Point.Col = B.ColumnStart;
++    Point.Code = Code;
++    Point.TrueCount = TrueCount;
++    Point.FalseCount = FalseCount;
++    Point.Status = Status;
++    Point.NumZeroSuccessors = 1;  // 只执行一侧，意味着恰好有一个分支为0
++    Point.SuccessorVariance = Variance;
++    Point.SuccessorAverage = Average;
++
++    BranchPoints.push_back(Point);
++  }
++
++  return BranchPoints;
++}
++
++// ============== 新版本：支持分支组识别 ==============
++
++// 分析switch分支组
++static void analyzeSwitchBranchGroup(
++    const std::vector<const coverage::CountedRegion*> &GroupBranches,
++    const std::vector<std::string> &Lines,
++    llvm::StringRef Filename,
++    std::vector<OneSidedBranchPoint> &BranchPoints) {
++
++  unsigned GroupSize = GroupBranches.size();
++
++  for (size_t i = 0; i < GroupBranches.size(); ++i) {
++    const auto *BR = GroupBranches[i];
++
++    // 跳过循环条件分支
++    if (isLoopConditionBranch(*BR, Lines))
++      continue;
++
++    // 提取case标签
++    std::string CaseLabel = extractCaseLabel(*BR, Lines);
++
++    uint64_t TrueCount = BR->ExecutionCount;
++    uint64_t FalseCount = BR->FalseExecutionCount;
++
++    // 检查是否完全未执行或只执行了一侧
++    bool Uncovered = (TrueCount == 0 && FalseCount == 0);
++    bool OneSided = isOneSidedBranch(*BR);
++
++    if (!Uncovered && !OneSided)
++      continue;  // 这个case已经完全覆盖，不是瓶颈
++
++    // 计算统计信息
++    double Average = (static_cast<double>(TrueCount) + static_cast<double>(FalseCount)) / 2.0;
++    double Variance = calculateVariance(TrueCount, FalseCount, Average);
++
++    std::string Code;
++    if (BR->LineStart > 0 && BR->LineStart < Lines.size())
++      Code = Lines[BR->LineStart];
++    else
++      Code = "";
++
++    const char *Status = "unknown";
++    if (Uncovered)
++      Status = "uncovered_case";
++    else if (TrueCount == 0 && FalseCount > 0)
++      Status = "only_false";
++    else if (TrueCount > 0 && FalseCount == 0)
++      Status = "only_true";
++
++    OneSidedBranchPoint Point;
++    Point.Filename = Filename.str();
++    Point.Line = BR->LineStart;
++    Point.Col = BR->ColumnStart;
++    Point.Code = Code;
++    Point.TrueCount = TrueCount;
++    Point.FalseCount = FalseCount;
++    Point.Status = Status;
++    Point.NumZeroSuccessors = Uncovered ? 2 : 1;
++    Point.SuccessorVariance = Variance;
++    Point.SuccessorAverage = Average;
++
++    // 分支组信息
++    Point.IsPartOfGroup = true;
++    Point.GroupType = BGT_Switch;
++    Point.GroupSize = GroupSize;
++    Point.GroupIndex = i;
++    Point.CaseLabel = CaseLabel;
++
++    // 查找对应的switch语句（传入整个分支组以利用CFG关系）
++    unsigned SwitchLine = 0;
++    Point.SwitchStatement = findSwitchStatement(BR->LineStart, Lines, SwitchLine, GroupBranches);
++    Point.SwitchStatementLine = SwitchLine;
++
++    // ============== 新增：查找case下第一个可执行语句 ==============
++    std::string FirstStmtCode;
++    Point.CaseBodyLine = findFirstStatementAfterCase(BR->LineStart, Lines, FirstStmtCode);
++    Point.CaseBodyCode = FirstStmtCode;
++
++    BranchPoints.push_back(Point);
++  }
++}
++
++// 新的收集函数：支持分支组识别
++static std::vector<OneSidedBranchPoint> collectFileOneSidedBranches(
++    const coverage::CoverageData &FC,
++    llvm::StringRef Filename,
++    bool SkipLowValueGuards) {
++
++  auto Lines = loadFileLines(Filename);
++  std::vector<OneSidedBranchPoint> BranchPoints;
++
++  auto Branches = FC.getBranches();
++  if (Branches.empty())
++    return BranchPoints;
++
++  // 第一步：识别并分组switch分支
++  std::set<size_t> Processed;
++  std::vector<const coverage::CountedRegion*> CurrentSwitchGroup;
++
++  for (size_t i = 0; i < Branches.size(); ++i) {
++    if (Processed.count(i))
++      continue;
++
++    const auto &B = Branches[i];
++
++    // 如果是switch分支，尝试找同一switch的其他case
++    if (isSwitchBranch(B, Lines)) {
++      CurrentSwitchGroup.clear();
++      CurrentSwitchGroup.push_back(&B);
++      Processed.insert(i);
++
++      // 找到对应的switch语句和它的结束行
++      int switchEndLine = -1;
++      unsigned firstCaseLine = B.LineStart;
++
++      // 利用分支组信息找到第一个case
++      for (const auto *BR : CurrentSwitchGroup) {
++        if (BR->LineStart < firstCaseLine) {
++          firstCaseLine = BR->LineStart;
++        }
++      }
++
++      // 从第一个case向上查找switch语句
++      for (int line = (int)firstCaseLine - 1; line >= 0 && line >= (int)firstCaseLine - 50; --line) {
++        llvm::StringRef Line(Lines[line]);
++        llvm::StringRef Trimmed = Line.trim();
++        if (Trimmed.starts_with("switch")) {
++          switchEndLine = findSwitchEndLine(line, Lines);
++          break;
++        }
++      }
++
++      // 查找同一switch内的所有case/default分支
++      if (switchEndLine > 0) {
++        // 使用switch的完整范围来分组
++        for (size_t j = i + 1; j < Branches.size(); ++j) {
++          if (Processed.count(j))
++            continue;
++
++          const auto &NextB = Branches[j];
++          // 检查是否在switch范围内且是switch分支
++          if (isSwitchBranch(NextB, Lines) &&
++              (int)NextB.LineStart <= switchEndLine &&
++              (int)NextB.LineStart >= (int)B.LineStart - 500) {
++            CurrentSwitchGroup.push_back(&NextB);
++            Processed.insert(j);
++          }
++        }
++      } else {
++        // 降级到使用距离限制（向后兼容）
++        for (size_t j = i + 1; j < Branches.size(); ++j) {
++          if (Processed.count(j))
++            continue;
++
++          const auto &NextB = Branches[j];
++          if (isSwitchBranch(NextB, Lines) &&
++              abs((int)NextB.LineStart - (int)B.LineStart) <= 100) {
++            CurrentSwitchGroup.push_back(&NextB);
++            Processed.insert(j);
++          }
++        }
++      }
++
++      // 分析这个switch组
++      if (CurrentSwitchGroup.size() > 1) {
++        analyzeSwitchBranchGroup(CurrentSwitchGroup, Lines, Filename, BranchPoints);
++      } else {
++        // 单独的switch分支，使用原有逻辑
++        goto SINGLE_BRANCH_PROCESSING;
++      }
++    } else {
++SINGLE_BRANCH_PROCESSING:
++      // 非switch分支或单独分支，使用原有逻辑
++      if (isLoopConditionBranch(B, Lines))
++        continue;
++      if (!isOneSidedBranch(B))
++        continue;
++
++      uint64_t TrueCount = B.ExecutionCount;
++      uint64_t FalseCount = B.FalseExecutionCount;
++
++      double Average = (static_cast<double>(TrueCount) + static_cast<double>(FalseCount)) / 2.0;
++      double Variance = calculateVariance(TrueCount, FalseCount, Average);
++
++      std::string Code;
++      if (B.LineStart > 0 && B.LineStart < Lines.size())
++        Code = Lines[B.LineStart];
++      else
++        Code = "";
++
++      const char *Status = "unknown";
++      if (TrueCount == 0 && FalseCount > 0)
++        Status = "only_false";
++      else if (TrueCount > 0 && FalseCount == 0)
++        Status = "only_true";
++
++      OneSidedBranchPoint Point;
++      Point.Filename = Filename.str();
++      Point.Line = B.LineStart;
++      Point.Col = B.ColumnStart;
++      Point.Code = Code;
++      Point.TrueCount = TrueCount;
++      Point.FalseCount = FalseCount;
++      Point.Status = Status;
++      Point.NumZeroSuccessors = 1;
++      Point.SuccessorVariance = Variance;
++      Point.SuccessorAverage = Average;
++
++      // 标记为非分支组
++      Point.IsPartOfGroup = false;
++      Point.GroupType = BGT_SingleIf;
++      Point.GroupSize = 1;
++      Point.GroupIndex = 0;
++
++      // 初始化新增字段
++      Point.CaseBodyLine = 0;
++      Point.CaseBodyCode = "";
++      Point.SwitchStatementLine = 0;
++
++      // 检查是否是else if，添加对应的if语句
++      llvm::StringRef CodeRef(Code);
++      if (CodeRef.contains("else if")) {
++        // 是else if，查找对应的if语句
++        Point.IfStatement = findIfStatement(B.LineStart, Lines);
++        Point.GroupType = BGT_IfElseChain;  // 标记为if-else链的一部分
++      }
++
++      if (SkipLowValueGuards && shouldSkipLowValueGuardBranch(Point, Lines))
++        continue;
++
++      BranchPoints.push_back(Point);
++    }
++  }
++
++  return BranchPoints;
++}
++
++// 收集零覆盖分支：两侧都未执行
++static std::vector<OneSidedBranchPoint> collectFileZeroCoveredBranches(
++    const coverage::CoverageData &FC,
++    llvm::StringRef Filename) {
++
++  auto Lines = loadFileLines(Filename);
++  std::vector<OneSidedBranchPoint> BranchPoints;
++
++  auto Branches = FC.getBranches();
++  if (Branches.empty())
++    return BranchPoints;
++
++  for (const auto &B : Branches) {
++    // 跳过循环条件分支
++    if (isLoopConditionBranch(B, Lines))
++      continue;
++    // 只处理零覆盖分支
++    if (!isZeroCoveredBranch(B))
++      continue;
++
++    uint64_t TrueCount = B.ExecutionCount;  // 应该为0
++    uint64_t FalseCount = B.FalseExecutionCount;  // 应该为0
++
++    double Average = 0.0;
++    double Variance = 0.0;
++
++    std::string Code;
++    if (B.LineStart > 0 && B.LineStart < Lines.size())
++      Code = Lines[B.LineStart];
++    else
++      Code = "";
++
++    const char *Status = "zero_covered";
++
++    OneSidedBranchPoint Point;
++    Point.Filename = Filename.str();
++    Point.Line = B.LineStart;
++    Point.Col = B.ColumnStart;
++    Point.Code = Code;
++    Point.TrueCount = TrueCount;
++    Point.FalseCount = FalseCount;
++    Point.Status = Status;
++    Point.NumZeroSuccessors = 2;  // 两侧都是零
++    Point.SuccessorVariance = Variance;
++    Point.SuccessorAverage = Average;
++
++    // 标记为非分支组
++    Point.IsPartOfGroup = false;
++    Point.GroupType = BGT_SingleIf;
++    Point.GroupSize = 1;
++    Point.GroupIndex = 0;
++
++    // 初始化新增字段
++    Point.CaseBodyLine = 0;
++    Point.CaseBodyCode = "";
++    Point.SwitchStatementLine = 0;
++    Point.IfStatement = "";
++
++    // 检查是否是else if
++    llvm::StringRef CodeRef(Code);
++    if (CodeRef.contains("else if")) {
++      Point.IfStatement = findIfStatement(B.LineStart, Lines);
++      Point.GroupType = BGT_IfElseChain;
++    }
++
++    BranchPoints.push_back(Point);
++  }
++
++  return BranchPoints;
++}
++
++// 将分支点数组转换为JSON数组（支持分支组信息）
++static json::Array convertBranchPointsToJSON(const std::vector<OneSidedBranchPoint> &BranchPoints) {
++  json::Array Arr;
++  for (const auto &Point : BranchPoints) {
++    json::Object Obj({
++        {"filename", Point.Filename},
++        {"line", static_cast<int64_t>(Point.Line)},
++        {"col",  static_cast<int64_t>(Point.Col)},
++        {"true_count", clamp_uint64_to_int64(Point.TrueCount)},
++        {"false_count", clamp_uint64_to_int64(Point.FalseCount)},
++        {"status", Point.Status},
++        {"code", Point.Code},
++    });
++
++    // 如果属于分支组，添加额外信息
++    if (Point.IsPartOfGroup) {
++      Obj["is_part_of_group"] = true;
++
++      // 添加组类型
++      const char *GroupTypeStr = "unknown";
++      if (Point.GroupType == BGT_Switch)
++        GroupTypeStr = "switch";
++      else if (Point.GroupType == BGT_IfElseChain)
++        GroupTypeStr = "if_else_chain";
++      else if (Point.GroupType == BGT_SingleIf)
++        GroupTypeStr = "single_if";
++
++      Obj["group_type"] = GroupTypeStr;
++      Obj["group_size"] = static_cast<int64_t>(Point.GroupSize);
++      Obj["group_index"] = static_cast<int64_t>(Point.GroupIndex);
++
++      // 对于switch，添加case标签
++      if (!Point.CaseLabel.empty() && Point.CaseLabel != "unknown") {
++        Obj["case_label"] = Point.CaseLabel;
++      }
++
++      // ============== 新增：对于switch，添加case下第一个基本块信息 ==============
++      if (Point.GroupType == BGT_Switch) {
++        // 始终输出这些字段，保持结构一致（值为0或空字符串表示未找到）
++        Obj["case_body_line"] = static_cast<int64_t>(Point.CaseBodyLine);
++        Obj["case_body_code"] = Point.CaseBodyCode;
++      }
++    } else {
++      Obj["is_part_of_group"] = false;
++    }
++
++    // 添加switch语句（对于switch类型始终输出，保持结构一致）
++    if (Point.GroupType == BGT_Switch) {
++      Obj["switch_statement"] = Point.SwitchStatement;
++      Obj["switch_statement_line"] = static_cast<int64_t>(Point.SwitchStatementLine);
++    } else {
++      // 非switch类型，只有在有值时才添加
++      if (!Point.SwitchStatement.empty()) {
++        Obj["switch_statement"] = Point.SwitchStatement;
++      }
++    }
++
++    // 添加if语句（如果有）
++    if (!Point.IfStatement.empty()) {
++      Obj["if_statement"] = Point.IfStatement;
++    }
++
++    Arr.push_back(std::move(Obj));
++  }
++  return Arr;
++}
++
+ json::Object renderFile(const coverage::CoverageMapping &Coverage,
+                         const std::string &Filename,
+                         const FileCoverageSummary &FileReport,
+@@ -256,15 +1241,26 @@ json::Object renderFile(const coverage::CoverageMapping &Coverage,
+   if (!Options.ExportSummaryOnly) {
+     // Calculate and render detailed coverage information for given file.
+     auto FileCoverage = Coverage.getCoverageForFile(Filename);
+-    File["segments"] = renderFileSegments(FileCoverage, FileReport);
+-    File["branches"] = renderFileBranches(FileCoverage, FileReport);
+-    File["mcdc_records"] = renderFileMCDC(FileCoverage, FileReport);
+-    if (!Options.SkipExpansions) {
+-      File["expansions"] =
+-          renderFileExpansions(Coverage, FileCoverage, FileReport);
++    if (Options.ExportOnlyOneSidedBranches) {
++      // 注意：在全局排序模式下，这个函数不会被调用
++      // 这里只是为了保持兼容性
++      auto BranchPoints = collectFileOneSidedBranches(
++          FileCoverage, Filename, Options.ExportSkipLowValueGuards);
++      File["one_sided_branches"] = convertBranchPointsToJSON(BranchPoints);
++    } else if (Options.ExportZeroCoveredBranches) {
++      // 零覆盖分支模式
++      auto BranchPoints = collectFileZeroCoveredBranches(FileCoverage, Filename);
++      File["zero_covered_branches"] = convertBranchPointsToJSON(BranchPoints);
++    } else {
++      File["segments"] = renderFileSegments(FileCoverage, FileReport);
++      File["branches"] = renderFileBranches(FileCoverage, FileReport);
++      File["mcdc_records"] = renderFileMCDC(FileCoverage, FileReport);
++      if (!Options.SkipExpansions) {
++        File["expansions"] = renderFileExpansions(Coverage, FileCoverage, FileReport);
++      }
+     }
+   }
+-  File["summary"] = renderSummary(FileReport);
++  // File["summary"] = renderSummary(FileReport);
+   return File;
+ }
+ 
+@@ -272,6 +1268,210 @@ json::Array renderFiles(const coverage::CoverageMapping &Coverage,
+                         ArrayRef<std::string> SourceFiles,
+                         ArrayRef<FileCoverageSummary> FileReports,
+                         const CoverageViewOptions &Options) {
++  // 特殊处理：如果是 ExportOnlyOneSidedBranches 模式，需要全局排序
++  if (Options.ExportOnlyOneSidedBranches) {
++    // 第一步：收集所有文件的分支点
++    std::vector<OneSidedBranchPoint> AllBranchPoints;
++    std::map<std::string, std::vector<OneSidedBranchPoint>> BranchesByFile;
++
++    for (unsigned I = 0, E = SourceFiles.size(); I < E; ++I) {
++      const auto &SourceFile = SourceFiles[I];
++      auto FileCoverage = Coverage.getCoverageForFile(SourceFile);
++      auto BranchPoints = collectFileOneSidedBranches(
++          FileCoverage, SourceFile, Options.ExportSkipLowValueGuards);
++      BranchesByFile[SourceFile] = std::move(BranchPoints);
++      AllBranchPoints.insert(AllBranchPoints.end(),
++                            BranchesByFile[SourceFile].begin(),
++                            BranchesByFile[SourceFile].end());
++    }
++
++    // 第二步：使用改进的轮询排序，优先保证函数多样性
++    //
++    // 排序策略：
++    // 1. 首先按函数分组（保证多样性）
++    // 2. 在每个函数内，按重要性 + 质量指标排序
++    // 3. 使用轮询方式从不同函数中取分支
++    //
++    // 关键改进：不先按重要性分组，而是让函数多样性优先级高于重要性
++    // 这样可以避免所有 switch case（uncovered_case）挤在前面
++    // 同时仍然保证每个函数内部高价值分支优先
++
++    // 定义重要性等级：数值越小越重要
++    auto getImportanceRank = [](const std::string &Status) -> int {
++      if (Status == "uncovered_case") return 0;      // 最高优先级
++      if (Status == "only_false") return 1;
++      if (Status == "only_true") return 2;
++      return 3;  // 未知状态
++    };
++
++    // 定义分支质量评分（综合重要性和质量指标）
++    auto getQualityScore = [&getImportanceRank](const OneSidedBranchPoint &P) -> double {
++      // 重要性权重最高（拉开差距）
++      double score = (3.0 - getImportanceRank(P.Status)) * 10000.0;
++      // 然后是质量指标
++      score += P.NumZeroSuccessors * 100.0;   // 0分支数
++      score += P.SuccessorVariance;           // 方差
++      return score;
++    };
++
++    // 按文件名提取函数名（从完整路径中）
++    auto getFunctionKey = [](const std::string &Filename) -> std::string {
++      // 提取文件名（不含路径）作为函数分组的key
++      size_t LastSlash = Filename.find_last_of('/');
++      if (LastSlash != std::string::npos)
++        return Filename.substr(LastSlash + 1);
++      return Filename;
++    };
++
++    // 步骤1：按函数分组（不先按重要性分组）
++    std::map<std::string, std::vector<OneSidedBranchPoint>> GroupedByFunction;
++
++    for (auto &Branch : AllBranchPoints) {
++      std::string FunctionKey = getFunctionKey(Branch.Filename);
++      GroupedByFunction[FunctionKey].push_back(Branch);
++    }
++
++    // 步骤2：在每个函数内按质量排序（重要性已包含在质量评分中）
++    for (auto &FunctionGroup : GroupedByFunction) {
++      auto &Branches = FunctionGroup.second;
++
++      llvm::sort(Branches, [&getQualityScore](const OneSidedBranchPoint &A,
++                                                 const OneSidedBranchPoint &B) {
++        double ScoreA = getQualityScore(A);
++        double ScoreB = getQualityScore(B);
++        if (ScoreA != ScoreB)
++          return ScoreA > ScoreB;
++
++        // 质量相同时，按行号排序（保证稳定性）
++        if (A.Line != B.Line)
++          return A.Line < B.Line;
++
++        return A.Col < B.Col;
++      });
++    }
++
++    // 步骤3：轮询合并 - 从不同函数中交替取分支
++    std::vector<OneSidedBranchPoint> SortedBranches;
++
++    if (!GroupedByFunction.empty()) {
++      // 收集所有函数名
++      std::vector<std::string> FunctionNames;
++      for (auto &FunctionGroup : GroupedByFunction) {
++        FunctionNames.push_back(FunctionGroup.first);
++      }
++
++      // 按函数名字典序排序（保证稳定性）
++      llvm::sort(FunctionNames);
++
++      // 轮询取分支：类似发牌，每个函数轮流贡献一个分支
++      size_t MaxBranches = 0;
++      for (const auto &Name : FunctionNames) {
++        MaxBranches = std::max(MaxBranches, GroupedByFunction[Name].size());
++      }
++
++      // 逐轮取分支
++      for (size_t Round = 0; Round < MaxBranches; ++Round) {
++        for (const auto &FunctionName : FunctionNames) {
++          auto &Branches = GroupedByFunction[FunctionName];
++          if (Round < Branches.size()) {
++            SortedBranches.push_back(Branches[Round]);
++          }
++        }
++      }
++    }
++
++    // 替换原数组为排序后的结果
++    AllBranchPoints = std::move(SortedBranches);
++
++    // 第三步：输出全局排序后的结果
++    // 创建一个单一的文件对象包含所有分支
++    json::Array FileArray;
++    json::Object GlobalFile;
++    GlobalFile["filename"] = "all_files";
++    GlobalFile["one_sided_branches"] = convertBranchPointsToJSON(AllBranchPoints);
++    FileArray.push_back(std::move(GlobalFile));
++
++    return FileArray;
++  }
++
++  // 零覆盖分支模式：类似单边分支的全局排序
++  if (Options.ExportZeroCoveredBranches) {
++    // 第一步：收集所有文件的分支点
++    std::vector<OneSidedBranchPoint> AllBranchPoints;
++    std::map<std::string, std::vector<OneSidedBranchPoint>> BranchesByFile;
++
++    for (unsigned I = 0, E = SourceFiles.size(); I < E; ++I) {
++      const auto &SourceFile = SourceFiles[I];
++      auto FileCoverage = Coverage.getCoverageForFile(SourceFile);
++      auto BranchPoints = collectFileZeroCoveredBranches(FileCoverage, SourceFile);
++      BranchesByFile[SourceFile] = std::move(BranchPoints);
++      AllBranchPoints.insert(AllBranchPoints.end(),
++                            BranchesByFile[SourceFile].begin(),
++                            BranchesByFile[SourceFile].end());
++    }
++
++    // 第二步：按函数分组并排序（简化版，因为零覆盖分支只有一个状态）
++    std::map<std::string, std::vector<OneSidedBranchPoint>> GroupedByFunction;
++
++    auto getFunctionKey = [](const std::string &Filename) -> std::string {
++      size_t LastSlash = Filename.find_last_of('/');
++      if (LastSlash != std::string::npos)
++        return Filename.substr(LastSlash + 1);
++      return Filename;
++    };
++
++    for (auto &Branch : AllBranchPoints) {
++      std::string FunctionKey = getFunctionKey(Branch.Filename);
++      GroupedByFunction[FunctionKey].push_back(Branch);
++    }
++
++    // 在每个函数内按行号排序
++    for (auto &FunctionGroup : GroupedByFunction) {
++      auto &Branches = FunctionGroup.second;
++      llvm::sort(Branches, [](const OneSidedBranchPoint &A,
++                               const OneSidedBranchPoint &B) {
++        if (A.Line != B.Line)
++          return A.Line < B.Line;
++        return A.Col < B.Col;
++      });
++    }
++
++    // 第三步：轮询合并 - 从不同函数中交替取分支
++    std::vector<OneSidedBranchPoint> SortedBranches;
++
++    if (!GroupedByFunction.empty()) {
++      std::vector<std::string> FunctionNames;
++      for (auto &FunctionGroup : GroupedByFunction) {
++        FunctionNames.push_back(FunctionGroup.first);
++      }
++      llvm::sort(FunctionNames);
++
++      size_t MaxBranches = 0;
++      for (const auto &Name : FunctionNames) {
++        MaxBranches = std::max(MaxBranches, GroupedByFunction[Name].size());
++      }
++
++      for (size_t Round = 0; Round < MaxBranches; ++Round) {
++        for (const auto &FunctionName : FunctionNames) {
++          auto &Branches = GroupedByFunction[FunctionName];
++          if (Round < Branches.size()) {
++            SortedBranches.push_back(Branches[Round]);
++          }
++        }
++      }
++    }
++
++    // 第四步：输出全局排序后的结果
++    json::Array FileArray;
++    json::Object GlobalFile;
++    GlobalFile["filename"] = "all_files";
++    GlobalFile["zero_covered_branches"] = convertBranchPointsToJSON(AllBranchPoints);
++    FileArray.push_back(std::move(GlobalFile));
++
++    return FileArray;
++  }
++
++  // 常规模式：并行处理每个文件
+   ThreadPoolStrategy S = hardware_concurrency(Options.NumThreads);
+   if (Options.NumThreads == 0) {
+     // If NumThreads is not specified, create one thread for each input, up to
+diff --git a/llvm/tools/llvm-cov/CoverageViewOptions.h b/llvm/tools/llvm-cov/CoverageViewOptions.h
+index 1f6ad570f..58c27b93d 100644
+--- a/llvm/tools/llvm-cov/CoverageViewOptions.h
++++ b/llvm/tools/llvm-cov/CoverageViewOptions.h
+@@ -47,6 +47,9 @@ struct CoverageViewOptions {
+   bool SkipFunctions;
+   bool SkipBranches;
+   bool BinaryCounters;
++  bool ExportOnlyOneSidedBranches = false;
++  bool ExportZeroCoveredBranches = false;
++  bool ExportSkipLowValueGuards = false;
+   OutputFormat Format;
+   BranchOutputType ShowBranches;
+   std::string ShowOutputDirectory;

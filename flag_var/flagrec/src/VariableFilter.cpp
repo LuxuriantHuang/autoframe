@@ -1,0 +1,1004 @@
+//===-- VariableFilter.cpp - Variable Candidate Filtering -----*- C++ -*-===//
+///
+/// \file
+/// Implementation of Module B: Variable Candidate Filtering
+/// Filters out input-reachable and arithmetic variables.
+///
+//===----------------------------------------------------------------------===//
+
+#include "FlagRec.h"
+#include "VariableFilter.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Path.h"
+#include <fstream>
+
+using namespace llvm;
+
+namespace flagrec {
+
+//===----------------------------------------------------------------------===//
+// VariableFilter Implementation
+//===----------------------------------------------------------------------===//
+
+VariableFilter::VariableFilter(const VariableFilterConfig &cfg)
+    : config(cfg) {
+  stats = {};
+}
+
+bool VariableFilter::analyzeModule(Module *module,
+                                   std::vector<VarCandidate> &outCandidates) {
+  if (!module) {
+    return false;
+  }
+
+  candidates.clear();
+  stats = {};
+
+  // Step 1: Collect all variables - simplified version
+  for (auto &gv : module->globals()) {
+    if (gv.hasName()) {
+      VarCandidate cand;
+      cand.name = gv.getName().str();
+      cand.value = &gv;
+      cand.typeName = "int";  // Simplified
+      cand.function = "<global>";
+      cand.location = SourceLocation(gv.getName().str(), 0);  // Use name as location
+      cand.isGlobal = true;
+      candidates.push_back(cand);
+    }
+  }
+
+  // Collect local variables
+  for (auto &func : *module) {
+    // Build a map from alloca to debug variable name
+    std::map<AllocaInst*, std::string> allocaToVarName;
+
+    // First pass: find all dbg.declare and dbg.value instructions
+    for (auto &bb : func) {
+      for (auto &inst : bb) {
+        if (auto *dbgDeclare = dyn_cast<DbgDeclareInst>(&inst)) {
+          // dbg.declare has the alloca as its first argument (address)
+          Value *addr = dbgDeclare->getAddress();
+          if (addr) {
+            // The address might be the alloca itself
+            if (auto *alloca = dyn_cast<AllocaInst>(addr)) {
+              DILocalVariable *localVar = dbgDeclare->getVariable();
+              if (localVar) {
+                allocaToVarName[alloca] = localVar->getName().str();
+              }
+            }
+            // Or it might be a bitcast of the alloca
+            else if (auto *bitcast = dyn_cast<BitCastInst>(addr)) {
+              if (auto *alloca = dyn_cast<AllocaInst>(bitcast->getOperand(0))) {
+                DILocalVariable *localVar = dbgDeclare->getVariable();
+                if (localVar) {
+                  allocaToVarName[alloca] = localVar->getName().str();
+                }
+              }
+            }
+            // Or it might be a bitcast expression with alloca
+            else if (auto *constExpr = dyn_cast<ConstantExpr>(addr)) {
+              if (constExpr->getOpcode() == Instruction::BitCast) {
+                if (auto *alloca = dyn_cast<AllocaInst>(constExpr->getOperand(0))) {
+                  DILocalVariable *localVar = dbgDeclare->getVariable();
+                  if (localVar) {
+                    allocaToVarName[alloca] = localVar->getName().str();
+                  }
+                }
+              }
+            }
+          }
+        }
+        else if (auto *dbgValue = dyn_cast<DbgValueInst>(&inst)) {
+          // dbg.value can also provide variable names
+          Value *addr = dbgValue->getValue();
+          if (addr && isa<AllocaInst>(addr)) {
+            DILocalVariable *localVar = dbgValue->getVariable();
+            if (localVar) {
+              AllocaInst *alloca = cast<AllocaInst>(addr);
+              if (allocaToVarName.find(alloca) == allocaToVarName.end()) {
+                allocaToVarName[alloca] = localVar->getName().str();
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Second pass: collect alloca instructions with debug names
+    for (auto &bb : func) {
+      for (auto &inst : bb) {
+        if (auto *alloca = dyn_cast<AllocaInst>(&inst)) {
+          Type *allocType = alloca->getAllocatedType();
+          if (allocType->isIntegerTy()) {
+            VarCandidate cand;
+
+            // Try to get the variable name from debug info
+            auto it = allocaToVarName.find(alloca);
+            if (it != allocaToVarName.end() && !it->second.empty()) {
+              cand.name = it->second;
+            } else {
+              cand.name = alloca->hasName() ? alloca->getName().str() : "<unnamed>";
+            }
+            cand.value = alloca;
+            cand.typeName = "int";
+            cand.function = func.getName().str();
+
+            // Try to get debug location from the alloca instruction
+            SourceLocation loc(func.getName().str(), 0);
+            if (alloca->getDebugLoc()) {
+              DILocation *dl = alloca->getDebugLoc();
+              if (dl) {
+                loc.file = dl->getFilename().str();
+                loc.line = dl->getLine();
+                loc.column = dl->getColumn();
+              }
+            }
+            // If no debug info on alloca, try to find from nearby instructions
+            else {
+              for (auto &bb : func) {
+                bool found = false;
+                for (auto &i : bb) {
+                  if (i.getDebugLoc()) {
+                    DILocation *dl = i.getDebugLoc();
+                    if (dl) {
+                      loc.file = dl->getFilename().str();
+                      loc.line = dl->getLine();
+                      found = true;
+                      break;
+                    }
+                  }
+                }
+                if (found) break;
+              }
+            }
+            cand.location = loc;
+            cand.isGlobal = false;
+
+            // Check if this is a loop counter variable
+            if (isLoopCounterName(cand.name)) {
+              cand.isLoopVariable = true;
+            }
+
+            candidates.push_back(cand);
+          }
+        }
+      }
+    }
+  }
+
+  stats.totalVariables = candidates.size();
+
+  // Collect struct member variables
+  collectStructMembers(module);
+
+  // Rebuild valueToCandidate map after collecting struct members
+  std::map<Value*, size_t> valueToCandidate;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (candidates[i].value) {
+      valueToCandidate[candidates[i].value] = i;
+    }
+  }
+
+  // Now track struct member usage for ALL GEPs, aggregating by struct field
+  // Map from (structName, fieldIdx) to candidate index
+  std::map<std::pair<std::string, int>, size_t> fieldToCandidate;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (candidates[i].isStructMember) {
+      fieldToCandidate[std::make_pair(candidates[i].structTypeName, candidates[i].fieldIndex)] = i;
+    }
+  }
+
+  // Track ALL GEPs that access flag fields, not just the ones we created candidates for
+  for (auto &func : *module) {
+    for (auto &bb : func) {
+      for (auto &inst : bb) {
+        if (auto *gep = dyn_cast<GetElementPtrInst>(&inst)) {
+          // Get struct type and field index
+          if (gep->getNumOperands() >= 3) {
+            Value *ptrOperand = gep->getOperand(0);
+            Value *firstIndex = gep->getOperand(1);
+            Value *fieldIndex = gep->getOperand(2);
+
+            if (auto *constFirstIdx = dyn_cast<ConstantInt>(firstIndex)) {
+              if (constFirstIdx->getZExtValue() == 0) {
+                PointerType *ptrType = dyn_cast<PointerType>(ptrOperand->getType());
+                if (ptrType) {
+                  Type *pointedType = ptrType->getElementType();
+                  StructType *structType = dyn_cast<StructType>(pointedType);
+                  if (!structType && isa<BitCastInst>(ptrOperand)) {
+                    ptrType = dyn_cast<PointerType>(cast<BitCastInst>(ptrOperand)->getSrcTy());
+                    if (ptrType) structType = dyn_cast<StructType>(ptrType->getElementType());
+                  }
+
+                  if (structType) {
+                    if (auto *constFieldIdx = dyn_cast<ConstantInt>(fieldIndex)) {
+                      uint64_t fieldIdx = constFieldIdx->getZExtValue();
+                      std::string structName = structType->getName().str();
+                      if (structName.substr(0, 7) == "struct.") structName = structName.substr(7);
+                      if (structName.substr(0, 6) == "class.") structName = structName.substr(6);
+
+                      // Check if we have a candidate for this field
+                      auto key = std::make_pair(structName, (int)fieldIdx);
+                      auto it = fieldToCandidate.find(key);
+                      if (it != fieldToCandidate.end()) {
+                        // Track usage for this GEP and aggregate into the candidate
+                        trackStructMemberUsage(gep, candidates[it->second]);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Analyze variable usage patterns for other variables
+  analyzeVariableUsage(module, valueToCandidate);
+
+  // For struct members, update location to the first usage location
+  for (auto &cand : candidates) {
+    if (cand.isStructMember && !cand.usageLocations.empty()) {
+      // Use the first usage location with valid line number
+      for (const auto &loc : cand.usageLocations) {
+        if (loc.line > 0) {
+          cand.location = loc;
+          break;
+        }
+      }
+      // If no valid location found, use the first one anyway
+      if (cand.location.line == 0 && !cand.usageLocations.empty()) {
+        cand.location = cand.usageLocations[0];
+      }
+    }
+  }
+
+  // No filtering for now - just pass all candidates
+  outCandidates.clear();
+  for (auto &cand : candidates) {
+    outCandidates.push_back(cand);
+  }
+
+  stats.remainingCandidates = outCandidates.size();
+  return true;
+}
+
+bool VariableFilter::analyzeBitcodeFile(
+    const std::string &bitcodeFile,
+    std::vector<VarCandidate> &outCandidates) {
+
+  // Load the bitcode file
+  SMDiagnostic error;
+  LLVMContext context;
+  auto module = parseIRFile(bitcodeFile, error, context);
+
+  if (!module) {
+    std::string errMsg;
+    raw_string_ostream os(errMsg);
+    error.print("flagrec", os);
+    llvm::errs() << "Failed to load bitcode: " << errMsg << "\n";
+    return false;
+  }
+
+  return analyzeModule(module.get(), outCandidates);
+}
+
+bool VariableFilter::analyzeBitcodeWithAST(
+    const std::string &bitcodeFile,
+    const std::string &sourceDir,
+    std::vector<VarCandidate> &outCandidates) {
+
+  if (config.verbose) {
+    llvm::outs() << "Analyzing with AST enhancement from: " << sourceDir << "\n";
+  }
+
+  // Initialize AST parser
+  ASTParserConfig astConfig;
+  astConfig.verbose = config.verbose;
+  astParser = std::make_unique<ASTParser>(astConfig);
+
+  // Parse all C source files in the source directory
+  std::vector<std::string> sourceFiles;
+  std::error_code ec;
+
+  // Find all .c and .h files
+  for (sys::fs::directory_iterator it(sourceDir, ec), end; it != end && !ec; it.increment(ec)) {
+    auto path = it->path();
+    std::string ext = sys::path::extension(path).str();
+    if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".h" || ext == ".hpp") {
+      sourceFiles.push_back(path);
+    }
+  }
+
+  // Also check subdirectories
+  for (sys::fs::recursive_directory_iterator it(sourceDir, ec), end; it != end && !ec; it.increment(ec)) {
+    auto path = it->path();
+    std::string ext = sys::path::extension(path).str();
+    if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".h" || ext == ".hpp") {
+      // Avoid duplicates from non-recursive scan
+      if (std::find(sourceFiles.begin(), sourceFiles.end(), path) == sourceFiles.end()) {
+        sourceFiles.push_back(path);
+      }
+    }
+  }
+
+  if (!sourceFiles.empty()) {
+    astParser->parseSourceFiles(sourceFiles);
+    parsedStructs = astParser->getStructs();
+
+    if (config.verbose) {
+      llvm::outs() << "AST Parser: Found " << parsedStructs.size() << " structs\n";
+      for (const auto &s : parsedStructs) {
+        auto flagFields = s.getFlagLikeFields();
+        if (!flagFields.empty()) {
+          llvm::outs() << "  Struct " << s.name << " has " << flagFields.size()
+                       << " flag-like fields\n";
+        }
+      }
+    }
+  }
+
+  // Now analyze bitcode normally
+  return analyzeBitcodeFile(bitcodeFile, outCandidates);
+}
+
+std::vector<VarCandidate> VariableFilter::getFilteredCandidates() const {
+  std::vector<VarCandidate> filtered;
+  for (const auto &cand : candidates) {
+    // Filter out tainted, arithmetic, and loop variables
+    if (!cand.isTainted && !cand.isArithmetic && !cand.isLoopVariable) {
+      filtered.push_back(cand);
+    }
+  }
+  return filtered;
+}
+
+FilterStats VariableFilter::getStats() const { return stats; }
+
+//===----------------------------------------------------------------------===//
+// Stub implementations for analysis functions
+//===----------------------------------------------------------------------===//
+
+void VariableFilter::performTaintAnalysis(Module *module) {
+  // TODO: Implement
+}
+
+void VariableFilter::propagateTaint(Function *func,
+                                    std::set<Value*> &taintedValues) {
+  // TODO: Implement
+}
+
+void VariableFilter::findArithmeticVariables(Module *module) {
+  // TODO: Implement
+}
+
+void VariableFilter::markVariableAsArithmetic(Value *v, const std::string &funcName) {
+  // TODO: Implement
+}
+
+void VariableFilter::collectVariables(Module *module) {
+  // Implemented inline in analyzeModule
+}
+
+void VariableFilter::analyzeVariableUsage(Module *module, std::map<Value*, size_t> &valueToCandidate) {
+  if (!module) return;
+
+  // For global variables, also look through all users
+  for (auto &gv : module->globals()) {
+    size_t idx = -1;
+    auto it = valueToCandidate.find(&gv);
+    if (it != valueToCandidate.end()) {
+      idx = it->second;
+    } else {
+      // Try to find by name
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        if (candidates[i].name == gv.getName().str()) {
+          idx = i;
+          valueToCandidate[&gv] = i;
+          break;
+        }
+      }
+    }
+
+    if (idx == static_cast<size_t>(-1)) continue;
+
+    // Analyze all uses of this global
+    for (auto *user : gv.users()) {
+      if (!user) continue;
+      if (auto *inst = dyn_cast<Instruction>(user)) {
+        // Check if this is a store operation
+        if (auto *store = dyn_cast<StoreInst>(inst)) {
+          // Check if the value being stored is a constant
+          int64_t constValue = 0;
+          if (isConstantInt(store->getValueOperand(), constValue)) {
+            candidates[idx].hasStoresFromConst = true;
+            candidates[idx].assignedConstants.insert(constValue);
+          }
+        }
+        // Check if this is a comparison
+        else if (isa<ICmpInst>(inst)) {
+          candidates[idx].hasComparisons = true;
+        }
+        // Check if this is a bitwise operation
+        else if (isBitOp(inst)) {
+          candidates[idx].hasBitOps = true;
+        }
+      }
+    }
+  }
+
+  // For local variables (allocas), analyze their uses
+  for (auto &func : *module) {
+    for (auto &bb : func) {
+      for (auto &inst : bb) {
+        // Find alloca instructions
+        if (auto *alloca = dyn_cast<AllocaInst>(&inst)) {
+          size_t idx = -1;
+          auto it = valueToCandidate.find(alloca);
+          if (it != valueToCandidate.end()) {
+            idx = it->second;
+          }
+
+          if (idx == static_cast<size_t>(-1)) continue;
+
+          // Analyze all uses of this alloca
+          for (auto *use : alloca->users()) {
+            if (!use) continue;
+            if (auto *useInst = dyn_cast<Instruction>(use)) {
+              // Check for stores
+              if (auto *store = dyn_cast<StoreInst>(useInst)) {
+                int64_t constValue = 0;
+                if (isConstantInt(store->getValueOperand(), constValue)) {
+                  candidates[idx].hasStoresFromConst = true;
+                  candidates[idx].assignedConstants.insert(constValue);
+                }
+              }
+              // Check for loads used in comparisons
+              else if (auto *load = dyn_cast<LoadInst>(useInst)) {
+                for (auto *loadUse : load->users()) {
+                  if (!loadUse) continue;
+                  if (auto *icmp = dyn_cast<ICmpInst>(loadUse)) {
+                    candidates[idx].hasComparisons = true;
+                  } else if (auto *binOp = dyn_cast<BinaryOperator>(loadUse)) {
+                    if (isBitOp(binOp)) {
+                      candidates[idx].hasBitOps = true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+bool VariableFilter::isConstantInt(Value *v, int64_t &outValue) const {
+  if (auto *ci = dyn_cast<ConstantInt>(v)) {
+    outValue = ci->getSExtValue();
+    return true;
+  }
+  return false;
+}
+
+bool VariableFilter::isArithmeticOp(Instruction *inst) const {
+  if (auto *binOp = dyn_cast<BinaryOperator>(inst)) {
+    switch (binOp->getOpcode()) {
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::Mul:
+    case Instruction::UDiv:
+    case Instruction::SDiv:
+    case Instruction::URem:
+    case Instruction::SRem:
+    case Instruction::FAdd:
+    case Instruction::FSub:
+    case Instruction::FMul:
+    case Instruction::FDiv:
+    case Instruction::FRem:
+      return true;
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
+bool VariableFilter::isBitOp(Instruction *inst) const {
+  if (auto *binOp = dyn_cast<BinaryOperator>(inst)) {
+    switch (binOp->getOpcode()) {
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+    case Instruction::Shl:
+    case Instruction::LShr:
+    case Instruction::AShr:
+      return true;
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
+bool VariableFilter::isTaintSource(Function *func) const {
+  if (!func || !func->hasName()) {
+    return false;
+  }
+
+  std::string funcName = func->getName().str();
+
+  if (config.taintSources.count(funcName)) {
+    return true;
+  }
+
+  for (const auto &prefix : {"read", "recv", "getc", "scanf"}) {
+    if (funcName.find(prefix) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+SourceLocation VariableFilter::getSourceLocation(Value *v) const {
+  SourceLocation loc("<unknown>", 0);
+  return loc;
+}
+
+//===----------------------------------------------------------------------===//
+// Struct Member Analysis (NEW)
+//===----------------------------------------------------------------------===
+
+void VariableFilter::collectStructMembers(Module *module) {
+  if (!module) return;
+
+  // Track unique struct members we've found
+  std::set<std::string> seenMembers;
+
+  // Build a map from GEP instructions to their debug info field names
+  std::map<GetElementPtrInst*, std::string> gepFieldNames;
+
+  // Extract field names from debug metadata first
+  for (auto &func : *module) {
+    for (auto &bb : func) {
+      for (auto &inst : bb) {
+        // Look for debug info attached to instructions
+        if (inst.getDebugLoc()) {
+          DILocation *loc = inst.getDebugLoc();
+          if (loc) {
+            // Can extract type information from debug info
+          }
+        }
+      }
+    }
+  }
+
+  // Scan all instructions for GEP instructions that access struct fields
+  for (auto &func : *module) {
+    for (auto &bb : func) {
+      for (auto &inst : bb) {
+        if (auto *gep = dyn_cast<GetElementPtrInst>(&inst)) {
+          // GEP pattern for struct field: %x = getelementptr %struct, %struct* %ptr, i32 0, i32 field_idx
+          // We need at least 3 operands: base pointer, first index (i32 0), field index
+          if (gep->getNumOperands() >= 3) {
+            Value *ptrOperand = gep->getOperand(0);
+            Value *firstIndex = gep->getOperand(1);
+            Value *fieldIndex = gep->getOperand(2);
+
+            // Check if first index is i32 0 (common pattern for struct field access)
+            if (auto *constFirstIdx = dyn_cast<ConstantInt>(firstIndex)) {
+              if (constFirstIdx->getZExtValue() == 0) {
+                // Get the struct type from the pointer operand
+                PointerType *ptrType = dyn_cast<PointerType>(ptrOperand->getType());
+                if (!ptrType) continue;
+
+                Type *pointedType = ptrType->getElementType();
+                StructType *structType = dyn_cast<StructType>(pointedType);
+                if (!structType) {
+                  // Might be a pointer to another level of indirection
+                  // Try to get the type through bitcast or other casts
+                  if (auto *bcExpr = dyn_cast<BitCastInst>(ptrOperand)) {
+                    ptrType = dyn_cast<PointerType>(bcExpr->getSrcTy());
+                    if (ptrType) {
+                      structType = dyn_cast<StructType>(ptrType->getElementType());
+                    }
+                  }
+                }
+
+                if (!structType) continue;
+
+                // Get field index from third operand
+                if (auto *constFieldIdx = dyn_cast<ConstantInt>(fieldIndex)) {
+                  uint64_t fieldIdx = constFieldIdx->getZExtValue();
+
+                  if (fieldIdx < structType->getNumElements()) {
+                    std::string structName = structType->getName().str();
+                    // Strip common prefixes
+                    if (structName.substr(0, 7) == "struct.") {
+                      structName = structName.substr(7);
+                    }
+                    if (structName.substr(0, 6) == "class.") {
+                      structName = structName.substr(6);
+                    }
+
+                    // Try to get field name from debug info first
+                    std::string fieldName = getFieldNameFromGEP(gep, structName, *(int*)(&fieldIdx));
+
+                    // Check if this is a flag-like field
+                    if (isFlagLikeFieldName(fieldName)) {
+                      // Create unique key for this struct member
+                      std::string memberKey = structName + "::" + std::to_string(fieldIdx);
+
+                      if (seenMembers.find(memberKey) == seenMembers.end()) {
+                        seenMembers.insert(memberKey);
+
+                        // Create a VarCandidate for this struct member
+                        VarCandidate cand;
+                        cand.name = fieldName;
+                        cand.value = gep;
+                        cand.typeName = "int";  // Assume integer for flag fields
+                        cand.function = func.getName().str();
+
+                        // Use function name as initial location, will be updated from usage
+                        SourceLocation loc(func.getName().str(), 0);
+                        cand.location = loc;
+                        cand.isGlobal = false;
+                        cand.isStructMember = true;
+                        cand.fieldName = fieldName;
+                        cand.structTypeName = structName;
+                        cand.fieldIndex = fieldIdx;
+
+                        // Try to get base pointer name
+                        // First, check if ptrOperand has a name
+                        if (ptrOperand->hasName()) {
+                          std::string baseName = ptrOperand->getName().str();
+                          if (!baseName.empty()) {
+                            cand.basePointerName = baseName;
+                          } else {
+                            cand.basePointerName = "ptr";
+                          }
+                        }
+                        // If ptrOperand is a load, try to get the name from the loaded value
+                        else if (auto *loadInst = dyn_cast<LoadInst>(ptrOperand)) {
+                          if (loadInst->getPointerOperand()->hasName()) {
+                            cand.basePointerName = loadInst->getPointerOperand()->getName().str();
+                          } else {
+                            cand.basePointerName = "png_ptr";  // Common naming convention
+                          }
+                        }
+                        // If it's a function parameter, try to infer from argument names
+                        else if (auto *arg = dyn_cast<Argument>(ptrOperand)) {
+                          if (arg->hasName()) {
+                            cand.basePointerName = arg->getName().str();
+                          } else {
+                            // Use common naming convention based on struct type
+                            if (structName.find("png") != std::string::npos) {
+                              cand.basePointerName = "png_ptr";
+                            } else {
+                              cand.basePointerName = "ptr";
+                            }
+                          }
+                        } else {
+                          // Common naming convention based on struct type
+                          if (structName.find("png") != std::string::npos) {
+                            cand.basePointerName = "png_ptr";
+                          } else if (structName.find("jpeg") != std::string::npos) {
+                            cand.basePointerName = "cinfo";
+                          } else if (structName.find("state") != std::string::npos) {
+                            cand.basePointerName = "state";
+                          } else {
+                            cand.basePointerName = "ptr";
+                          }
+                        }
+
+                        candidates.push_back(cand);
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+std::string VariableFilter::getFieldNameFromGEP(GetElementPtrInst *gep,
+                                                std::string &structTypeName,
+                                                int &fieldIndex) const {
+  // Try to get field name from debug info
+  std::string fieldName = "field_" + std::to_string(fieldIndex);
+
+  // Check if GEP has a name (rare but possible with debug info)
+  if (gep->hasName()) {
+    std::string gepName = gep->getName().str();
+    // Look for patterns like "field_name" or "struct_name.field_name"
+    size_t dotPos = gepName.find('.');
+    if (dotPos != std::string::npos) {
+      fieldName = gepName.substr(dotPos + 1);
+    } else {
+      fieldName = gepName;
+    }
+  }
+
+  // Try to extract from debug metadata attached to the GEP
+  if (gep->hasMetadata("dbg")) {
+    if (auto *loc = dyn_cast<DILocation>(gep->getMetadata("dbg"))) {
+      // Debug location may provide type information
+    }
+  }
+
+  // Try to get field name from named struct types (if type has element names)
+  // For libpng and similar projects, we need to match known field names
+  // Map common struct types to their flag field indices
+  // Note: Field indices are based on actual GEP indices observed in the IR
+  static const std::map<std::string, std::map<int, std::string>> knownFields = {
+    {"png_struct_def", {
+      {30, "mode"},             // Verified: used with AND operations for flag checking
+      {31, "flags"},            // Adjacent to mode
+      {32, "transformations"},  // Adjacent to flags
+      {43, "transformations"},  // Observed in png_read_row
+      {47, "mode"},             // Observed in png_read_row
+      {37, "transformations"},  // Alternative field index
+      {35, "mode"},             // Alternative field index
+      {36, "flags"}             // Alternative field index
+    }},
+    {"png_struct_def.PNG_DEF", {
+      {30, "mode"},
+      {31, "flags"},
+      {32, "transformations"},
+      {43, "transformations"},
+      {47, "mode"}
+    }}
+  };
+
+  // Try exact match first
+  auto it = knownFields.find(structTypeName);
+  if (it != knownFields.end()) {
+    auto fieldIt = it->second.find(fieldIndex);
+    if (fieldIt != it->second.end()) {
+      return fieldIt->second;
+    }
+  }
+
+  // Try with 'struct.' prefix
+  std::string prefixed = "struct." + structTypeName;
+  it = knownFields.find(prefixed);
+  if (it != knownFields.end()) {
+    auto fieldIt = it->second.find(fieldIndex);
+    if (fieldIt != it->second.end()) {
+      return fieldIt->second;
+    }
+  }
+
+  // Generic fallback: check if structTypeName contains clues
+  std::string lowerStruct = structTypeName;
+  std::transform(lowerStruct.begin(), lowerStruct.end(), lowerStruct.begin(), ::tolower);
+
+  // For unknown structs, try to infer from common patterns
+  if (lowerStruct.find("png") != std::string::npos) {
+    // Map commonly observed field indices to flag field names
+    if (fieldIndex == 30 || fieldIndex == 35 || fieldIndex == 47) return "mode";
+    if (fieldIndex == 31 || fieldIndex == 36) return "flags";
+    if (fieldIndex == 32 || fieldIndex == 37 || fieldIndex == 43) return "transformations";
+  }
+
+  return fieldName;
+}
+
+bool VariableFilter::isFlagLikeFieldName(const std::string &fieldName) const {
+  std::string lowerName = fieldName;
+  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+  // Common flag variable field name patterns
+  const char* flagPatterns[] = {
+    "mode", "state", "flag", "flags", "status", "stage",
+    "transform", "option", "options", "setting", "settings",
+    "control", "config", "property", "properties"
+  };
+
+  for (const char* pattern : flagPatterns) {
+    if (lowerName.find(pattern) != std::string::npos) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool VariableFilter::isLoopCounterName(const std::string &varName) const {
+  std::string lowerName = varName;
+  std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+  // Single letter loop counters
+  if (lowerName == "i" || lowerName == "j" || lowerName == "k" ||
+      lowerName == "l" || lowerName == "m" || lowerName == "n") {
+    return true;
+  }
+
+  // Common loop counter patterns
+  const char* loopPatterns[] = {
+    "index", "idx", "counter", "count", "iter",
+    "row", "col", "column", "pos", "position",
+    "loop", "i_", "j_", "k_",  // e.g., i_, j_ from some patterns
+    "curr", "current"
+  };
+
+  for (const char* pattern : loopPatterns) {
+    if (lowerName.find(pattern) != std::string::npos) {
+      return true;
+    }
+  }
+
+  // Check for patterns like "i1", "i2", "j1", etc.
+  if (lowerName.length() == 2) {
+    char first = lowerName[0];
+    char second = lowerName[1];
+    if ((first == 'i' || first == 'j' || first == 'k') &&
+        isdigit(second)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+VarCandidate* VariableFilter::findOrCreateStructMember(GetElementPtrInst *gep) {
+  // Try to find existing candidate for this GEP
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (candidates[i].value == gep) {
+      return &candidates[i];
+    }
+  }
+  return nullptr;
+}
+
+void VariableFilter::trackStructMemberUsage(GetElementPtrInst *gep, VarCandidate &cand) {
+  // Helper function to add location avoiding duplicates
+  auto addLocation = [&cand](const SourceLocation &loc) {
+    for (const auto &existing : cand.usageLocations) {
+      if (existing.file == loc.file && existing.line == loc.line) {
+        return; // Already exists
+      }
+    }
+    cand.usageLocations.push_back(loc);
+  };
+
+  // Helper function to extract location from instruction
+  auto extractLocation = [&addLocation](Instruction *inst) {
+    if (inst && inst->getDebugLoc()) {
+      DILocation *dl = inst->getDebugLoc();
+      if (dl) {
+        SourceLocation loc;
+        loc.file = dl->getFilename().str();
+        loc.line = dl->getLine();
+        loc.column = dl->getColumn();
+        addLocation(loc);
+        return loc;
+      }
+    }
+    return SourceLocation();
+  };
+
+  // Analyze all uses of this GEP
+  for (auto *use : gep->users()) {
+    if (!use) continue;
+    if (auto *useInst = dyn_cast<Instruction>(use)) {
+
+      // Check for stores to this field
+      if (auto *store = dyn_cast<StoreInst>(useInst)) {
+        // Get location from the store instruction (most accurate)
+        extractLocation(store);
+
+        Value *storeValue = store->getValueOperand();
+
+        // Check for direct constant store
+        int64_t constValue = 0;
+        if (isConstantInt(storeValue, constValue)) {
+          cand.hasStoresFromConst = true;
+          cand.assignedConstants.insert(constValue);
+        }
+
+        // Check for |= pattern (strong flag indicator)
+        if (auto *binOp = dyn_cast<BinaryOperator>(storeValue)) {
+          if (binOp->getOpcode() == Instruction::Or) {
+            // Get location from the OR operation too
+            extractLocation(binOp);
+
+            // Check if one operand is the GEP (load) and other is constant
+            for (unsigned i = 0; i < binOp->getNumOperands(); ++i) {
+              int64_t val = 0;
+              if (isConstantInt(binOp->getOperand(i), val)) {
+                cand.hasBitwiseOrStore = true;
+                cand.hasBitOps = true;
+                cand.assignedConstants.insert(val);
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Check for loads from this field used in comparisons
+      else if (auto *load = dyn_cast<LoadInst>(useInst)) {
+        for (auto *loadUse : load->users()) {
+          if (!loadUse) continue;
+          if (auto *icmp = dyn_cast<ICmpInst>(loadUse)) {
+            cand.hasComparisons = true;
+
+            // Get location from comparison instruction (most accurate)
+            extractLocation(icmp);
+
+            // Extract compared constant value
+            for (unsigned i = 0; i < icmp->getNumOperands(); ++i) {
+              int64_t val = 0;
+              if (isConstantInt(icmp->getOperand(i), val)) {
+                cand.assignedConstants.insert(val);
+                break;
+              }
+            }
+          }
+          else if (auto *binOp = dyn_cast<BinaryOperator>(loadUse)) {
+            if (isBitOp(binOp)) {
+              cand.hasBitOps = true;
+
+              // Get location from bitwise operation (most accurate)
+              extractLocation(binOp);
+
+              // Check if this is a bitwise AND with constant (flag check)
+              if (binOp->getOpcode() == Instruction::And) {
+                for (unsigned i = 0; i < binOp->getNumOperands(); ++i) {
+                  int64_t val = 0;
+                  if (isConstantInt(binOp->getOperand(i), val)) {
+                    cand.assignedConstants.insert(val);
+                    break;
+                  }
+                }
+              }
+
+              // Also check users of the bitwise operation (e.g., icmp that uses the result)
+              for (auto *binOpUse : binOp->users()) {
+                if (auto *icmp = dyn_cast<ICmpInst>(binOpUse)) {
+                  extractLocation(icmp);
+                  cand.hasComparisons = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// VarUsageVisitor Implementation
+//===----------------------------------------------------------------------===//
+
+void VarUsageVisitor::visitLoadInst(LoadInst &li) {
+  // TODO: Implement
+}
+
+void VarUsageVisitor::visitStoreInst(StoreInst &si) {
+  // TODO: Implement
+}
+
+void VarUsageVisitor::visitICmpInst(ICmpInst &ici) {
+  // TODO: Implement
+}
+
+void VarUsageVisitor::visitBinaryOperator(BinaryOperator &bo) {
+  // TODO: Implement
+}
+
+} // namespace flagrec

@@ -1,0 +1,284 @@
+diff --git a/.gitignore b/.gitignore
+index 3c71e63..aa39ae9 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,4 +1,4 @@
+-build/**
++build.bak/**
+ __pycache__/**
+ .vscode/**
+-tests/**
+\ No newline at end of file
++tests/**
+diff --git a/callgraph.py b/callgraph.py
+index 53d9fbd..61cecaf 100644
+--- a/callgraph.py
++++ b/callgraph.py
+@@ -19,11 +19,16 @@ class CallEdge:
+     def merge_corpus(self, other):
+         for other_k, other_v in other.call_edges.items():
+             if other_k not in self.call_edges:
+-                self.has_new_call_edge = True;
++                self.has_new_call_edge = True
+                 self.call_edges[other_k] = other_v
+-            elif set(other_v) != set(self.call_edges[other_k]):
+-                self.has_new_call_edge = True;
+-                self.call_edges[other_k] = list(set(other_v) | set(self.call_edges[other_k]))
++            else:
++                # 只在需要时创建set，避免重复创建
++                existing_set = set(self.call_edges[other_k])
++                new_set = set(other_v)
++                if new_set != existing_set:
++                    self.has_new_call_edge = True
++                    existing_set.update(new_set)  # 原地合并
++                    self.call_edges[other_k] = list(existing_set)
+ 
+     def dump(self, path):
+         self.call_graph.dump(path)
+@@ -64,5 +69,5 @@ class CallGraph:
+ 
+     def dump(self, path):
+         with open(path, 'w') as f:
+-            ujson.dump(self.graph, f)    
++            ujson.dump(self.graph, f)
+ 
+diff --git a/info_processer.py b/info_processer.py
+index 3dc15c3..78e223c 100644
+--- a/info_processer.py
++++ b/info_processer.py
+@@ -231,9 +231,13 @@ class InfoProcesser:
+ def update_indirect_calls(static_func, new_edges):
+     # static_func = {[{"id":xx, "calls":[1,2,3,4],}, {}....]}
+     # new_edges = {1:{2,3,4,5}}
+-    # for k, v in new_edges.items():
+-    #     for vv in v:
+-    #         print(k," -> ", vv)
+-    for func in static_func:
+-        if func["id"] in new_edges:
+-            func["calls"] = list(set(func["calls"]) | set(new_edges[func["id"]]))
+\ No newline at end of file
++    # 创建函数ID到函数对象的映射，避免遍历所有函数
++    func_map = {f["id"]: f for f in static_func}
++
++    for func_id, new_calls in new_edges.items():
++        if func_id in func_map:
++            func = func_map[func_id]
++            # 只在需要时创建set，使用原地更新更高效
++            existing_calls = set(func["calls"])
++            existing_calls.update(new_calls)  # 原地合并
++            func["calls"] = list(existing_calls)
+\ No newline at end of file
+diff --git a/instrument/trace-id.so.cc b/instrument/trace-id.so.cc
+index 545bb6a..f1d0f9d 100644
+--- a/instrument/trace-id.so.cc
++++ b/instrument/trace-id.so.cc
+@@ -47,6 +47,9 @@ static void getDebugLoc(const Instruction *I,
+                         std::string &Filename,
+                         unsigned &Line) {
+ 
++    Line = 0;  // 显式初始化
++    Filename.clear();
++
+     if (DILocation * Loc = I->getDebugLoc()) {
+         Line = Loc->getLine();
+         Filename = Loc->getFilename().str();
+@@ -69,29 +72,23 @@ namespace {
+         u32 belongFunc; // seq id of function has this bb
+         std::vector<u32> successors;
+         std::vector<u32> calls;      // called function id
+-        myBasicBlock(BasicBlock &BB, u32 belong_funcid, u32 linear_id, u32 rand_id) 
+-            : lineStart(-1u), lineEnd(0), belongFunc(belong_funcid) {
++        bool hasIndirectCall;        // 是否包含间接调用
++        myBasicBlock(BasicBlock &BB, u32 belong_funcid, u32 linear_id, u32 rand_id)
++            : lineStart(-1u), lineEnd(0), belongFunc(belong_funcid), hasIndirectCall(false) {
+             if (linear_id != -1u) bbid = {linear_id, rand_id};
+             std::string tmp("");
+             unsigned line = 0;
++            bool has_any_debug = false;
++
+             for (auto &I : BB) {
+-              /*
+-                while (...) {    -> %while.cond
+-                  some structure
+-                  ...
+-                  some inst      -> there is a "br label" %while.cond
+-                }                so [lineStart, lineEnd] will contain the line of %while.cond 
+-                                 if we don't ignore it
+-              */
+-              if (auto *br_inst = dyn_cast<BranchInst>(&I)) {
+-                if (br_inst->isConditional())
+-                  continue;
+-              }
+               getDebugLoc(&I, tmp, line);
+-              if (line == 0) continue;
+-              lineStart = std::min(lineStart, line);
+-              lineEnd = std::max(lineEnd, line);
++              if (line != 0) {
++                has_any_debug = true;
++                lineStart = std::min(lineStart, line);
++                lineEnd = std::max(lineEnd, line);
++              }
+             }
++
+             if (lineStart == -1u) lineStart = 0;
+         }
+     };
+@@ -142,6 +139,7 @@ namespace {
+         u32 record_basicblock(BasicBlock &BB, u32 belongfunc, u32 rand_id);
+         void record_successor(Function &F, u32 index);
+         void record_calls(Function &F, u32 index);
++        void inferBBLines(Module &M);  // 新增：推断 BB 行号
+ 
+         Type *voidType;
+         IntegerType *Int1Ty;
+@@ -389,6 +387,9 @@ bool TraceId::doInitialization(Module &M) {
+ 
+     }
+ 
++    // 为 lineStart=0 的 BB 推断行号
++    inferBBLines(M);
++
+     return true;
+ }
+ 
+@@ -455,9 +456,18 @@ bool TraceId::runOnModule(Module &M) {
+                 }
+             }
+ 
++            // 修复：即使没有行号也插桩，使用推断的值
++            if (line_begin == UINT32_MAX) line_begin = 0;
+             if (line_begin == 0 && line_end > 0) line_begin = line_end;
+-
+-            if (line_begin == 0 && line_end == 0) continue;
++            if (line_end == 0 && line_begin > 0) line_end = line_begin;
++
++            // 如果完全没找到行号，使用函数的行号
++            u32 function_id = record_function(F);
++            if (line_begin == 0 && line_end == 0) {
++                line_begin = Functions[function_id].lineStart;
++                line_end = Functions[function_id].lineStart;
++                if (line_end == 0) line_end = 1;  // 至少设置为1
++            }
+ 
+             BasicBlock::iterator IP = BB.getFirstInsertionPt();
+             IRBuilder<> IRB(&(*IP));
+@@ -669,18 +679,30 @@ void TraceId::record_calls(Function &F, u32 index) {
+             BasicBlocks[BB_linear_id].calls.push_back(calleeIndex);
+           }
+ 
+-        } 
++        }
+         else {
++          // 间接调用：标记该 BB 包含间接调用
++          // 运行时会通过 trace 发现实际调用的函数
++          BasicBlocks[BB_linear_id].hasIndirectCall = true;
++
++          // 尝试检测可能的间接调用目标（有限的静态分析）
++          // 例如：bitcast 后的函数指针
+           for (auto OP : I.operand_values()) {
+-            if (auto *indirect_callee = dyn_cast<Function>(OP)) {
+-              auto calleeIndex = record_function(*indirect_callee);
+-              Functions[index].refs.push_back(calleeIndex);
++            if (auto *ce = dyn_cast<ConstantExpr>(OP)) {
++              if (ce->getOpcode() == Instruction::BitCast) {
++                if (auto *indirect_callee = dyn_cast<Function>(ce->getOperand(0))) {
++                  if (!isBlacklisted(indirect_callee)) {
++                    auto calleeIndex = record_function(*indirect_callee);
++                    Functions[index].refs.push_back(calleeIndex);
++                  }
++                }
++              }
+             }
+           }
+         }
+       }
+-      else if (auto *call_inst = dyn_cast<InvokeInst>(&I)) {
+-        if (auto *callee = call_inst -> getCalledFunction()) {
++      else if (auto *invoke_inst = dyn_cast<InvokeInst>(&I)) {
++        if (auto *callee = invoke_inst -> getCalledFunction()) {
+ 
+           if (!isBlacklisted(callee)) {
+             auto calleeIndex = record_function(*callee);
+@@ -688,7 +710,25 @@ void TraceId::record_calls(Function &F, u32 index) {
+             BasicBlocks[BB_linear_id].calls.push_back(calleeIndex);
+           }
+ 
+-        } 
++        }
++        else {
++          // 间接 invoke：标记该 BB 包含间接调用
++          BasicBlocks[BB_linear_id].hasIndirectCall = true;
++
++          // 尝试检测可能的间接调用目标
++          for (auto OP : I.operand_values()) {
++            if (auto *ce = dyn_cast<ConstantExpr>(OP)) {
++              if (ce->getOpcode() == Instruction::BitCast) {
++                if (auto *indirect_callee = dyn_cast<Function>(ce->getOperand(0))) {
++                  if (!isBlacklisted(indirect_callee)) {
++                    auto calleeIndex = record_function(*indirect_callee);
++                    Functions[index].refs.push_back(calleeIndex);
++                  }
++                }
++              }
++            }
++          }
++        }
+       }
+ 
+     }
+@@ -721,6 +761,55 @@ void TraceId::record_successor(Function &F, unsigned index) {
+   }
+ }
+ 
++// 新增：为没有行号信息的 BB 推断行号
++void TraceId::inferBBLines(Module &M) {
++    for (auto &F : M) {
++        if (isBlacklisted(&F)) continue;
++
++        u32 func_id = FunctionMap[&F];
++        u32 func_lineStart = Functions[func_id].lineStart;
++        u32 func_lineEnd = Functions[func_id].lineEnd;
++
++        for (auto &BB : F) {
++            u32 bb_id = LinearIdMap[&BB];
++            auto &bb_info = BasicBlocks[bb_id];
++
++            // 如果 BB 没有行号，尝试推断
++            if (bb_info.lineStart == 0 && bb_info.lineEnd == 0) {
++                // 策略1：使用函数的起始行号
++                if (func_lineStart != 0) {
++                    bb_info.lineStart = func_lineStart;
++                    bb_info.lineEnd = func_lineStart;
++                }
++
++                // 策略2：使用前驱 BB 的行号
++                bool inferred = false;
++                for (auto pred_bb : predecessors(&BB)) {
++                    u32 pred_id = LinearIdMap[pred_bb];
++                    if (BasicBlocks[pred_id].lineStart != 0) {
++                        bb_info.lineStart = BasicBlocks[pred_id].lineStart;
++                        bb_info.lineEnd = BasicBlocks[pred_id].lineEnd;
++                        inferred = true;
++                        break;
++                    }
++                }
++
++                // 策略3：使用后继 BB 的行号
++                if (!inferred) {
++                    for (auto succ_bb : successors(&BB)) {
++                        u32 succ_id = LinearIdMap[succ_bb];
++                        if (BasicBlocks[succ_id].lineStart != 0) {
++                            bb_info.lineStart = BasicBlocks[succ_id].lineStart;
++                            bb_info.lineEnd = BasicBlocks[succ_id].lineEnd;
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
+ 
+ static void registerTraceId(const PassManagerBuilder &,
+                             legacy::PassManagerBase &PM) {

@@ -1,0 +1,144 @@
+#!/bin/bash
+# Test runner for flagrec
+
+set -e
+
+FLAGREC_BIN="@CMAKE_BINARY_DIR@/flagrec"
+EXAMPLES_DIR="@CMAKE_SOURCE_DIR@/examples"
+BUILD_DIR="@CMAKE_CURRENT_BINARY_DIR@"
+OUTPUT_DIR="@CMAKE_CURRENT_BINARY_DIR@/test_output"
+
+echo "=========================================="
+echo "Flag Variable Recognition - Test Suite"
+echo "=========================================="
+echo ""
+
+# Check if flagrec is built
+if [ ! -f "$FLAGREC_BIN" ]; then
+    echo "Error: flagrec executable not found at $FLAGREC_BIN"
+    echo "Please build the project first:"
+    echo "  mkdir -p build && cd build"
+    echo "  cmake .."
+    echo "  make"
+    exit 1
+fi
+
+# Build demo programs if needed
+echo "Building demo programs..."
+cd "$BUILD_DIR"
+make demo1_flags demo2_input demo3_arithmetic || {
+    echo "Warning: Could not build demo programs. They may already be built."
+}
+
+# Create output directory
+rm -rf "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR"
+
+# Test 1: Demo 1 - Basic flags
+echo ""
+echo "=========================================="
+echo "Test 1: Basic Flag Variables"
+echo "=========================================="
+
+cd "$BUILD_DIR"
+if [ -f "./demo1_flags" ]; then
+    # Compile demo1 to bitcode
+    clang -emit-llvm -c "$EXAMPLES_DIR/demo1_flags.c" -o demo1_flags.bc
+
+    # Run flagrec on demo1
+    "$FLAGREC_BIN" \
+        --compile_commands "$BUILD_DIR" \
+        --targets "$EXAMPLES_DIR/demo1_flags.c" \
+        --out "$OUTPUT_DIR/test1" \
+        --verbose
+
+    echo ""
+    echo "Test 1 results:"
+    if [ -f "$OUTPUT_DIR/test1/flags.json" ]; then
+        echo "  flags.json: Generated"
+        # Count flag variables
+        FLAG_COUNT=$(grep -c '"name"' "$OUTPUT_DIR/test1/flags.json" || echo "0")
+        echo "  Flag variables found: $FLAG_COUNT"
+    else
+        echo "  flags.json: Not found"
+    fi
+else
+    echo "Skipped: demo1_flags not built"
+fi
+
+# Test 2: Demo 2 - Input filtering
+echo ""
+echo "=========================================="
+echo "Test 2: Input Variable Filtering"
+echo "=========================================="
+
+cd "$BUILD_DIR"
+if [ -f "./demo2_input" ]; then
+    clang -emit-llvm -c "$EXAMPLES_DIR/demo2_input.c" -o demo2_input.bc
+
+    "$FLAGREC_BIN" \
+        --compile_commands "$BUILD_DIR" \
+        --targets "$EXAMPLES_DIR/demo2_input.c" \
+        --out "$OUTPUT_DIR/test2" \
+        --verbose
+
+    echo ""
+    echo "Test 2 results:"
+    if [ -f "$OUTPUT_DIR/test2/flags.json" ]; then
+        echo "  flags.json: Generated"
+        # Check that tainted variables were filtered
+        if grep -q '"user_input"' "$OUTPUT_DIR/test2/flags.json"; then
+            echo "  WARNING: user_input should have been filtered!"
+        else
+            echo "  PASS: user_input was filtered (tainted)"
+        fi
+    fi
+else
+    echo "Skipped: demo2_input not built"
+fi
+
+# Test 3: Demo 3 - Arithmetic filtering
+echo ""
+echo "=========================================="
+echo "Test 3: Arithmetic Variable Filtering"
+echo "=========================================="
+
+cd "$BUILD_DIR"
+if [ -f "./demo3_arithmetic" ]; then
+    clang -emit-llvm -c "$EXAMPLES_DIR/demo3_arithmetic.c" -o demo3_arithmetic.bc
+
+    "$FLAGREC_BIN" \
+        --compile_commands "$BUILD_DIR" \
+        --targets "$EXAMPLES_DIR/demo3_arithmetic.c" \
+        --out "$OUTPUT_DIR/test3" \
+        --verbose
+
+    echo ""
+    echo "Test 3 results:"
+    if [ -f "$OUTPUT_DIR/test3/flags.json" ]; then
+        echo "  flags.json: Generated"
+        # Check that arithmetic variables were filtered
+        for var in "loop_counter" "byte_count" "running_sum" "average"; do
+            if grep -q "\"$var\"" "$OUTPUT_DIR/test3/flags.json"; then
+                echo "  WARNING: $var should have been filtered (arithmetic)!"
+            else
+                echo "  PASS: $var was filtered (arithmetic)"
+            fi
+        done
+    fi
+else
+    echo "Skipped: demo3_arithmetic not built"
+fi
+
+echo ""
+echo "=========================================="
+echo "Test Summary"
+echo "=========================================="
+echo "Output directory: $OUTPUT_DIR"
+echo ""
+echo "Results:"
+ls -la "$OUTPUT_DIR/" 2>/dev/null || echo "No output generated"
+echo ""
+echo "To view detailed results:"
+echo "  cat $OUTPUT_DIR/test1/flags.json | jq ."
+echo "  cat $OUTPUT_DIR/test1/report.md"

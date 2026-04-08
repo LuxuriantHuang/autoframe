@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+log/
+llm_log/
+benchmarks/*/out/
+benchmarks/*/out_*/
+benchmarks/*/llm_tmp/
+benchmarks/*/mut_tmp/
+benchmarks/*/sym_tmp/
+*.log

@@ -1,0 +1,10 @@
+docker==7.1.0
+httpx==0.28.1
+openai==2.7.1
+python-dotenv==1.2.1
+PyYAML==6.0.2
+tree-sitter==0.20.4
+tree-sitter-c==0.24.1
+tree-sitter-languages==1.10.2
+tqdm==4.67.1
+ujson==5.10.0
