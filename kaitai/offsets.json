@@ -1,0 +1,513 @@
+{
+  "file_format": ".png",
+  "file_size": 1260,
+  "fields": [
+    {
+      "name": "magic",
+      "offset": 0,
+      "size": 8,
+      "tag_id": 1
+    },
+    {
+      "name": "ihdr_len",
+      "offset": 8,
+      "size": 4,
+      "tag_id": 2
+    },
+    {
+      "name": "ihdr_type",
+      "offset": 12,
+      "size": 4,
+      "tag_id": 3
+    },
+    {
+      "name": "ihdr",
+      "offset": 16,
+      "size": 13,
+      "tag_id": 4
+    },
+    {
+      "name": "ihdr.width",
+      "offset": 16,
+      "size": 4,
+      "tag_id": 5
+    },
+    {
+      "name": "ihdr.height",
+      "offset": 20,
+      "size": 4,
+      "tag_id": 6
+    },
+    {
+      "name": "ihdr.bit_depth",
+      "offset": 24,
+      "size": 1,
+      "tag_id": 7
+    },
+    {
+      "name": "ihdr.color_type",
+      "offset": 25,
+      "size": 1,
+      "tag_id": 8
+    },
+    {
+      "name": "ihdr.compression_method",
+      "offset": 26,
+      "size": 1,
+      "tag_id": 9
+    },
+    {
+      "name": "ihdr.filter_method",
+      "offset": 27,
+      "size": 1,
+      "tag_id": 10
+    },
+    {
+      "name": "ihdr.interlace_method",
+      "offset": 28,
+      "size": 1,
+      "tag_id": 11
+    },
+    {
+      "name": "ihdr_crc",
+      "offset": 29,
+      "size": 4,
+      "tag_id": 12
+    },
+    {
+      "name": "chunks",
+      "offset": 33,
+      "size": 1227,
+      "tag_id": 13
+    },
+    {
+      "name": "chunks[0].len",
+      "offset": 33,
+      "size": 4,
+      "tag_id": 14
+    },
+    {
+      "name": "chunks[0].type",
+      "offset": 37,
+      "size": 4,
+      "tag_id": 15
+    },
+    {
+      "name": "chunks[0].body",
+      "offset": 41,
+      "size": 4,
+      "tag_id": 16
+    },
+    {
+      "name": "chunks[0].body.gamma_int",
+      "offset": 41,
+      "size": 4,
+      "tag_id": 17
+    },
+    {
+      "name": "chunks[0].crc",
+      "offset": 45,
+      "size": 4,
+      "tag_id": 18
+    },
+    {
+      "name": "chunks[1].len",
+      "offset": 49,
+      "size": 4,
+      "tag_id": 19
+    },
+    {
+      "name": "chunks[1].type",
+      "offset": 53,
+      "size": 4,
+      "tag_id": 20
+    },
+    {
+      "name": "chunks[1].body",
+      "offset": 57,
+      "size": 1,
+      "tag_id": 21
+    },
+    {
+      "name": "chunks[1].body.render_intent",
+      "offset": 57,
+      "size": 1,
+      "tag_id": 22
+    },
+    {
+      "name": "chunks[1].crc",
+      "offset": 58,
+      "size": 4,
+      "tag_id": 23
+    },
+    {
+      "name": "chunks[2].len",
+      "offset": 62,
+      "size": 4,
+      "tag_id": 24
+    },
+    {
+      "name": "chunks[2].type",
+      "offset": 66,
+      "size": 4,
+      "tag_id": 25
+    },
+    {
+      "name": "chunks[2].body",
+      "offset": 70,
+      "size": 32,
+      "tag_id": 26
+    },
+    {
+      "name": "chunks[2].body.white_point",
+      "offset": 70,
+      "size": 8,
+      "tag_id": 27
+    },
+    {
+      "name": "chunks[2].body.white_point.x_int",
+      "offset": 70,
+      "size": 4,
+      "tag_id": 28
+    },
+    {
+      "name": "chunks[2].body.white_point.y_int",
+      "offset": 74,
+      "size": 4,
+      "tag_id": 29
+    },
+    {
+      "name": "chunks[2].body.red",
+      "offset": 78,
+      "size": 8,
+      "tag_id": 30
+    },
+    {
+      "name": "chunks[2].body.red.x_int",
+      "offset": 78,
+      "size": 4,
+      "tag_id": 31
+    },
+    {
+      "name": "chunks[2].body.red.y_int",
+      "offset": 82,
+      "size": 4,
+      "tag_id": 32
+    },
+    {
+      "name": "chunks[2].body.green",
+      "offset": 86,
+      "size": 8,
+      "tag_id": 33
+    },
+    {
+      "name": "chunks[2].body.green.x_int",
+      "offset": 86,
+      "size": 4,
+      "tag_id": 34
+    },
+    {
+      "name": "chunks[2].body.green.y_int",
+      "offset": 90,
+      "size": 4,
+      "tag_id": 35
+    },
+    {
+      "name": "chunks[2].body.blue",
+      "offset": 94,
+      "size": 8,
+      "tag_id": 36
+    },
+    {
+      "name": "chunks[2].body.blue.x_int",
+      "offset": 94,
+      "size": 4,
+      "tag_id": 37
+    },
+    {
+      "name": "chunks[2].body.blue.y_int",
+      "offset": 98,
+      "size": 4,
+      "tag_id": 38
+    },
+    {
+      "name": "chunks[2].crc",
+      "offset": 102,
+      "size": 4,
+      "tag_id": 39
+    },
+    {
+      "name": "chunks[3].len",
+      "offset": 106,
+      "size": 4,
+      "tag_id": 40
+    },
+    {
+      "name": "chunks[3].type",
+      "offset": 110,
+      "size": 4,
+      "tag_id": 41
+    },
+    {
+      "name": "chunks[3].body",
+      "offset": 114,
+      "size": 2,
+      "tag_id": 42
+    },
+    {
+      "name": "chunks[3].body.bkgd",
+      "offset": 114,
+      "size": 2,
+      "tag_id": 43
+    },
+    {
+      "name": "chunks[3].body.bkgd.value",
+      "offset": 114,
+      "size": 2,
+      "tag_id": 44
+    },
+    {
+      "name": "chunks[3].crc",
+      "offset": 116,
+      "size": 4,
+      "tag_id": 45
+    },
+    {
+      "name": "chunks[4].len",
+      "offset": 120,
+      "size": 4,
+      "tag_id": 46
+    },
+    {
+      "name": "chunks[4].type",
+      "offset": 124,
+      "size": 4,
+      "tag_id": 47
+    },
+    {
+      "name": "chunks[4].body",
+      "offset": 128,
+      "size": 9,
+      "tag_id": 48
+    },
+    {
+      "name": "chunks[4].body.pixels_per_unit_x",
+      "offset": 128,
+      "size": 4,
+      "tag_id": 49
+    },
+    {
+      "name": "chunks[4].body.pixels_per_unit_y",
+      "offset": 132,
+      "size": 4,
+      "tag_id": 50
+    },
+    {
+      "name": "chunks[4].body.unit",
+      "offset": 136,
+      "size": 1,
+      "tag_id": 51
+    },
+    {
+      "name": "chunks[4].crc",
+      "offset": 137,
+      "size": 4,
+      "tag_id": 52
+    },
+    {
+      "name": "chunks[5].len",
+      "offset": 141,
+      "size": 4,
+      "tag_id": 53
+    },
+    {
+      "name": "chunks[5].type",
+      "offset": 145,
+      "size": 4,
+      "tag_id": 54
+    },
+    {
+      "name": "chunks[5].body",
+      "offset": 149,
+      "size": 947,
+      "tag_id": 55
+    },
+    {
+      "name": "chunks[5].crc",
+      "offset": 1096,
+      "size": 4,
+      "tag_id": 56
+    },
+    {
+      "name": "chunks[6].len",
+      "offset": 1100,
+      "size": 4,
+      "tag_id": 57
+    },
+    {
+      "name": "chunks[6].type",
+      "offset": 1104,
+      "size": 4,
+      "tag_id": 58
+    },
+    {
+      "name": "chunks[6].body",
+      "offset": 1108,
+      "size": 37,
+      "tag_id": 59
+    },
+    {
+      "name": "chunks[6].body.keyword",
+      "offset": 1108,
+      "size": 12,
+      "tag_id": 60
+    },
+    {
+      "name": "chunks[6].body.text",
+      "offset": 1120,
+      "size": 25,
+      "tag_id": 61
+    },
+    {
+      "name": "chunks[6].crc",
+      "offset": 1145,
+      "size": 4,
+      "tag_id": 62
+    },
+    {
+      "name": "chunks[7].len",
+      "offset": 1149,
+      "size": 4,
+      "tag_id": 63
+    },
+    {
+      "name": "chunks[7].type",
+      "offset": 1153,
+      "size": 4,
+      "tag_id": 64
+    },
+    {
+      "name": "chunks[7].body",
+      "offset": 1157,
+      "size": 37,
+      "tag_id": 65
+    },
+    {
+      "name": "chunks[7].body.keyword",
+      "offset": 1157,
+      "size": 12,
+      "tag_id": 66
+    },
+    {
+      "name": "chunks[7].body.text",
+      "offset": 1169,
+      "size": 25,
+      "tag_id": 67
+    },
+    {
+      "name": "chunks[7].crc",
+      "offset": 1194,
+      "size": 4,
+      "tag_id": 68
+    },
+    {
+      "name": "chunks[8].len",
+      "offset": 1198,
+      "size": 4,
+      "tag_id": 69
+    },
+    {
+      "name": "chunks[8].type",
+      "offset": 1202,
+      "size": 4,
+      "tag_id": 70
+    },
+    {
+      "name": "chunks[8].body",
+      "offset": 1206,
+      "size": 7,
+      "tag_id": 71
+    },
+    {
+      "name": "chunks[8].body.keyword",
+      "offset": 1206,
+      "size": 6,
+      "tag_id": 72
+    },
+    {
+      "name": "chunks[8].body.text",
+      "offset": 1212,
+      "size": 1,
+      "tag_id": 73
+    },
+    {
+      "name": "chunks[8].crc",
+      "offset": 1213,
+      "size": 4,
+      "tag_id": 74
+    },
+    {
+      "name": "chunks[9].len",
+      "offset": 1217,
+      "size": 4,
+      "tag_id": 75
+    },
+    {
+      "name": "chunks[9].type",
+      "offset": 1221,
+      "size": 4,
+      "tag_id": 76
+    },
+    {
+      "name": "chunks[9].body",
+      "offset": 1225,
+      "size": 19,
+      "tag_id": 77
+    },
+    {
+      "name": "chunks[9].body.keyword",
+      "offset": 1225,
+      "size": 16,
+      "tag_id": 78
+    },
+    {
+      "name": "chunks[9].body.text",
+      "offset": 1241,
+      "size": 3,
+      "tag_id": 79
+    },
+    {
+      "name": "chunks[9].crc",
+      "offset": 1244,
+      "size": 4,
+      "tag_id": 80
+    },
+    {
+      "name": "chunks[10].len",
+      "offset": 1248,
+      "size": 4,
+      "tag_id": 81
+    },
+    {
+      "name": "chunks[10].type",
+      "offset": 1252,
+      "size": 4,
+      "tag_id": 82
+    },
+    {
+      "name": "chunks[10].body",
+      "offset": 1256,
+      "size": 0,
+      "tag_id": 83
+    },
+    {
+      "name": "chunks[10].crc",
+      "offset": 1256,
+      "size": 4,
+      "tag_id": 84
+    }
+  ],
+  "field_tag_base": 1,
+  "byte_tag_base": 10000,
+  "total_fields": 84
+}

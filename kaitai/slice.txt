@@ -1,0 +1,19 @@
+=== Source Slice ===
+
+-- /home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c --
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:320: void PNGAPI
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:321: png_info_init_3(png_infopp ptr_ptr, png_size_t png_info_struct_size)
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:322: {
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:323 [func=png_info_init_3]:    png_infop info_ptr = *ptr_ptr;
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:324: 
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:325:    png_debug(1, "in png_info_init_3");
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:326: 
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:327 [func=png_info_init_3]:    if (info_ptr == NULL)
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:328:       return;
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:329: 
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:330 [func=<target>,png_info_init_3]:    if (png_sizeof(png_info) > png_info_struct_size)
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:331:    {
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:332:       png_destroy_struct(info_ptr);
+/home/lab420/Desktop/autoframe/benchmarks/libpng/build/trace/png.c:333:       info_ptr = (png_infop)png_create_struct(PNG_STRUCT_INFO);
+
+=== End Source Slice ===

@@ -1,0 +1,8 @@
+{
+  "file_path": "test.isi",
+  "fields": [],
+  "error": {
+    "type": "EndOfStreamError",
+    "message": "requested 4 bytes, but only 3 bytes available"
+  }
+}

@@ -102,6 +102,17 @@ class SeedEvalResult:
     rejection_reason: Optional[str] = None
 
 
+@dataclass
+class DirectTextSeedResult:
+    success: bool
+    attempt_made: bool
+    candidate_path: Optional[str] = None
+    gate_result: Optional[SeedGateResult] = None
+    eval_result: Optional[SeedEvalResult] = None
+    response_text: Optional[str] = None
+    failure_reason: Optional[str] = None
+
+
 def setup_logger():
     global _logger_initialized
     # Skip if already initialized to prevent creating multiple log files
@@ -2694,44 +2705,31 @@ def handle_subspace_bootstrap(target, tracer: CoverageTracer, llm_util: LLMUtil)
     llm_queue_path = Path(output_dir) / "LLM" / "queue"
     os.makedirs(llm_queue_path, exist_ok=True)
     seed_id = len(os.listdir(llm_queue_path))
-    times = 0
-    while times < MAX_TIME:
-        resp = llm_util.get_response(generation_messages)
-        generated_text = extract_direct_text_payload(resp)
-        if not generated_text:
-            append_llm_retry_feedback(
-                generation_messages,
-                resp,
-                "未提取到可写入 seed 文件的文本内容。请只返回 <generated_input>...</generated_input> 包裹的最小 seed 文本。"
-            )
-            times += 1
-            continue
-
-        seed_path = os.path.join(llm_queue_path, f"id:{int(seed_id):06},bid:{int(roadblock_id or 999999):06}")
-        with open(seed_path, 'w', encoding='utf-8') as f:
-            f.write(generated_text)
-        logger.info(f"[{LogOp.ROADBLOCK}] Bootstrap seed written to {seed_path}")
-
-        gate_result, eval_result = gate_seed(seed_path, roadblock=target)
-        logger.info(
-            f"[SEED_GATE] decision={gate_result.decision} accepted={gate_result.accepted} "
-            f"reason={gate_result.reason}"
-        )
-        local_progress = gate_result.accepted and _seed_eval_indicates_local_progress(eval_result)
-        if local_progress:
+    seed_path = os.path.join(llm_queue_path, f"id:{int(seed_id):06},bid:{int(roadblock_id or 999999):06}")
+    text_result = write_direct_text_seed_and_test(
+        llm_util,
+        generation_messages,
+        seed_path,
+        roadblock=target,
+        max_attempts=MAX_TIME,
+        missing_payload_feedback="未提取到可写入 seed 文件的文本内容。请只返回 <generated_input>...</generated_input> 包裹的最小 seed 文本。",
+        no_progress_feedback="该输入没有带来新的覆盖。请继续生成更小、更直接、更能进入目标 parser family 的输入。",
+        require_local_progress=True,
+    )
+    if text_result.attempt_made:
+        logger.info(f"[{LogOp.ROADBLOCK}] Bootstrap seed written to {text_result.candidate_path}")
+        if text_result.gate_result:
             logger.info(
-                f"[{LogOp.ROADBLOCK}] Subspace bootstrap produced local hit evidence for {roadblock_key} "
-                f"(family={family})"
+                f"[SEED_GATE] decision={text_result.gate_result.decision} "
+                f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
             )
-            mark_roadblock_resolved(roadblock_key, "SUBSPACE_BOOTSTRAP")
-            return True, "SUBSPACE_BOOTSTRAP", seed_id, roadblock_id
-
-        append_llm_retry_feedback(
-            generation_messages,
-            resp,
-            "该输入没有带来新的覆盖。请继续生成更小、更直接、更能进入目标 parser family 的输入。"
+    if text_result.success:
+        logger.info(
+            f"[{LogOp.ROADBLOCK}] Subspace bootstrap produced local hit evidence for {roadblock_key} "
+            f"(family={family})"
         )
-        times += 1
+        mark_roadblock_resolved(roadblock_key, "SUBSPACE_BOOTSTRAP")
+        return True, "SUBSPACE_BOOTSTRAP", seed_id, roadblock_id
 
     mark_roadblock_failed(roadblock_key, "BOOTSTRAP_FAILED", target)
     logger.info(f"[{LogOp.ROADBLOCK}] Subspace bootstrap failed for {roadblock_key}")
@@ -3478,42 +3476,30 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
             )
             _log_full_prompt_messages("Path T0 text_direct prompt", generation_messages)
 
-            attempt = 0
-            while attempt < MAX_TIME:
-                resp = llm_util.get_response(generation_messages)
-                generated_text = extract_direct_text_payload(resp)
-                if not generated_text:
-                    append_llm_retry_feedback(
-                        generation_messages,
-                        resp,
-                        "未提取到可写入 seed 文件的文本内容。请只返回 <generated_input>...</generated_input> 包裹的 seed 文本。"
-                    )
-                    attempt += 1
-                    continue
-
-                seed_path = os.path.join(llm_target_path, f"id:{int(local_seed_id):06},bid:{int(roadblock_id):06}")
-                with open(seed_path, 'w', encoding='utf-8') as f:
-                    f.write(generated_text)
-                logger.info(f"[{LogOp.ROADBLOCK}] Path T0: Text seed written to {seed_path}")
-                gate_result, eval_result = gate_seed(seed_path, roadblock=roadblock, call_chain=call_chain)
-                logger.info(
-                    f"[SEED_GATE] Path T0 text decision={gate_result.decision} accepted={gate_result.accepted} "
-                    f"reason={gate_result.reason}"
-                )
-                local_progress = gate_result.accepted and _seed_eval_indicates_local_progress(eval_result)
-                if local_progress:
+            seed_path = os.path.join(llm_target_path, f"id:{int(local_seed_id):06},bid:{int(roadblock_id):06}")
+            text_result = write_direct_text_seed_and_test(
+                llm_util,
+                generation_messages,
+                seed_path,
+                roadblock=roadblock,
+                call_chain=call_chain,
+                max_attempts=MAX_TIME,
+                no_progress_feedback="该文本输入没有带来新的覆盖。请继续生成更短、更直接、更贴近目标分支状态的文本输入。",
+                require_local_progress=True,
+            )
+            if text_result.attempt_made:
+                logger.info(f"[{LogOp.ROADBLOCK}] Path T0: Text seed written to {text_result.candidate_path}")
+                if text_result.gate_result:
                     logger.info(
-                        f"[{LogOp.ROADBLOCK}] Path T0 produced a locally validated seed via direct text generation"
+                        f"[SEED_GATE] Path T0 text decision={text_result.gate_result.decision} "
+                        f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
                     )
-                    mark_roadblock_resolved(roadblock_key, "LLM_TEXT")
-                    return True, "LLM_TEXT", local_seed_id, roadblock_id
-
-                append_llm_retry_feedback(
-                    generation_messages,
-                    resp,
-                    "该文本输入没有带来新的覆盖。请继续生成更短、更直接、更贴近目标分支状态的文本输入。"
+            if text_result.success:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Path T0 produced a locally validated seed via direct text generation"
                 )
-                attempt += 1
+                mark_roadblock_resolved(roadblock_key, "LLM_TEXT")
+                return True, "LLM_TEXT", local_seed_id, roadblock_id
 
             if terminal_on_failure:
                 mark_roadblock_failed(roadblock_key, "NO_LOCAL_TARGET_HIT", roadblock)
@@ -4043,39 +4029,41 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                     f"[{LogOp.ROADBLOCK}] Path C: "
                     f"{'Text' if generation_mode == 'text_direct' else 'Script'} generation attempt "
                     f"{times + 1}/{MAX_TIME}")
-                resp = llm_util.get_response(generation_messages)
                 if generation_mode == "text_direct":
-                    generated_text = extract_direct_text_payload(resp)
-                    if not generated_text:
-                        append_llm_retry_feedback(
-                            generation_messages,
-                            resp,
-                            "未提取到可写入 seed 文件的文本内容。请只返回 <generated_input>...</generated_input> 包裹的 seed 文本。"
-                        )
-                        times += 1
-                        continue
-
                     seed_path = os.path.join(LLM_TARGET_PATH, f"id:{int(seed_id):06},bid:{int(roadblock_id):06}")
-                    with open(seed_path, 'w', encoding='utf-8') as f:
-                        f.write(generated_text)
-                    logger.info(f"[{LogOp.ROADBLOCK}] Path C: Text seed written to {seed_path}")
-                    gate_result, eval_result = gate_seed(seed_path, roadblock=roadblock, call_chain=call_chain)
-                    logger.info(
-                        f"[SEED_GATE] Path C text decision={gate_result.decision} accepted={gate_result.accepted} "
-                        f"reason={gate_result.reason}"
+                    text_result = write_direct_text_seed_and_test(
+                        llm_util,
+                        generation_messages,
+                        seed_path,
+                        roadblock=roadblock,
+                        call_chain=call_chain,
+                        max_attempts=MAX_TIME,
+                        no_progress_feedback="该文本输入没有带来新的覆盖。请继续生成更短、更直接、更贴近目标分支状态的文本输入。",
+                        require_local_progress=True,
                     )
-                    local_progress = gate_result.accepted and _seed_eval_indicates_local_progress(eval_result)
-                    if local_progress:
+                    if text_result.attempt_made:
+                        logger.info(f"[{LogOp.ROADBLOCK}] Path C: Text seed written to {text_result.candidate_path}")
+                        if text_result.gate_result:
+                            logger.info(
+                                f"[SEED_GATE] Path C text decision={text_result.gate_result.decision} "
+                                f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
+                            )
+                    if text_result.success:
                         logger.info(
                             f"[{LogOp.ROADBLOCK}] Path C produced a locally validated seed via direct text generation")
                         mark_roadblock_resolved(roadblock_key, "LLM_TEXT")
                         return True, "LLM_TEXT", seed_id, roadblock_id
 
-                    fail_mode = eval_result.rejection_reason or "NO_NEW_EDGES"
+                    fail_mode = (
+                        text_result.eval_result.rejection_reason
+                        if text_result.eval_result is not None
+                        else "NO_NEW_EDGES"
+                    ) or "NO_NEW_EDGES"
                     mark_roadblock_failed(roadblock_key, fail_mode, roadblock)
                     logger.debug(f"[{LogOp.ROADBLOCK}] Path C: Generated text but local validation did not accept it")
                     return False, "LLM text generated but local validation failed", seed_id, roadblock_id
 
+                resp = llm_util.get_response(generation_messages)
                 match = extract_json_with_fallback(resp, pattern_json)
                 if not match:
                     logger.debug(f"[{LogOp.LLM}] Path C: JSON pattern not found, requesting regeneration")
@@ -4270,6 +4258,104 @@ def extract_direct_text_payload(response_text: str) -> str | None:
             pass
 
     return raw
+
+
+def write_direct_text_seed_and_test(
+    llm_util: LLMUtil,
+    generation_messages: list[dict[str, str]],
+    seed_path: str,
+    *,
+    roadblock: Optional[dict[str, Any]] = None,
+    call_chain=None,
+    max_attempts: int = 3,
+    missing_payload_feedback: str | None = None,
+    empty_payload_feedback: str | None = None,
+    no_progress_feedback: str | None = None,
+    require_local_progress: bool = False,
+) -> DirectTextSeedResult:
+    try:
+        check_fuzzer_alive()
+    except FuzzerProcessDiedError as e:
+        logger.critical(f"[{LogOp.FUZZER}] {e}")
+        logger.critical("[{LogOp.FUZZER}] Fuzzer died before direct-text seed generation, aborting...")
+        raise
+
+    missing_payload_feedback = (
+        missing_payload_feedback
+        or "未提取到可写入 seed 文件的文本内容。请只返回 <generated_input>...</generated_input> 包裹的 seed 文本。"
+    )
+    empty_payload_feedback = (
+        empty_payload_feedback
+        or "生成的 seed 为空文件。请直接返回非空的 <generated_input>...</generated_input> 文本内容。"
+    )
+
+    for attempt in range(max_attempts):
+        resp = llm_util.get_response(generation_messages)
+        generated_text = extract_direct_text_payload(resp)
+        if not generated_text:
+            if attempt < max_attempts - 1:
+                append_llm_retry_feedback(generation_messages, resp, missing_payload_feedback)
+            continue
+
+        Path(seed_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(seed_path, 'w', encoding='utf-8') as f:
+            f.write(generated_text)
+
+        try:
+            file_size = os.path.getsize(seed_path)
+        except OSError:
+            file_size = 0
+        if file_size <= 0:
+            if attempt < max_attempts - 1:
+                append_llm_retry_feedback(generation_messages, resp, empty_payload_feedback)
+            continue
+
+        gate_result, eval_result = gate_seed(seed_path, roadblock=roadblock, call_chain=call_chain)
+        candidate_path = gate_result.audit_path or seed_path
+        if not require_local_progress:
+            return DirectTextSeedResult(
+                success=True,
+                attempt_made=True,
+                candidate_path=candidate_path,
+                gate_result=gate_result,
+                eval_result=eval_result,
+                response_text=resp,
+            )
+
+        local_progress = gate_result.accepted and _seed_eval_indicates_local_progress(eval_result)
+        if local_progress:
+            return DirectTextSeedResult(
+                success=True,
+                attempt_made=True,
+                candidate_path=candidate_path,
+                gate_result=gate_result,
+                eval_result=eval_result,
+                response_text=resp,
+            )
+
+        if attempt < max_attempts - 1 and no_progress_feedback:
+            append_llm_retry_feedback(generation_messages, resp, no_progress_feedback)
+            continue
+
+        return DirectTextSeedResult(
+            success=False,
+            attempt_made=True,
+            candidate_path=candidate_path,
+            gate_result=gate_result,
+            eval_result=eval_result,
+            response_text=resp,
+            failure_reason="NO_LOCAL_PROGRESS",
+        )
+
+    return DirectTextSeedResult(
+        success=False,
+        attempt_made=False,
+        candidate_path=None,
+        gate_result=None,
+        eval_result=None,
+        response_text=None,
+        failure_reason="TEXT_GENERATION_FAILED",
+    )
 
 
 def _looks_textual_semantic_input(fields=None, harness_code: str | None = None) -> bool:
@@ -7197,16 +7283,25 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
                     harness_code=harness_for_mode,
                     preferred_seed=seed,
                 )
-                resp = llm_util.get_response(generation_messages)
-                generated_text = extract_direct_text_payload(resp)
-                if generated_text:
-                    seed_path = os.path.join(llm_target_path, f"id:{int(seed_id):06},bid:{int(roadblock_id):06}")
-                    with open(seed_path, 'w', encoding='utf-8') as f:
-                        f.write(generated_text)
+                seed_path = os.path.join(llm_target_path, f"id:{int(seed_id):06},bid:{int(roadblock_id):06}")
+                text_result = write_direct_text_seed_and_test(
+                    llm_util,
+                    generation_messages,
+                    seed_path,
+                    roadblock=roadblock,
+                    call_chain=call_chain,
+                    max_attempts=MAX_TIME,
+                )
+                if text_result.attempt_made:
                     logger.info(
                         f"[{LogOp.ROADBLOCK}] Simplified Path C wrote a direct-text candidate; "
                         f"deferring effectiveness judgment to the outer coverage check"
                     )
+                    if text_result.gate_result:
+                        logger.info(
+                            f"[SEED_GATE] Simplified Path C text decision={text_result.gate_result.decision} "
+                            f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
+                        )
                     attempt_made = True
             else:
                 generation_messages = build_generate_script_messages(
