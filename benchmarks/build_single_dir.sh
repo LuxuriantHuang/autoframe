@@ -90,7 +90,7 @@ build_cjson_variant() {
   rm -rf "${build_dir}"
   mkdir -p "${build_dir}"
   pushd "${HOME_DIR}" >/dev/null
-  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-14 AFL_CXX=clang++-14 LLVM_COMPILER=clang
+  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18 LLVM_COMPILER=clang
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   cmake -S "${SRC_DIR}" -B "${build_dir}" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -132,7 +132,7 @@ build_cflow_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" configure_opts="${7:-}" afl_cmplog="${8:-}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-14 AFL_CXX=clang++-14
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   autoreconf -fi
   ./configure --enable-debug ${configure_opts}
@@ -158,7 +158,7 @@ build_cxxfilt_variant() {
   local support_src="${HOME_DIR}/cxxfilt_support.c"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-14 AFL_CXX=clang++-14
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   LDFLAGS="-no-pie" ./configure --disable-shared --disable-gdb
   make configure-bfd
@@ -190,7 +190,7 @@ build_jhead_variant() {
   local cc="$1" cflags="$2" outbin="$3" target_dir="$4" afl_cmplog="${5:-0}"
   clean_make_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-14 AFL_CXX=clang++-14
+  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   make -j"${JOBS}"
   install_binary "${SRC_DIR}/jhead" "${target_dir}" "${outbin}"
@@ -211,7 +211,7 @@ build_lcms_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" extra_link_flags="${7:-}" afl_cmplog="${8:-}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-14 AFL_CXX=clang++-14
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   ./autogen.sh
   ./configure --disable-shared
@@ -239,7 +239,7 @@ build_libpng_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" extra_link_flags="${7:-}" afl_cmplog="${8:-}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-14 AFL_CXX=clang++-14
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   ./configure --disable-shared
   make -j"${JOBS}"
@@ -265,7 +265,7 @@ build_xmllint_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" _extra_link_flags="${7:-}" afl_cmplog="${8:-0}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-14 AFL_CXX=clang++-14
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   sh ./autogen.sh
   CCLD="${CXX} ${CXXFLAGS}" CC="${CC}" CFLAGS="${CFLAGS}" ./configure --disable-shared
@@ -290,7 +290,7 @@ build_mujs_variant() {
   local cc="$1" _cxx="$2" cflags="$3" _cxxflags="$4" outbin="$5" target_dir="$6" _extra="${7:-}" afl_cmplog="${8:-}"
   clean_make_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-14 AFL_CXX=clang++-14
+  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   "${CC}" ${CFLAGS} -o "${outbin}" one.c main.c -lm
   install_binary "${SRC_DIR}/${outbin}" "${target_dir}" "${outbin}"

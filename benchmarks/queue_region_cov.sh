@@ -5,11 +5,12 @@ set -euo pipefail
 usage() {
   cat <<'EOT'
 用法:
-  ./benchmarks/queue_region_cov.sh <库目录> <输出目录>
+  ./benchmarks/queue_region_cov.sh [--all-fuzzers] <库目录> <输出目录>
 
 示例:
   ./benchmarks/queue_region_cov.sh benchmarks/pdf2text out
   ./benchmarks/queue_region_cov.sh benchmarks/jhead 6h
+  ./benchmarks/queue_region_cov.sh --all-fuzzers benchmarks/pdf2text out
 
 可选环境变量:
   TARGET_BIN        显式指定待分析二进制路径
@@ -21,6 +22,53 @@ usage() {
   KEEP_PROFILES=1   保留 /tmp 下的临时 profraw/profdata 文件，便于排查
   SHOW_REPORT=1     额外打印完整 llvm-cov report
 EOT
+}
+
+collect_queue_dirs() {
+  local lib_dir="$1"
+  local out_dir="$2"
+  local include_all="$3"
+
+  if [[ "${include_all}" == "1" ]]; then
+    find "${lib_dir}/${out_dir}" -mindepth 2 -maxdepth 2 -type d -name queue | sort
+  else
+    printf '%s\n' "${lib_dir}/${out_dir}/default/queue"
+  fi
+}
+
+detect_target_timeout_from_stats() {
+  local multiplier="${TIMEOUT_MULTIPLIER:-10}"
+  shift
+  local stats_path
+  local exec_timeout_ms
+  local max_exec_timeout_ms=0
+
+  if [[ -n "${TARGET_TIMEOUT:-}" ]]; then
+    printf '%s\n' "${TARGET_TIMEOUT}"
+    return 0
+  fi
+
+  for stats_path in "$@"; do
+    if [[ -f "${stats_path}" ]]; then
+      exec_timeout_ms="$(awk -F: '/^exec_timeout/ {gsub(/ /, "", $2); print $2; exit}' "${stats_path}")"
+      if [[ "${exec_timeout_ms}" =~ ^[0-9]+$ ]] && (( exec_timeout_ms > max_exec_timeout_ms )); then
+        max_exec_timeout_ms="${exec_timeout_ms}"
+      fi
+    fi
+  done
+
+  if (( max_exec_timeout_ms > 0 )); then
+    awk -v ms="${max_exec_timeout_ms}" -v mul="${multiplier}" '
+      BEGIN {
+        secs = (ms * mul) / 1000;
+        if (secs < 1) secs = 1;
+        printf "%.3fs\n", secs;
+      }
+    '
+    return 0
+  fi
+
+  printf '1s\n'
 }
 
 find_llvm_tool() {
@@ -79,36 +127,15 @@ resolve_lib_dir() {
   return 1
 }
 
-detect_target_timeout() {
-  local stats_path="$1"
-  local multiplier="${TIMEOUT_MULTIPLIER:-10}"
-  local exec_timeout_ms
-
-  if [[ -n "${TARGET_TIMEOUT:-}" ]]; then
-    printf '%s\n' "${TARGET_TIMEOUT}"
-    return 0
-  fi
-
-  if [[ -f "${stats_path}" ]]; then
-    exec_timeout_ms="$(awk -F: '/^exec_timeout/ {gsub(/ /, "", $2); print $2; exit}' "${stats_path}")"
-    if [[ "${exec_timeout_ms}" =~ ^[0-9]+$ ]]; then
-      awk -v ms="${exec_timeout_ms}" -v mul="${multiplier}" '
-        BEGIN {
-          secs = (ms * mul) / 1000;
-          if (secs < 1) secs = 1;
-          printf "%.3fs\n", secs;
-        }
-      '
-      return 0
-    fi
-  fi
-
-  printf '1s\n'
-}
-
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
+fi
+
+all_fuzzers=0
+if [[ "${1:-}" == "--all-fuzzers" ]]; then
+  all_fuzzers=1
+  shift
 fi
 
 if [[ $# -ne 2 ]]; then
@@ -122,9 +149,26 @@ lib_dir="$(resolve_lib_dir "$1")" || {
 }
 out_dir="${2%/}"
 lib_name="$(basename "${lib_dir}")"
-queue_dir="${lib_dir}/${out_dir}/default/queue"
-# queue_dir="${lib_dir}/${out_dir}/master/queue"
-fuzzer_stats_path="${lib_dir}/${out_dir}/default/fuzzer_stats"
+
+mapfile -t queue_dirs < <(collect_queue_dirs "${lib_dir}" "${out_dir}" "${all_fuzzers}")
+if [[ "${#queue_dirs[@]}" -eq 0 ]]; then
+  echo "错误: 未找到任何 queue 目录: ${lib_dir}/${out_dir}" >&2
+  exit 1
+fi
+
+existing_queue_dirs=()
+stats_paths=()
+for queue_dir in "${queue_dirs[@]}"; do
+  if [[ -d "${queue_dir}" ]]; then
+    existing_queue_dirs+=("${queue_dir}")
+    stats_paths+=("${queue_dir%/queue}/fuzzer_stats")
+  fi
+done
+
+if [[ "${#existing_queue_dirs[@]}" -eq 0 ]]; then
+  echo "错误: 没有可用的 queue 目录: ${lib_dir}/${out_dir}" >&2
+  exit 1
+fi
 
 target_bin="${TARGET_BIN:-}"
 if [[ -z "${target_bin}" ]]; then
@@ -137,11 +181,6 @@ fi
 
 if [[ ! -x "${target_bin}" ]]; then
   echo "错误: 找不到可执行目标文件: ${target_bin}" >&2
-  exit 1
-fi
-
-if [[ ! -d "${queue_dir}" ]]; then
-  echo "错误: queue 目录不存在: ${queue_dir}" >&2
   exit 1
 fi
 
@@ -160,7 +199,7 @@ timeout_bin="$(find_llvm_tool "${TIMEOUT_BIN:-}" timeout gtimeout)" || {
   exit 1
 }
 
-target_timeout="$(detect_target_timeout "${fuzzer_stats_path}")"
+target_timeout="$(detect_target_timeout_from_stats "${stats_paths[@]}")"
 
 echo "使用 llvm-cov: ${llvm_cov_bin}"
 echo "使用 llvm-profdata: ${llvm_profdata_bin}"
@@ -176,13 +215,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mapfile -t queue_files < <(find "${queue_dir}" -maxdepth 1 -type f ! -name '.*' | sort)
+queue_files=()
+for queue_dir in "${existing_queue_dirs[@]}"; do
+  while IFS= read -r sample; do
+    queue_files+=("${sample}")
+  done < <(find "${queue_dir}" -maxdepth 1 -type f ! -name '.*' | sort)
+done
+
 if [[ "${#queue_files[@]}" -eq 0 ]]; then
-  echo "错误: ${queue_dir} 中没有可用样本。" >&2
+  echo "错误: 未找到可用样本。" >&2
   exit 1
 fi
 
 echo "样本数量: ${#queue_files[@]}"
+echo "Queue 目录数: ${#existing_queue_dirs[@]}"
 echo "目标二进制: ${target_bin}"
 echo "单样本超时: ${target_timeout}"
 echo "临时目录: ${tmp_dir}"
@@ -273,7 +319,13 @@ echo
 echo "========== 覆盖率报告 =========="
 echo "库目录: ${lib_dir}"
 echo "输出目录: ${out_dir}"
-echo "Queue 目录: ${queue_dir}"
+if [[ "${all_fuzzers}" == "1" ]]; then
+  echo "Queue 模式: 合并所有 fuzzer queue"
+  echo "Queue 根目录: ${lib_dir}/${out_dir}"
+else
+  echo "Queue 模式: default queue"
+  echo "Queue 目录: ${existing_queue_dirs[0]}"
+fi
 echo "目标二进制: ${target_bin}"
 echo "profdata: ${profdata_path}"
 echo "样本数量: ${executed}"
