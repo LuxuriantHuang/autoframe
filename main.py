@@ -47,6 +47,14 @@ from input_adapter import (
 )
 from semantic_fields import build_semantic_fields, has_semantic_field_provider
 from state_driven_mapper import StateDrivenMapper
+from xml_grammar_mutator import (
+    apply_llm_mutation_spec,
+    build_candidates_from_component_scores,
+    build_libxml_grammar_candidates,
+    build_libxml_llm_component_scoring_messages,
+    build_libxml_llm_mutation_spec_messages,
+    is_libxml_project,
+)
 import config
 from config import *
 from find_seed_root import find_seed_root
@@ -7091,6 +7099,202 @@ def attempt_simplified_field_mutation_path(ctx: SimplifiedAttemptContext, patter
         return False
 
 
+def _next_seed_output_path(queue_dir: Path, *, roadblock_id: int | str) -> str:
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    next_id = len([p for p in queue_dir.iterdir() if p.is_file()])
+    while True:
+        candidate = queue_dir / f"id:{int(next_id):06},bid:{int(roadblock_id):06}"
+        if not candidate.exists():
+            return os.fspath(candidate)
+        next_id += 1
+
+
+def _load_text_seed_for_xml(seed_name: str | None) -> str | None:
+    if not seed_name:
+        return None
+    seed_path = config.find_seed_path(seed_name)
+    if seed_path is None or not seed_path.exists():
+        return None
+    try:
+        return seed_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _collect_libxml_donor_texts(preferred_seed: str | None, limit: int = 4) -> list[str]:
+    donors: list[str] = []
+    seen: set[str] = set()
+    for seed_name in [preferred_seed]:
+        text = _load_text_seed_for_xml(seed_name)
+        if text and text not in seen:
+            seen.add(text)
+            donors.append(text)
+
+    queue_dirs = [
+        Path(output_dir) / "default" / "queue",
+        Path(output_dir) / "LLM" / "queue",
+    ]
+    for queue_dir in queue_dirs:
+        if len(donors) >= limit:
+            break
+        if not queue_dir.exists():
+            continue
+        for seed_path in sorted(queue_dir.iterdir(), reverse=True):
+            if len(donors) >= limit:
+                break
+            if not seed_path.is_file():
+                continue
+            try:
+                text = seed_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            donors.append(text)
+    return donors
+
+
+def _call_llm_json_object(
+    llm_util: LLMUtil,
+    messages: list[dict[str, str]],
+    context: str,
+    max_retries: int = 3,
+) -> dict[str, Any] | None:
+    pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
+    resp = ""
+    for attempt in range(max_retries):
+        try:
+            resp = llm_util.get_response(messages)
+            match = extract_json_with_fallback(resp, pattern_json)
+            if not match:
+                logger.warning(f"[{LogOp.LLM}] {context}: JSON pattern not found (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    append_llm_retry_feedback(messages, resp, "请只返回一个 JSON object，不要输出额外解释。")
+                continue
+            result = json.loads(match.group(1).strip())
+            schema_error = validate_generic_object_result(result, context)
+            if schema_error:
+                logger.warning(
+                    f"[{LogOp.LLM}] {context}: invalid schema (attempt {attempt + 1}/{max_retries}): {schema_error}"
+                )
+                if attempt < max_retries - 1:
+                    append_llm_retry_feedback(
+                        messages,
+                        resp,
+                        f"返回结构不符合要求：{schema_error}。请只返回一个 JSON object。",
+                    )
+                continue
+            return result
+        except json.JSONDecodeError as exc:
+            logger.warning(f"[{LogOp.LLM}] {context}: JSON decode error (attempt {attempt + 1}/{max_retries}): {exc}")
+            if attempt < max_retries - 1:
+                append_llm_retry_feedback(messages, resp, f"JSON 解析失败：{exc}。请只返回一个 JSON object。")
+        except Exception as exc:
+            logger.error(f"[{LogOp.LLM}] {context}: unexpected error: {exc}", exc_info=True)
+            break
+    return None
+
+
+def attempt_simplified_xml_grammar_path(ctx: SimplifiedAttemptContext) -> bool:
+    global output_dir
+
+    if not ENABLE_SIMPLIFIED_XML_GRAMMAR_PATH:
+        return False
+    if not is_libxml_project(PROJECT):
+        return False
+    if ctx.generation_mode != "text_direct":
+        return False
+
+    try:
+        preferred_seed_text = _load_text_seed_for_xml(ctx.seed)
+        donor_seed_texts = _collect_libxml_donor_texts(ctx.seed)
+        candidates = build_libxml_grammar_candidates(
+            constraints=ctx.constraints,
+            summary=ctx.summary,
+            roadblock_code=ctx.bcode,
+            preferred_seed_text=preferred_seed_text,
+            donor_seed_texts=donor_seed_texts,
+            fields=ctx.fields,
+            max_candidates=6,
+        )
+        if ENABLE_SIMPLIFIED_XML_GRAMMAR_LLM_SPEC:
+            spec_messages = build_libxml_llm_mutation_spec_messages(
+                constraints=ctx.constraints,
+                summary=ctx.summary,
+                roadblock_code=ctx.bcode,
+                preferred_seed_text=preferred_seed_text,
+                donor_seed_texts=donor_seed_texts,
+                fields=ctx.fields,
+            )
+            spec_result = _call_llm_json_object(ctx.llm_util, spec_messages, "xml grammar llm spec")
+            if spec_result:
+                candidates.extend(
+                    apply_llm_mutation_spec(
+                        constraints=ctx.constraints,
+                        summary=ctx.summary,
+                        roadblock_code=ctx.bcode,
+                        spec=spec_result,
+                        preferred_seed_text=preferred_seed_text,
+                        donor_seed_texts=donor_seed_texts,
+                        fields=ctx.fields,
+                        max_candidates=4,
+                    )
+                )
+        if ENABLE_SIMPLIFIED_XML_GRAMMAR_LLM_SCORING:
+            scoring_messages = build_libxml_llm_component_scoring_messages(
+                constraints=ctx.constraints,
+                summary=ctx.summary,
+                roadblock_code=ctx.bcode,
+                preferred_seed_text=preferred_seed_text,
+                donor_seed_texts=donor_seed_texts,
+                fields=ctx.fields,
+            )
+            scoring_result = _call_llm_json_object(ctx.llm_util, scoring_messages, "xml grammar llm scoring")
+            if scoring_result:
+                candidates.extend(
+                    build_candidates_from_component_scores(
+                        constraints=ctx.constraints,
+                        summary=ctx.summary,
+                        roadblock_code=ctx.bcode,
+                        scoring_result=scoring_result,
+                        preferred_seed_text=preferred_seed_text,
+                        donor_seed_texts=donor_seed_texts,
+                        fields=ctx.fields,
+                        max_candidates=4,
+                    )
+                )
+        dedup_candidates = []
+        seen_texts: set[str] = set()
+        for candidate in candidates:
+            if not candidate.text or candidate.text in seen_texts:
+                continue
+            seen_texts.add(candidate.text)
+            dedup_candidates.append(candidate)
+        candidates = dedup_candidates[:10]
+        if not candidates:
+            return False
+
+        llm_target_path = Path(output_dir) / "LLM" / "queue"
+        attempted = False
+        accepted = False
+        for candidate in candidates:
+            seed_path = _next_seed_output_path(llm_target_path, roadblock_id=ctx.roadblock_id)
+            Path(seed_path).write_text(candidate.text, encoding="utf-8")
+            attempted = True
+            gate_result, eval_result = gate_seed(seed_path, roadblock=ctx.roadblock, call_chain=ctx.call_chain)
+            logger.info(
+                f"[{LogOp.ROADBLOCK}] Simplified XML grammar path strategy={candidate.strategy} "
+                f"decision={gate_result.decision} accepted={gate_result.accepted} reason={gate_result.reason}"
+            )
+            if gate_result.accepted:
+                accepted = True
+        return attempted and accepted
+    except Exception as e:
+        logger.error(f"[{LogOp.ROADBLOCK}] Simplified XML grammar path error: {e}", exc_info=True)
+        return False
+
+
 def attempt_simplified_batch_mutation_path(ctx: SimplifiedAttemptContext) -> bool:
     global output_dir
 
@@ -7460,6 +7664,7 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
             ("taint_mutation", ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH, lambda: attempt_simplified_taint_mutation_path(attempt_ctx, pattern_json)),
             ("state_driven", ENABLE_SIMPLIFIED_STATE_DRIVEN_PATH and ENABLE_STATE_DRIVEN_PATH_B, lambda: attempt_simplified_state_driven_path(attempt_ctx)),
             ("field_mutation", ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH, lambda: attempt_simplified_field_mutation_path(attempt_ctx, pattern_json)),
+            ("xml_grammar", ENABLE_SIMPLIFIED_XML_GRAMMAR_PATH, lambda: attempt_simplified_xml_grammar_path(attempt_ctx)),
             ("batch_mutation", ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH, lambda: attempt_simplified_batch_mutation_path(attempt_ctx)),
             ("direct_generation", ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH, lambda: attempt_simplified_direct_generation_path(attempt_ctx, pattern_json)),
         ]

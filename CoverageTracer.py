@@ -1168,6 +1168,8 @@ def export_one_sided_branches(profdata: Path, cov_target_path) -> list[dict]:
     seen: set[tuple] = set()
     for file_entry in branch_entries:
         for branch in file_entry.get("one_sided_branches", []):
+            if int(branch.get("true_count", 0) or 0) == 0 and int(branch.get("false_count", 0) or 0) == 0:
+                continue
             key = (
                 branch.get("filename"),
                 int(branch.get("line", 0) or 0),
@@ -1182,6 +1184,45 @@ def export_one_sided_branches(profdata: Path, cov_target_path) -> list[dict]:
             item.pop("col", None)
             branches.append(item)
     return branches
+
+
+def export_switch_coverage_summary(profdata: Path, cov_target_path) -> list[dict]:
+    cmd = [
+        LLVM_COV_BIN,
+        "export",
+        os.fspath(cov_target_path),
+        "-format=text",
+        f"-instr-profile={profdata.resolve()}",
+        "--json-switch-coverage-summary",
+    ]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        cwd=profdata.parent,
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "[COVERAGE] Failed to export switch coverage summary for %s: %s",
+            profdata,
+            (result.stderr or "").strip()[:300],
+        )
+        return []
+
+    try:
+        payload = json.loads(result.stdout)
+    except Exception as exc:
+        logger.warning("[COVERAGE] Failed to parse switch coverage export for %s: %s", profdata, exc)
+        return []
+
+    summaries: list[dict] = []
+    for file_entry in payload.get("data", [{}])[0].get("files", []):
+        for summary in file_entry.get("switch_coverage_summary", []):
+            summaries.append(summary)
+    return summaries
 
 
 class CoverageTracer:
@@ -1632,26 +1673,35 @@ class CoverageTracer:
         recent_files = set()
         recent_functions = set()
         seed_dir = Path.joinpath(Path(self.output_dir), FUZZER_NAME, "queue")
+        profdir = self.prof_dir
+        profdir.mkdir(parents=True, exist_ok=True)
         if self.last_trace_timestamp_ns > int(last_scan_time or 0):
             logger.info(
                 "[TRACE] Resuming trace checkpoint at timestamp_ns=%d",
                 self.last_trace_timestamp_ns,
             )
             last_scan_time = self.last_trace_timestamp_ns
-        seed_lst_to_run, resume_data_to_load, last_scan_time = get_new_seeds(seed_dir, read_files, last_scan_time)
+        seed_lst_to_run, resume_data_to_load, last_scan_time = get_new_seeds(
+            seed_dir,
+            read_files,
+            last_scan_time,
+            prof_dir=profdir,
+        )
         if len(seed_lst_to_run) == 0:
             logging.info("没有新的seed需要追踪，等待AFL生成新seed...")
             # 返回空roadblocks而不是False，让主循环继续运行
             return True, last_scan_time, "没有新的seed", []
-        profdir = self.prof_dir
         self._reset_rb_seed_index()
-        if os.path.exists(profdir):
-            shutil.rmtree(profdir)
-        os.makedirs(profdir, exist_ok=True)
+        for stale_profraw in profdir.glob("*.profraw"):
+            try:
+                stale_profraw.unlink()
+            except FileNotFoundError:
+                continue
         total_seed_count = len(seed_lst_to_run)
         progress_interval = 100
         trace_loop_start = time.time()
         logger.info(f"trace extract begin (seed_count={total_seed_count})")
+        new_profraw_files: list[Path] = []
 
         # 初始化时间记录文件（整个运行周期只创建一次）
         if not self.timing_log_initialized:
@@ -1697,6 +1747,7 @@ class CoverageTracer:
             if not profraw_file.exists():
                 logger.warning(f"[TRACE] Profraw not generated, skipping seed: {seed_path.name}")
                 continue
+            new_profraw_files.append(profraw_file)
 
             single_prof_data_cmd = f"{LLVM_PROFDATA_BIN} merge -sparse -o {profdir.resolve().as_posix()}/{seed_path.name}.profdata {profdir.resolve().as_posix()}/{seed_path.name}.profraw"
             p = subprocess.Popen(split(single_prof_data_cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1760,20 +1811,18 @@ class CoverageTracer:
         logger.info("llvmcov merge end, indirect calls update begin")
         # update_indirect_calls(funcs, new_call_edge.call_edges)
         logger.info("indirect calls updated")
-        # 根据 main.profdata 是否存在决定合并策略
-        main_profdata = self.main_profdata_path
-        if main_profdata.exists():
-            profdata_cmd = f"{LLVM_PROFDATA_BIN} merge -sparse -o {self.main_profdata_path.resolve().as_posix()} {main_profdata.as_posix()} {profdir}/*.profraw"
-        else:
-            profdata_cmd = f"{LLVM_PROFDATA_BIN} merge -sparse -o {self.main_profdata_path.resolve().as_posix()} {profdir}/*.profraw"
-        p = subprocess.Popen(profdata_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=profdir)
-        prof_stdout, prof_stderr = p.communicate()
-        if p.returncode != 0:
+        if not new_profraw_files:
+            logger.warning("[TRACE] No profraw files generated in this pass")
+            profdata_files = list(profdir.glob("*.profdata"))
+            self._rb_seed_index_signature = self._profdata_signature(profdata_files)
+            return True, last_scan_time, "没有生成新的profraw", []
+        ok, merge_error = self._merge_main_profdata(new_profraw_files)
+        if not ok:
             logger.error(
                 "[TRACE] llvm-profdata merge failed (bin=%s, rc=%s): %s",
                 LLVM_PROFDATA_BIN,
-                p.returncode,
-                prof_stderr.decode("utf-8", errors="ignore").strip()[:800],
+                "batched",
+                merge_error[:800],
             )
             return False, last_scan_time, "llvm-profdata merge failed", []
         export_cmd = f"{LLVM_COV_BIN} export {COV_TARGET_PATH} -format=text -instr-profile={self.main_profdata_path.as_posix()} --json-only-one-sided-branches --json-skip-low-value-guards"
@@ -1907,6 +1956,42 @@ class CoverageTracer:
             self.trace_progress_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
         except Exception as exc:
             logger.warning("[TRACE] Failed to save trace progress checkpoint %s: %s", self.trace_progress_path, exc)
+
+    def _merge_main_profdata(self, new_profraw_files: list[Path]) -> tuple[bool, str]:
+        if not new_profraw_files:
+            return False, "no profraw files"
+        input_list_path = self.trace_dir / "merge_inputs.txt"
+        merge_inputs = [path.resolve().as_posix() for path in new_profraw_files]
+        if self.main_profdata_path.exists():
+            merge_inputs.insert(0, self.main_profdata_path.resolve().as_posix())
+        input_list_path.write_text("\n".join(merge_inputs) + "\n", encoding="utf-8")
+
+        merged_output = self.trace_dir / "main.profdata.tmp"
+        cmd = [
+            LLVM_PROFDATA_BIN,
+            "merge",
+            "-sparse",
+            "-o",
+            merged_output.resolve().as_posix(),
+            f"@{input_list_path.resolve().as_posix()}",
+        ]
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.trace_dir,
+        )
+        _, stderr = p.communicate()
+        if p.returncode != 0:
+            return False, stderr.decode("utf-8", errors="ignore").strip()
+
+        merged_output.replace(self.main_profdata_path)
+        try:
+            input_list_path.unlink()
+        except FileNotFoundError:
+            pass
+
+        return True, ""
 
     def _index_profdata_file(self, profdata: Path) -> None:
         if not profdata.exists():
@@ -2114,22 +2199,32 @@ class CoverageTracer:
         return normalized_targets
 
 
-def get_new_seeds(directory, read_files, last_scan_time):  # 添加去数据库找的功能
+def get_new_seeds(directory, read_files, last_scan_time, prof_dir: Path | None = None):  # 添加去数据库找的功能
     files_to_run = []
     files_to_load = []
+    latest_seen_timestamp_ns = int(last_scan_time or 0)
     sorted_pathdir = sorted(Path(directory).iterdir())
     for file_path in sorted_pathdir:
         if not file_path.is_file():
             continue
         stat = file_path.stat()
         file_timestamp_ns = max(int(stat.st_ctime_ns), int(stat.st_mtime_ns))
-        if file_timestamp_ns > int(last_scan_time or 0) and file_path not in read_files:
-            ''' last scan time and read_files should not influence by resume data'''
-            last_scan_time = max(int(last_scan_time or 0), file_timestamp_ns)
-            read_files.add(file_path)
-            files_to_run.append(file_path)
+        latest_seen_timestamp_ns = max(latest_seen_timestamp_ns, file_timestamp_ns)
 
-    return files_to_run, files_to_load, last_scan_time
+        profdata_missing = False
+        if prof_dir is not None:
+            profdata_missing = not (prof_dir / f"{file_path.name}.profdata").exists()
+
+        needs_incremental_trace = file_timestamp_ns > int(last_scan_time or 0) and file_path not in read_files
+        needs_backfill_trace = profdata_missing
+        if not needs_incremental_trace and not needs_backfill_trace:
+            continue
+
+        ''' last scan time and read_files should not influence by resume data'''
+        read_files.add(file_path)
+        files_to_run.append(file_path)
+
+    return files_to_run, files_to_load, latest_seen_timestamp_ns
 
 
 if __name__ == '__main__':
