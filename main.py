@@ -28,6 +28,7 @@ from CoverageTracer import (
     get_function_slice,
     get_harness_code,
 )
+from attempt_scheduler import AttemptScheduler, SchedulerCandidate, SchedulerResult
 from DSE_util import DSEUtil
 from Excep.ScriptExtractError import ScriptExtractError
 from Excep.ScriptNotFoundError import ScriptNotFoundError
@@ -77,6 +78,14 @@ SEED_IMPORT_CORPUS_SAMPLE_LIMIT = 48
 SEED_IMPORT_MAX_BYTES = 8192
 SEED_IMPORT_MIN_SCORE_FOR_BREAKTHROUGH = 0.30
 
+DIRECT_GENERATION_FUZZER = "LLM"
+FLAG_FUZZER = "flag"
+SUBSPACE_BOOTSTRAP_FUZZER = "subspace_bootstrap"
+XML_GRAMMAR_FUZZER = "xml_grammar"
+TAINT_MUTATION_FUZZER = "taint_mutation"
+FIELD_MUTATION_FUZZER = "field_mutation"
+STATE_DRIVEN_FUZZER = "state_driven"
+
 
 @dataclass
 class ControlSurfaceProfile:
@@ -108,6 +117,13 @@ class SeedEvalResult:
     coverage_gain_class: str
     cost_metrics: dict[str, Any] = field(default_factory=dict)
     rejection_reason: Optional[str] = None
+    stderr_text: str = ""
+    stderr_cluster: str = ""
+    stderr_novel: bool = False
+    parser_depth_score: int = 0
+    closest_hit_line_distance: int | None = None
+    deepest_call_chain_hit_index: int = -1
+    frontier_advance: bool = False
 
 
 @dataclass
@@ -119,6 +135,27 @@ class DirectTextSeedResult:
     eval_result: Optional[SeedEvalResult] = None
     response_text: Optional[str] = None
     failure_reason: Optional[str] = None
+
+
+@dataclass
+class DirectGenerationPlan:
+    generation_mode: str
+    strategy: str
+    reason: str
+    inferred_mode: str
+    planner_result: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class DirectGenerationExecutionResult:
+    attempted: bool
+    success: bool
+    mode: str
+    seed_id: int = -1
+    candidate_path: Optional[str] = None
+    failure_reason: Optional[str] = None
+    gate_result: Optional[SeedGateResult] = None
+    eval_result: Optional[SeedEvalResult] = None
 
 
 @dataclass
@@ -933,6 +970,7 @@ def ensure_cached_single_function_slice(
         llm_util,
         dynamic_context=dynamic_context,
         original_target_line=roadblock.get('line'),
+        target_file=roadblock.get('filename'),
     )
     if not code_slice or "No matching instruction found" in code_slice or len(code_slice) <= 50:
         return None
@@ -1128,6 +1166,41 @@ def apply_recommended_next_steps(decision_result: dict[str, Any], route_preferen
         elif step == 'deprioritize_roadblock':
             updated['value_score'] = min(updated['value_score'], 0.35)
     return updated
+
+
+def apply_target_class_route_policy(
+    target_class: str,
+    *,
+    generation_mode: str,
+    route_preferences: dict[str, Any],
+    path_ab_policy: dict[str, Any],
+) -> dict[str, Any]:
+    updated_route_preferences = dict(route_preferences)
+    updated_path_ab_policy = dict(path_ab_policy)
+    prefer_direct_text_generation = generation_mode == "text_direct"
+    structured_text_mode = False
+
+    if target_class == "structured_text_parser":
+        generation_mode = "text_direct"
+        prefer_direct_text_generation = True
+        structured_text_mode = True
+        updated_route_preferences['allow_direct_generation'] = True
+        updated_route_preferences['prefer_batch_mutation'] = False
+        updated_route_preferences['prefer_input_mutation'] = False
+        updated_route_preferences['prefer_state_guided'] = False
+        updated_path_ab_policy['path_ab_enabled'] = False
+        updated_path_ab_policy['path_a_enabled'] = False
+        updated_path_ab_policy['path_b_enabled'] = False
+        updated_path_ab_policy['auto_enabled'] = False
+        updated_path_ab_policy['reason'] = 'structured_text_direct_mode'
+
+    return {
+        'generation_mode': generation_mode,
+        'prefer_direct_text_generation': prefer_direct_text_generation,
+        'structured_text_mode': structured_text_mode,
+        'route_preferences': updated_route_preferences,
+        'path_ab_policy': updated_path_ab_policy,
+    }
 
 
 def derive_path_ab_policy(
@@ -1860,82 +1933,268 @@ def get_recent_roadblock_failure_rate() -> float:
     return failures / len(recent_roadblock_outcomes)
 
 
-def should_enter_early_zero_branch_stage(stuck_time: float, roadblock_count: int, skipped_failed: int) -> bool:
-    """
-    Start zero-covered exploration before one-sided roadblocks are fully exhausted
-    once the current roadblock workflow shows clear low-yield signals.
-    """
-    if not (ENABLE_ZERO_BRANCH_SECOND_STAGE and ENABLE_ZERO_COVERED_EXPLORATION):
-        return False
-
-    if roadblock_count <= 0:
-        return True
-
-    recent_failure_rate = get_recent_roadblock_failure_rate()
-    enough_history = len(recent_roadblock_outcomes) >= recent_roadblock_outcomes.maxlen
-    visible_candidates = roadblock_count + skipped_failed
-    failed_ratio = skipped_failed / visible_candidates if visible_candidates > 0 else 0.0
-
-    return (
-        stuck_time >= THRESHOLD_TIME * 2
-        and enough_history
-        and recent_failure_rate >= 0.8
-        and (roadblock_count <= 3 or failed_ratio >= 0.7)
-    )
+@dataclass
+class PlateauAttemptContext:
+    tracer: CoverageTracer
+    llm_util: LLMUtil
+    stuck_time: float
+    roadblocks: list[dict]
+    last_scan_time: int
+    read_files: set
 
 
-def should_prioritize_zero_branch_stage(stuck_time: float, roadblock_count: int, skipped_failed: int) -> bool:
-    """
-    Escalate zero-covered exploration to primary mode when the current stagnation is
-    clearly deep, even if a few roadblocks are still technically available.
-    """
-    if roadblock_count <= 0:
-        return True
-
-    recent_failure_rate = get_recent_roadblock_failure_rate()
-    enough_history = len(recent_roadblock_outcomes) >= recent_roadblock_outcomes.maxlen
-    visible_candidates = roadblock_count + skipped_failed
-    failed_ratio = skipped_failed / visible_candidates if visible_candidates > 0 else 0.0
-
-    return (
-        stuck_time >= THRESHOLD_TIME * 4
-        and enough_history
-        and recent_failure_rate >= 0.8
-        and (roadblock_count <= 3 or failed_ratio >= 0.7)
-    )
+@dataclass
+class PathEpochState:
+    path_name: str
+    started: bool = False
+    completed: bool = False
+    completion_reason: str = ""
+    coverage_breakthrough_seen: bool = False
+    attempt_count: int = 0
+    last_candidate_key: str | None = None
 
 
-def run_zero_branch_stage(
-    tracer: CoverageTracer,
-    llm_util: LLMUtil,
-    last_scan_time,
-    read_files,
-    attempt_limit: int,
-    stage_reason: str,
-):
-    """Run zero-covered branch exploration and stop early on any breakthrough."""
-    try:
-        zero_branches = tracer.get_zero_branch_targets_from_llvm_cov()[:attempt_limit]
-        logger.info(
-            f"[{LogOp.ROADBLOCK}] ZERO_BRANCH_STAGE entered ({stage_reason}), "
-            f"found {len(zero_branches)} zero-covered branches"
+class PlateauPathScheduler:
+    def __init__(self, path_name: str, runtime_dir: Path):
+        self.path_name = path_name
+        self.scheduler = AttemptScheduler(path_name, runtime_dir / f"{path_name}.json")
+
+    def refresh_candidates(self, context: PlateauAttemptContext) -> list[SchedulerCandidate]:
+        raise NotImplementedError
+
+    def execute(self, candidate: SchedulerCandidate, context: PlateauAttemptContext) -> SchedulerResult:
+        raise NotImplementedError
+
+    def select_candidate(self, context: PlateauAttemptContext) -> SchedulerCandidate | None:
+        candidates = self.scheduler.sync_candidates(self.refresh_candidates(context))
+        return self.scheduler.select_candidate(candidates)
+
+    def record_result(self, candidate: SchedulerCandidate, result: SchedulerResult) -> None:
+        self.scheduler.record_result(candidate, result)
+
+
+class DirectGenerationScheduler(PlateauPathScheduler):
+    def __init__(self, runtime_dir: Path):
+        super().__init__("direct_generation", runtime_dir)
+
+    def refresh_candidates(self, context: PlateauAttemptContext) -> list[SchedulerCandidate]:
+        candidates: list[SchedulerCandidate] = []
+        for roadblock in context.roadblocks:
+            roadblock_key = roadblock.get('roadblock_key') or get_roadblock_key(roadblock)
+            if roadblock_key in resolved_roadblocks or roadblock_key in pass_roadblock_id:
+                continue
+            candidates.append(
+                SchedulerCandidate(
+                    path_name=self.path_name,
+                    candidate_key=roadblock_key,
+                    target_key=roadblock_key,
+                    prepared_context_ref=roadblock_key,
+                    score=20.0,
+                    payload={"roadblock": roadblock},
+                )
+            )
+        return candidates
+
+    def execute(self, candidate: SchedulerCandidate, context: PlateauAttemptContext) -> SchedulerResult:
+        roadblock = candidate.payload["roadblock"]
+        attempted, mode, _, _ = handle_roadblock_direct_generation_only(roadblock, context.tracer, context.llm_util)
+        stuck_time = context.tracer.check_coverage_growth()
+        return SchedulerResult(
+            attempted=attempted,
+            success=attempted,
+            mode=mode,
+            coverage_breakthrough=stuck_time < THRESHOLD_TIME,
         )
 
-        for zc_branch in zero_branches:
-            ret, mode, id, target_id = handle_zero_covered_branch(zc_branch, tracer, llm_util)
-            stuck_time = tracer.check_coverage_growth()
 
-            if stuck_time < THRESHOLD_TIME:
+class SimplifiedPathScheduler(PlateauPathScheduler):
+    def __init__(self, path_name: str, runtime_dir: Path, *, base_score: float):
+        super().__init__(path_name, runtime_dir)
+        self.base_score = base_score
+
+    def refresh_candidates(self, context: PlateauAttemptContext) -> list[SchedulerCandidate]:
+        candidates: list[SchedulerCandidate] = []
+        for roadblock in context.roadblocks:
+            roadblock_key = roadblock.get('roadblock_key') or get_roadblock_key(roadblock)
+            if roadblock_key in resolved_roadblocks or roadblock_key in pass_roadblock_id:
+                continue
+            candidates.append(
+                SchedulerCandidate(
+                    path_name=self.path_name,
+                    candidate_key=f"{self.path_name}:{roadblock_key}",
+                    target_key=roadblock_key,
+                    prepared_context_ref=roadblock_key,
+                    score=self.base_score,
+                    payload={"roadblock": roadblock},
+                )
+            )
+        return candidates
+
+    def execute(self, candidate: SchedulerCandidate, context: PlateauAttemptContext) -> SchedulerResult:
+        roadblock = candidate.payload["roadblock"]
+        attempted, mode, _, _ = handle_roadblock_simplified(
+            roadblock,
+            context.tracer,
+            context.llm_util,
+            selected_paths={self.path_name},
+            mark_attempted=False,
+        )
+        stuck_time = context.tracer.check_coverage_growth()
+        return SchedulerResult(
+            attempted=attempted,
+            success=attempted,
+            mode=mode,
+            coverage_breakthrough=stuck_time < THRESHOLD_TIME,
+        )
+
+
+class PlateauAttemptOrchestrator:
+    def __init__(self, tracer: CoverageTracer, llm_util: LLMUtil):
+        self.tracer = tracer
+        self.llm_util = llm_util
+        self.runtime_dir = Path(output_dir) / "runtime" / "scheduler"
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self.schedulers: list[PlateauPathScheduler] = []
+        self.active_epoch_id = 0
+        self.epoch_active = False
+        self.path_epoch_states: dict[str, PathEpochState] = {}
+        if ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH:
+            self.schedulers.append(DirectGenerationScheduler(self.runtime_dir))
+        if ENABLE_SIMPLIFIED_FLAG_PATH:
+            self.schedulers.append(SimplifiedPathScheduler("flag", self.runtime_dir, base_score=19.0))
+        if ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH:
+            self.schedulers.append(SimplifiedPathScheduler("taint_mutation", self.runtime_dir, base_score=18.0))
+        if ENABLE_SIMPLIFIED_STATE_DRIVEN_PATH and ENABLE_STATE_DRIVEN_PATH_B:
+            self.schedulers.append(SimplifiedPathScheduler("state_driven", self.runtime_dir, base_score=17.0))
+        if ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH:
+            self.schedulers.append(SimplifiedPathScheduler("field_mutation", self.runtime_dir, base_score=16.0))
+        if ENABLE_SIMPLIFIED_XML_GRAMMAR_PATH:
+            self.schedulers.append(SimplifiedPathScheduler("xml_grammar", self.runtime_dir, base_score=15.0))
+        if ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH:
+            self.schedulers.append(SimplifiedPathScheduler("batch_mutation", self.runtime_dir, base_score=14.0))
+        self._reset_epoch_states()
+
+    def _reset_epoch_states(self) -> None:
+        self.path_epoch_states = {
+            scheduler.path_name: PathEpochState(path_name=scheduler.path_name)
+            for scheduler in self.schedulers
+        }
+
+    def has_active_epoch(self) -> bool:
+        return self.epoch_active
+
+    def start_new_epoch(self, stuck_time: float) -> None:
+        self.active_epoch_id += 1
+        self.epoch_active = True
+        self._reset_epoch_states()
+        logger.info(
+            f"[{LogOp.ROADBLOCK}] Starting plateau epoch {self.active_epoch_id} "
+            f"(stuck_time={stuck_time:.1f}s, paths={len(self.schedulers)})"
+        )
+
+    def close_epoch(self, reason: str) -> None:
+        if not self.epoch_active:
+            return
+        logger.info(
+            f"[{LogOp.ROADBLOCK}] Plateau epoch {self.active_epoch_id} finished: {reason}"
+        )
+        for state in self.path_epoch_states.values():
+            logger.info(
+                f"[{LogOp.ROADBLOCK}] Epoch {self.active_epoch_id} path `{state.path_name}` "
+                f"summary: completed={state.completed}, attempts={state.attempt_count}, "
+                f"coverage_breakthrough_seen={state.coverage_breakthrough_seen}, "
+                f"last_candidate={state.last_candidate_key or 'N/A'}, "
+                f"reason={state.completion_reason or 'pending'}"
+            )
+        self.epoch_active = False
+        self._reset_epoch_states()
+
+    @staticmethod
+    def prepare_roadblocks(roadblocks: list[dict]) -> list[dict]:
+        prepared_roadblocks = []
+        for rb in roadblocks:
+            rb['roadblock_id'] = rb.get('roadblock_id') or get_rb_id(rb)
+            rb['roadblock_key'] = rb.get('roadblock_key') or get_roadblock_key(rb)
+            rb['function'] = rb.get('function') or get_function_name(rb)[0]
+            prepared_roadblocks.append(rb)
+        return prepared_roadblocks
+
+    def run_cycle(self, last_scan_time, read_files, stuck_time):
+        if not self.epoch_active:
+            self.start_new_epoch(stuck_time)
+
+        ret, last_scan_time, error_info, roadblocks = self.tracer.get_trace(read_files, last_scan_time)
+        if not ret:
+            if "没有新的seed" in error_info:
+                logger.info(f"[{LogOp.ROADBLOCK}] {error_info}")
+                logger.info(f"[{LogOp.ROADBLOCK}] Reusing current one-sided branches for epoch {self.active_epoch_id}")
+                roadblocks = self.tracer.get_current_one_sided_branches()
+            else:
+                logger.critical(f"[{LogOp.ROADBLOCK}] Coverage trace extraction failed: {error_info}")
+                logger.critical("Cannot proceed without valid trace data")
+                sys.exit(1)
+
+        prepared_roadblocks = self.prepare_roadblocks(roadblocks)
+        context = PlateauAttemptContext(
+            tracer=self.tracer,
+            llm_util=self.llm_util,
+            stuck_time=stuck_time,
+            roadblocks=prepared_roadblocks,
+            last_scan_time=last_scan_time,
+            read_files=read_files,
+        )
+        any_success = False
+        active_paths = 0
+        for scheduler in self.schedulers:
+            state = self.path_epoch_states[scheduler.path_name]
+            if state.completed:
+                continue
+            active_paths += 1
+            candidate = scheduler.select_candidate(context)
+            if candidate is None:
+                state.completed = True
+                state.completion_reason = "no_eligible_candidates"
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Epoch {self.active_epoch_id} scheduler `{scheduler.path_name}` "
+                    f"has no eligible candidates"
+                )
+                continue
+            logger.info(
+                f"[{LogOp.ROADBLOCK}] Epoch {self.active_epoch_id} scheduler `{scheduler.path_name}` "
+                f"proposed {candidate.target_key} "
+                f"(score={candidate.score:.1f}, failures={candidate.failure_count}, "
+                f"cooldown_until={candidate.cooldown_until:.0f}, selected={candidate.selection_count})"
+            )
+            state.started = True
+            state.attempt_count += 1
+            state.last_candidate_key = candidate.target_key
+            result = scheduler.execute(candidate, context)
+            scheduler.record_result(candidate, result)
+            any_success = any_success or result.success
+
+            if result.coverage_breakthrough:
+                state.completed = True
+                state.coverage_breakthrough_seen = True
+                state.completion_reason = f"coverage_breakthrough:{result.mode}"
                 reset_roadblock_outcomes()
-                logger.info(f"[{LogOp.ROADBLOCK}] Coverage breakthrough via zero-covered branch!")
-                return True, True, last_scan_time, read_files
-            if ret:
-                logger.info(f"[{LogOp.ROADBLOCK}] Zero-covered branch resolved: {mode}")
-                return True, False, last_scan_time, read_files
-    except Exception as e:
-        logger.error(f"[{LogOp.ROADBLOCK}] Error during zero-branch fallback: {e}", exc_info=True)
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Epoch {self.active_epoch_id} path `{candidate.path_name}` "
+                    f"observed coverage breakthrough (mode={result.mode}); other paths keep running"
+                )
+            elif result.attempted:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Epoch {self.active_epoch_id} path `{candidate.path_name}` "
+                    f"attempt finished without breakthrough (mode={result.mode})"
+                )
+            else:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Epoch {self.active_epoch_id} path `{candidate.path_name}` "
+                    f"did not produce an attempt (mode={result.mode})"
+                )
 
-    return False, False, last_scan_time, read_files
+        if active_paths == 0 or all(state.completed for state in self.path_epoch_states.values()):
+            self.close_epoch("all_paths_completed")
+        return any_success, last_scan_time, read_files
 
 
 def update_pass_roadblock():
@@ -2371,7 +2630,304 @@ def _call_chain_file_candidates(call_chain) -> list[str]:
     return candidates
 
 
+_seed_stderr_cluster_history: dict[str, set[str]] = defaultdict(set)
+_seed_coverage_feature_history: dict[str, set[tuple[str, int, str]]] = defaultdict(set)
+_seed_frontier_history: dict[str, dict[str, int | None]] = defaultdict(dict)
+
+
+def _string_contains_any(text: str, keywords: tuple[str, ...] | list[str] | set[str]) -> bool:
+    lowered = text.lower()
+    return any(keyword in lowered for keyword in keywords)
+
+
+def classify_input_target(fields=None, harness_code: str | None = None) -> str:
+    format_name = str((cached_format_info or {}).get("format_name", "")).lower()
+    format_desc = str((cached_format_info or {}).get("format_description", "")).lower()
+    harness_joined = (harness_code or "").lower()
+    project_name = str(PROJECT).lower()
+    combined = " ".join((format_name, format_desc, harness_joined, project_name))
+
+    structured_keywords = (
+        "xml", "json", "cjson", "yaml", "toml", "ini", "csv", "plist",
+        "config", "doctype", "entity", "namespace", "lexer", "yyparse",
+    )
+    if _string_contains_any(combined, structured_keywords):
+        return "structured_text_parser"
+
+    if _looks_textual_semantic_input(fields=fields, harness_code=harness_code):
+        return "code_like_text"
+
+    return "binary_or_other"
+
+
+def _seed_eval_target_class(target_context: Optional[dict[str, Any]] = None) -> str:
+    target_context = target_context or {}
+    harness_code = target_context.get("harness_code") or get_harness_code()
+    fields = target_context.get("fields")
+    return classify_input_target(fields=fields, harness_code=harness_code)
+
+
+def normalize_parser_stderr(stderr_text: str) -> str:
+    lowered = (stderr_text or "").lower()
+    if not lowered.strip():
+        return ""
+
+    cluster_rules = [
+        ("xml_mismatched_tag", ("opening and ending tag mismatch", "mismatch")),
+        ("xml_attr_error", ("attribute", "construct error")),
+        ("xml_entity_error", ("entity", "not defined")),
+        ("xml_namespace_error", ("namespace",)),
+        ("xml_doctype_error", ("doctype",)),
+        ("json_unterminated_string", ("unterminated string",)),
+        ("json_invalid_escape", ("invalid escape",)),
+        ("json_unexpected_token", ("unexpected", "token")),
+        ("json_invalid_number", ("invalid number",)),
+        ("json_duplicate_key", ("duplicate", "key")),
+        ("syntax_error", ("syntax error",)),
+        ("parse_error", ("parse error",)),
+    ]
+    for cluster_name, keywords in cluster_rules:
+        if all(keyword in lowered for keyword in keywords):
+            return cluster_name
+
+    if "error" in lowered:
+        return "generic_error"
+    return "unknown"
+
+
+def score_parser_depth(stderr_text: str) -> int:
+    lowered = (stderr_text or "").lower()
+    if not lowered.strip():
+        return 0
+
+    score = 0
+    if _string_contains_any(lowered, ("line ", "column ", "byte ", "offset ")):
+        score += 1
+    if _string_contains_any(lowered, ("tag", "attribute", "entity", "namespace", "doctype", "token", "escape")):
+        score += 1
+    if _string_contains_any(lowered, ("recover", "internal subset", "processing instruction", "duplicate key")):
+        score += 1
+    return score
+
+
+def _seed_history_key(target_context: Optional[dict[str, Any]]) -> str:
+    target_context = target_context or {}
+    roadblock = target_context.get("roadblock") or {}
+    filename = roadblock.get("filename", "")
+    line = roadblock.get("line", "")
+    function_name = roadblock.get("function", "")
+    return f"{PROJECT}:{filename}:{line}:{function_name}"
+
+
+def _mark_stderr_cluster_seen(cluster: str, target_context: Optional[dict[str, Any]]) -> bool:
+    if not cluster:
+        return False
+    history_key = _seed_history_key(target_context)
+    seen = _seed_stderr_cluster_history[history_key]
+    if cluster in seen:
+        return False
+    seen.add(cluster)
+    return True
+
+
+def _export_one_sided_branch_features(profdata_path: Path) -> set[tuple[str, int, str]]:
+    cmd = [
+        LLVM_COV_BIN,
+        "export",
+        os.fspath(COV_TARGET_PATH),
+        "-format=text",
+        f"-instr-profile={profdata_path.resolve()}",
+        "--json-only-one-sided-branches",
+        "--json-skip-low-value-guards",
+    ]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        cwd=os.fspath(profdata_path.parent),
+    )
+    if result.returncode != 0:
+        logger.warning(
+            f"[{LogOp.TEST}] llvm-cov export(one-sided branches) failed for {profdata_path}: "
+            f"{(result.stderr or '').strip()[:300]}"
+        )
+        return set()
+
+    try:
+        payload = json.loads(result.stdout)
+    except Exception as exc:
+        logger.warning(f"[{LogOp.TEST}] Failed to parse llvm-cov export for {profdata_path}: {exc}")
+        return set()
+
+    features: set[tuple[str, int, str]] = set()
+    file_entries = payload.get("data", [{}])[0].get("files", [])
+    for file_entry in file_entries:
+        for branch in file_entry.get("one_sided_branches", []):
+            true_count = int(branch.get("true_count", 0) or 0)
+            false_count = int(branch.get("false_count", 0) or 0)
+            if true_count == 0 and false_count == 0:
+                continue
+            filename = branch.get("filename")
+            line = int(branch.get("line", 0) or 0)
+            side = str(branch.get("side") or "")
+            if not filename or line <= 0:
+                continue
+            features.add((filename, line, side))
+    return features
+
+
+def _compute_new_coverage_features(
+    profdata_path: Optional[Path],
+    target_context: Optional[dict[str, Any]],
+) -> int:
+    if not profdata_path:
+        return 0
+    features = _export_one_sided_branch_features(profdata_path)
+    if not features:
+        return 0
+    history_key = _seed_history_key(target_context)
+    seen = _seed_coverage_feature_history[history_key]
+    new_features = features - seen
+    seen.update(features)
+    return len(new_features)
+
+
+def _extract_hit_lines(report_text: str) -> list[int]:
+    if not report_text:
+        return []
+    pattern = re.compile(r"^\s*(\d+)\|\s*([0-9][0-9A-Za-z\.\-]*)\|", re.MULTILINE)
+    hit_lines: list[int] = []
+    for match in pattern.finditer(report_text):
+        line_no = int(match.group(1))
+        count_token = match.group(2).strip().lower()
+        if count_token in {"0", "0.0"}:
+            continue
+        hit_lines.append(line_no)
+    return hit_lines
+
+
+def _closest_hit_line_distance(report_text: str, target_line: int | None) -> int | None:
+    if target_line is None:
+        return None
+    hit_lines = _extract_hit_lines(report_text)
+    if not hit_lines:
+        return None
+    return min(abs(line_no - target_line) for line_no in hit_lines)
+
+
+def _mark_frontier_advance(
+    *,
+    target_context: Optional[dict[str, Any]],
+    closest_hit_line_distance: int | None,
+    deepest_call_chain_hit_index: int,
+    parser_depth_score: int,
+) -> bool:
+    history_key = _seed_history_key(target_context)
+    prev = _seed_frontier_history.get(history_key, {})
+    advanced = False
+
+    prev_distance = prev.get("closest_hit_line_distance")
+    if closest_hit_line_distance is not None and (
+        prev_distance is None or closest_hit_line_distance < prev_distance
+    ):
+        advanced = True
+
+    prev_chain_index_value = prev.get("deepest_call_chain_hit_index")
+    prev_chain_index = -1 if prev_chain_index_value is None else int(prev_chain_index_value)
+    if deepest_call_chain_hit_index > prev_chain_index:
+        advanced = True
+
+    prev_parser_depth_value = prev.get("parser_depth_score")
+    prev_parser_depth = 0 if prev_parser_depth_value is None else int(prev_parser_depth_value)
+    if parser_depth_score > prev_parser_depth:
+        advanced = True
+
+    updated = dict(prev)
+    if closest_hit_line_distance is not None:
+        updated["closest_hit_line_distance"] = (
+            closest_hit_line_distance
+            if prev_distance is None
+            else min(int(prev_distance), closest_hit_line_distance)
+        )
+    updated["deepest_call_chain_hit_index"] = max(prev_chain_index, deepest_call_chain_hit_index)
+    updated["parser_depth_score"] = max(prev_parser_depth, parser_depth_score)
+    _seed_frontier_history[history_key] = updated
+    return advanced
+
+
+def _execute_seed_and_capture(seed_path: str, harness_code: str | None = None) -> tuple[bool, str]:
+    program_path = trace_prog or target_prog or COV_TARGET_PATH
+    if not program_path:
+        return False, ""
+
+    try:
+        cmd, stdin_data = build_seed_execution(program_path, seed_path, harness_code=harness_code)
+    except Exception as exc:
+        logger.warning(f"[{LogOp.TEST}] Failed to build seed execution command for {seed_path}: {exc}")
+        return False, ""
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=stdin_data,
+            stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr_text = ""
+        if exc.stderr:
+            stderr_text = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr)
+        return False, stderr_text or "timeout"
+    except Exception as exc:
+        logger.warning(f"[{LogOp.TEST}] Seed execution failed for {seed_path}: {exc}")
+        return False, str(exc)
+
+    stderr_data = result.stderr or b""
+    if isinstance(stderr_data, bytes):
+        stderr_text = stderr_data.decode("utf-8", errors="replace")
+    else:
+        stderr_text = str(stderr_data)
+    return result.returncode == 0, stderr_text
+
+
+def _classify_seed_gain(
+    *,
+    exec_ok: bool,
+    target_line_window_hit: bool,
+    target_file_hit: bool,
+    parse_family_hit: bool,
+    new_edges: int,
+    stderr_novel: bool,
+    parser_depth_score: int,
+    frontier_advance: bool,
+) -> str:
+    if not exec_ok:
+        return "execution_failed"
+    if target_line_window_hit:
+        return "target_line_window_hit"
+    if target_file_hit:
+        return "target_file_hit"
+    if frontier_advance:
+        return "frontier_advance"
+    if new_edges > 0:
+        return "new_edges"
+    if stderr_novel:
+        return "diagnostic_novelty"
+    if parse_family_hit:
+        return "parser_family_hit"
+    if parser_depth_score > 0:
+        return "parser_progress"
+    return "seed_generated"
+
+
 def evaluate_seed(seed_path: str, target_context: Optional[dict[str, Any]] = None) -> SeedEvalResult:
+    target_context = target_context or {}
     try:
         file_size = os.path.getsize(seed_path)
     except OSError:
@@ -2386,15 +2942,79 @@ def evaluate_seed(seed_path: str, target_context: Optional[dict[str, Any]] = Non
             rejection_reason="SEED_UNPARSEABLE",
         )
 
+    harness_code = target_context.get("harness_code") or get_harness_code()
+    exec_ok, stderr_text = _execute_seed_and_capture(seed_path, harness_code=harness_code)
+    stderr_cluster = normalize_parser_stderr(stderr_text)
+    stderr_novel = _mark_stderr_cluster_seen(stderr_cluster, target_context)
+    parser_depth_score = score_parser_depth(stderr_text)
+
+    profdata_path = _build_seed_profdata(seed_path) if COV_TARGET_PATH else None
+    roadblock = target_context.get("roadblock") or {}
+    call_chain = target_context.get("call_chain")
+
+    target_file_hit = False
+    target_line_window_hit = False
+    parse_family_hit = False
+    new_edges = 0
+    closest_hit_line_distance = None
+    deepest_call_chain_hit_index = -1
+    frontier_advance = False
+    coverage_gain_class = "seed_generated"
+
+    if profdata_path:
+        new_edges = _compute_new_coverage_features(profdata_path, target_context)
+        target_file = roadblock.get("filename")
+        target_line = roadblock.get("line")
+        if target_file:
+            target_report = _llvm_cov_show_file(target_file, profdata_path)
+            target_file_hit, target_line_window_hit = _llvm_cov_report_has_hits(target_report or "", target_line)
+            closest_hit_line_distance = _closest_hit_line_distance(target_report or "", target_line)
+
+        for idx, file_name in enumerate(_call_chain_file_candidates(call_chain)):
+            report_text = _llvm_cov_show_file(file_name, profdata_path)
+            any_hit, _ = _llvm_cov_report_has_hits(report_text or "")
+            if any_hit:
+                parse_family_hit = True
+                deepest_call_chain_hit_index = max(deepest_call_chain_hit_index, idx)
+
+    frontier_advance = _mark_frontier_advance(
+        target_context=target_context,
+        closest_hit_line_distance=closest_hit_line_distance,
+        deepest_call_chain_hit_index=deepest_call_chain_hit_index,
+        parser_depth_score=parser_depth_score,
+    )
+
+    target_class = _seed_eval_target_class(target_context)
+    if target_class == "structured_text_parser" and not parse_family_hit and stderr_cluster not in {"", "unknown"}:
+        parse_family_hit = True
+
+    coverage_gain_class = _classify_seed_gain(
+        exec_ok=exec_ok,
+        target_line_window_hit=target_line_window_hit,
+        target_file_hit=target_file_hit,
+        parse_family_hit=parse_family_hit,
+        new_edges=new_edges,
+        stderr_novel=stderr_novel,
+        parser_depth_score=parser_depth_score,
+        frontier_advance=frontier_advance,
+    )
+
     return SeedEvalResult(
-        exec_ok=True,
-        parse_family_hit=False,
-        new_edges=0,
-        target_file_hit=False,
-        target_line_window_hit=False,
-        coverage_gain_class="seed_generated",
+        exec_ok=exec_ok,
+        parse_family_hit=parse_family_hit,
+        new_edges=new_edges,
+        target_file_hit=target_file_hit,
+        target_line_window_hit=target_line_window_hit,
+        coverage_gain_class=coverage_gain_class,
         cost_metrics={"file_size": file_size},
-        rejection_reason=None,
+        rejection_reason=None if exec_ok else "SEED_EXECUTION_FAILED",
+        stderr_text=stderr_text[:1000],
+        stderr_cluster=stderr_cluster,
+        stderr_novel=stderr_novel,
+        parser_depth_score=parser_depth_score,
+        closest_hit_line_distance=closest_hit_line_distance,
+        deepest_call_chain_hit_index=deepest_call_chain_hit_index,
+        frontier_advance=frontier_advance,
     )
 
 
@@ -2493,7 +3113,27 @@ def diagnose_and_improve_no_coverage(
 
 
 def _seed_eval_indicates_local_progress(eval_result: SeedEvalResult) -> bool:
-    return bool(eval_result.exec_ok)
+    if not eval_result.exec_ok:
+        return False
+
+    target_class = _seed_eval_target_class()
+    if target_class == "structured_text_parser":
+        return any((
+            eval_result.target_line_window_hit,
+            eval_result.target_file_hit and eval_result.parse_family_hit,
+            eval_result.new_edges > 0,
+            eval_result.frontier_advance,
+            eval_result.stderr_novel,
+            eval_result.parser_depth_score >= 2,
+        ))
+
+    return any((
+        eval_result.target_line_window_hit,
+        eval_result.target_file_hit,
+        eval_result.new_edges > 0,
+        eval_result.frontier_advance,
+        eval_result.parse_family_hit,
+    ))
 
 def extract_and_test(
     llm_util: LLMUtil,
@@ -2507,6 +3147,8 @@ def extract_and_test(
     code_slice: Optional[str] = None,
     no_coverage_retry_budget: int = NO_COVERAGE_GUIDED_RETRY_LIMIT,
     duplicate_retry_budget: int = 2,
+    queue_dir: str | Path | None = None,
+    path_prefix: str | None = None,
 ):
     global input_dir, output_dir, fuzzing_args, target_prog, trace_prog
 
@@ -2521,7 +3163,14 @@ def extract_and_test(
     logger.info(f"[{LogOp.EXTRACT}] Extracting Python script from LLM response")
     script = extract_generator(script)
     logger.info(f"[{LogOp.EXTRACT}] Executing generated Python script")
-    stdout, stderr, new_seed_path = run_generator(script, roadblock_id if roadblock_id else 999999, seed_id, output_dir)
+    stdout, stderr, new_seed_path = run_generator(
+        script,
+        roadblock_id if roadblock_id else 999999,
+        seed_id,
+        output_dir,
+        path_prefix=path_prefix,
+        queue_dir=queue_dir,
+    )
     err_times = 0
     while stderr and "Connected to: <socket.socket" not in stderr:
         if err_times >= 3:
@@ -2533,8 +3182,14 @@ def extract_and_test(
             err_times += 1
             continue
         fixed_generator_script = extract_generator(fix_resp)
-        stdout, stderr, new_seed_path = run_generator(fixed_generator_script, roadblock_id if roadblock_id else 999999,
-                                                      seed_id, output_dir)
+        stdout, stderr, new_seed_path = run_generator(
+            fixed_generator_script,
+            roadblock_id if roadblock_id else 999999,
+            seed_id,
+            output_dir,
+            path_prefix=path_prefix,
+            queue_dir=queue_dir,
+        )
         script = fixed_generator_script
         err_times += 1
 
@@ -2559,8 +3214,14 @@ def extract_and_test(
             empty_file_times += 1
             continue
         fixed_generator_script = extract_generator(empty_fix_resp)
-        stdout, stderr, new_seed_path = run_generator(fixed_generator_script, roadblock_id if roadblock_id else 999999,
-                                                      seed_id, output_dir)
+        stdout, stderr, new_seed_path = run_generator(
+            fixed_generator_script,
+            roadblock_id if roadblock_id else 999999,
+            seed_id,
+            output_dir,
+            path_prefix=path_prefix,
+            queue_dir=queue_dir,
+        )
         script = fixed_generator_script
         empty_file_times += 1
         if not os.path.exists(new_seed_path):
@@ -2593,6 +3254,8 @@ def extract_and_test(
                 code_slice=code_slice,
                 no_coverage_retry_budget=no_coverage_retry_budget,
                 duplicate_retry_budget=duplicate_retry_budget - 1,
+                queue_dir=queue_dir,
+                path_prefix=path_prefix,
             )
     if not gate_result.accepted:
         logger.info(
@@ -2617,6 +3280,8 @@ def mutate_and_test(
     tracer: CoverageTracer,
     roadblock: Optional[dict] = None,
     call_chain=None,
+    path_prefix: str | None = None,
+    queue_dir: str | Path | None = None,
 ):
     global input_dir, output_dir, fuzzing_args, target_prog, trace_prog
 
@@ -2628,7 +3293,14 @@ def mutate_and_test(
         logger.critical("[{LogOp.FUZZER}] Fuzzer died before mutate_and_test, aborting...")
         raise
 
-    stdout, stderr, new_seed_path = run_mutate_script(script, seed_id, orig, output_dir)
+    stdout, stderr, new_seed_path = run_mutate_script(
+        script,
+        seed_id,
+        orig,
+        output_dir,
+        path_prefix=path_prefix,
+        queue_dir=queue_dir,
+    )
     err_times = 0
     while stderr and "Connected to: <socket.socket" not in stderr:
         if err_times >= 3:
@@ -2640,7 +3312,14 @@ def mutate_and_test(
             err_times += 1
             continue
         fixed_generator_script = extract_generator(fix_resp)
-        stdout, stderr, new_seed_path = run_mutate_script(fixed_generator_script, seed_id, orig, output_dir)
+        stdout, stderr, new_seed_path = run_mutate_script(
+            fixed_generator_script,
+            seed_id,
+            orig,
+            output_dir,
+            path_prefix=path_prefix,
+            queue_dir=queue_dir,
+        )
         script = fixed_generator_script
         err_times += 1
 
@@ -2731,10 +3410,14 @@ def handle_subspace_bootstrap(target, tracer: CoverageTracer, llm_util: LLMUtil)
         harness_code=harness_code,
     )
 
-    llm_queue_path = Path(output_dir) / "LLM" / "queue"
+    llm_queue_path = config.get_named_queue_dir(SUBSPACE_BOOTSTRAP_FUZZER)
     os.makedirs(llm_queue_path, exist_ok=True)
-    seed_id = len(os.listdir(llm_queue_path))
-    seed_path = os.path.join(llm_queue_path, f"id:{int(seed_id):06},bid:{int(roadblock_id or 999999):06}")
+    seed_path = os.fspath(
+        config.next_queue_seed_path(
+            llm_queue_path,
+            roadblock_id=roadblock_id or 999999,
+        )
+    )
     text_result = write_direct_text_seed_and_test(
         llm_util,
         generation_messages,
@@ -2753,12 +3436,14 @@ def handle_subspace_bootstrap(target, tracer: CoverageTracer, llm_util: LLMUtil)
                 f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
             )
     if text_result.success:
+        seed_match = re.search(r'id:(\d+)', Path(text_result.candidate_path or seed_path).name)
+        generated_seed_id = int(seed_match.group(1)) if seed_match else -1
         logger.info(
             f"[{LogOp.ROADBLOCK}] Subspace bootstrap produced local hit evidence for {roadblock_key} "
             f"(family={family})"
         )
         mark_roadblock_resolved(roadblock_key, "SUBSPACE_BOOTSTRAP")
-        return True, "SUBSPACE_BOOTSTRAP", seed_id, roadblock_id
+        return True, "SUBSPACE_BOOTSTRAP", generated_seed_id, roadblock_id
 
     mark_roadblock_failed(roadblock_key, "BOOTSTRAP_FAILED", target)
     logger.info(f"[{LogOp.ROADBLOCK}] Subspace bootstrap failed for {roadblock_key}")
@@ -3178,12 +3863,19 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                     # Extract script from result
                     script = extract_script_from_flag_result(flag_result)
                     if script:
-                        LLM_TARGET_PATH = Path(output_dir) / "LLM" / "queue"
+                        LLM_TARGET_PATH = config.get_named_queue_dir(FLAG_FUZZER)
                         os.makedirs(LLM_TARGET_PATH, exist_ok=True)
                         seed_id = len(os.listdir(LLM_TARGET_PATH))
                         logger.info("testing flag-based generation script")
                         solved, script, dest_file = extract_and_test(
-                            llm_util, script, roadblock_id, seed_id, tracer, fuzzer
+                            llm_util,
+                            script,
+                            roadblock_id,
+                            seed_id,
+                            tracer,
+                            fuzzer,
+                            queue_dir=LLM_TARGET_PATH,
+                            path_prefix="flag",
                         )
                         if solved:
                             logger.info(f"[{LogOp.ROADBLOCK}] Flag-based solution produced a locally validated seed for roadblock {roadblock_id}")
@@ -3421,28 +4113,27 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
             except Exception:
                 harness_for_mode = None
         generation_mode = infer_input_generation_mode(code_slice, harness_for_mode)
+        target_class = classify_input_target(fields=fields, harness_code=harness_for_mode)
         prefer_direct_text_generation = generation_mode == "text_direct"
-        text_direct_attempted = False
         force_direct_llm_generation = should_force_direct_llm_generation(
             fields=fields,
             harness_code=harness_for_mode,
         )
 
-        if force_direct_llm_generation:
-            generation_mode = "text_direct"
-            prefer_direct_text_generation = True
-            route_preferences['allow_direct_generation'] = True
-            route_preferences['prefer_batch_mutation'] = False
-            route_preferences['prefer_input_mutation'] = False
-            route_preferences['prefer_state_guided'] = False
-            path_ab_policy['path_ab_enabled'] = False
-            path_ab_policy['path_a_enabled'] = False
-            path_ab_policy['path_b_enabled'] = False
-            path_ab_policy['auto_enabled'] = False
-            path_ab_policy['reason'] = 'xml_force_direct_llm'
+        if force_direct_llm_generation or target_class == "structured_text_parser":
+            target_class_policy = apply_target_class_route_policy(
+                target_class,
+                generation_mode=generation_mode,
+                route_preferences=route_preferences,
+                path_ab_policy=path_ab_policy,
+            )
+            generation_mode = target_class_policy['generation_mode']
+            prefer_direct_text_generation = target_class_policy['prefer_direct_text_generation']
+            route_preferences = target_class_policy['route_preferences']
+            path_ab_policy = target_class_policy['path_ab_policy']
             logger.info(
-                f"[{LogOp.ROADBLOCK}] XML/text target detected; keeping Path T-1, "
-                f"skipping Path A/B/D, and falling through to direct generation"
+                f"[{LogOp.ROADBLOCK}] Structured-text parser target detected; keeping Path T-1, "
+                f"skipping Path A/B/D, and falling through to direct text generation"
             )
 
         def attempt_text_mutation(*, terminal_on_failure: bool):
@@ -3480,72 +4171,16 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                 return False, "text mutation generated but local validation failed", -1, roadblock_id
             return None
 
-        def attempt_direct_text_generation(*, terminal_on_failure: bool):
-            nonlocal text_direct_attempted
-            text_direct_attempted = True
-            route_preferences['allow_direct_generation'] = True
-            logger.info(f"[{LogOp.ROADBLOCK}] Path T0: Trying direct text generation before heavier paths")
-
-            llm_target_path = Path(output_dir) / "LLM" / "queue"
-            os.makedirs(llm_target_path, exist_ok=True)
-            local_seed_id = len(os.listdir(llm_target_path))
-            local_harness_code = supplemental_harness_code
-            if not local_harness_code and using_fallback_slice:
-                local_harness_code = get_harness_code()
-
-            generation_messages = build_direct_text_generation_messages(
-                code_slice,
-                constraints,
-                summary,
-                fields=fields,
-                target_branch=bcode,
-                state_hints=state_hints,
-                harness_code=local_harness_code,
-                preferred_seed=seed,
-            )
-            _log_full_prompt_messages("Path T0 text_direct prompt", generation_messages)
-
-            seed_path = os.path.join(llm_target_path, f"id:{int(local_seed_id):06},bid:{int(roadblock_id):06}")
-            text_result = write_direct_text_seed_and_test(
-                llm_util,
-                generation_messages,
-                seed_path,
-                roadblock=roadblock,
-                call_chain=call_chain,
-                max_attempts=MAX_TIME,
-                no_progress_feedback="该文本输入没有带来新的覆盖。请继续生成更短、更直接、更贴近目标分支状态的文本输入。",
-                require_local_progress=True,
-            )
-            if text_result.attempt_made:
-                logger.info(f"[{LogOp.ROADBLOCK}] Path T0: Text seed written to {text_result.candidate_path}")
-                if text_result.gate_result:
-                    logger.info(
-                        f"[SEED_GATE] Path T0 text decision={text_result.gate_result.decision} "
-                        f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
-                    )
-            if text_result.success:
-                logger.info(
-                    f"[{LogOp.ROADBLOCK}] Path T0 produced a locally validated seed via direct text generation"
-                )
-                mark_roadblock_resolved(roadblock_key, "LLM_TEXT")
-                return True, "LLM_TEXT", local_seed_id, roadblock_id
-
-            if terminal_on_failure:
-                mark_roadblock_failed(roadblock_key, "NO_LOCAL_TARGET_HIT", roadblock)
-                return False, "LLM text generated but local validation failed", local_seed_id, roadblock_id
-            logger.info(
-                f"[{LogOp.ROADBLOCK}] Path T0: Direct text generation exhausted without local gain; "
-                f"continuing to heavier paths"
-            )
-            return None
-
         if prefer_direct_text_generation:
             mutation_result = attempt_text_mutation(terminal_on_failure=False)
             if mutation_result is not None:
                 return mutation_result
-            direct_result = attempt_direct_text_generation(terminal_on_failure=False)
-            if direct_result is not None:
-                return direct_result
+
+        if target_class == "structured_text_parser":
+            logger.info(
+                f"[{LogOp.ROADBLOCK}] Structured-text parser target: skipping Path A/B/D and using "
+                f"Path T-1 plus unified Path C direct generation"
+            )
 
         # ========== 路径 2 & 3: 污点分析和通用求解（级联尝试）==========
         # 新逻辑：
@@ -3554,146 +4189,120 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
         # - 路径 C: 如果路径B也失败，尝试 generate_script（原来的路径3）
         # 一旦某个路径成功就退出
 
-        if path_ab_policy['auto_enabled']:
-            logger.info(
-                f"[{LogOp.ROADBLOCK}] Project '{PROJECT}' not in ENABLE_FIELD_PARSING, "
-                f"but Path A/B auto-enabled ({path_ab_policy['reason']})")
-        elif not path_ab_policy['path_ab_enabled']:
-            logger.info(
-                f"[{LogOp.ROADBLOCK}] Project '{PROJECT}' not in ENABLE_FIELD_PARSING, "
-                f"skipping Path A/B, using Path C directly ({path_ab_policy['reason']})")
-        # 尝试路径 A: 有污点分析数据且有 ranges
-        elif path_ab_policy['path_a_enabled'] and route_preferences['prefer_input_mutation']:
-            logger.info(f"[{LogOp.ROADBLOCK}] Path A: Taint analysis with ranges - using mutate_suggest_with_taint")
-            MUT_TARGET_PATH = Path(output_dir) / "mut" / "queue"
-            os.makedirs(MUT_TARGET_PATH, exist_ok=True)
-            seed_id = len(os.listdir(MUT_TARGET_PATH))
-            orig = seed  # Use original seed for mutation
-            field = relevant_info['fields']
-            byte_range = relevant_info['ranges']
-            byte_range[0]['end'] = str(int(byte_range[0]['end']) - 1)
+        if target_class != "structured_text_parser":
+            if path_ab_policy['auto_enabled']:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Project '{PROJECT}' not in ENABLE_FIELD_PARSING, "
+                    f"but Path A/B auto-enabled ({path_ab_policy['reason']})")
+            elif not path_ab_policy['path_ab_enabled']:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Project '{PROJECT}' not in ENABLE_FIELD_PARSING, "
+                    f"skipping Path A/B, using Path C directly ({path_ab_policy['reason']})")
+            elif path_ab_policy['path_a_enabled'] and route_preferences['prefer_input_mutation']:
+                logger.info(f"[{LogOp.ROADBLOCK}] Path A: Taint analysis with ranges - using mutate_suggest_with_taint")
+                MUT_TARGET_PATH = config.get_named_queue_dir(TAINT_MUTATION_FUZZER)
+                os.makedirs(MUT_TARGET_PATH, exist_ok=True)
+                seed_id = len(os.listdir(MUT_TARGET_PATH))
+                orig = seed
+                field = relevant_info['fields']
+                byte_range = relevant_info['ranges']
+                byte_range[0]['end'] = str(int(byte_range[0]['end']) - 1)
 
-            times = 0
-            path_succeeded = False
-            while times < MAX_TIME and not path_succeeded:
-                try:
-                    logger.debug(f"[{LogOp.ROADBLOCK}] Path A: Mutation attempt {times + 1}/{MAX_TIME}")
-                    suggestions = mutate_suggest_with_taint(code_slice, constraints, field if field else "", byte_range,
-                                                            llm_util,
-                                                            pattern_json)
-                    if not suggestions['passable']:
-                        logger.debug(f"[{LogOp.ROADBLOCK}] Path A: Mutation unsatisfiable, will try other paths")
-                        break  # 路径A失败，跳出并尝试路径B
+                times = 0
+                while times < MAX_TIME:
+                    try:
+                        logger.debug(f"[{LogOp.ROADBLOCK}] Path A: Mutation attempt {times + 1}/{MAX_TIME}")
+                        suggestions = mutate_suggest_with_taint(
+                            code_slice,
+                            constraints,
+                            field if field else "",
+                            byte_range,
+                            llm_util,
+                            pattern_json,
+                        )
+                        if not suggestions['passable']:
+                            logger.debug(f"[{LogOp.ROADBLOCK}] Path A: Mutation unsatisfiable, will try other paths")
+                            break
 
-                    logger.info(f"[{LogOp.ROADBLOCK}] Path A: Starting mutation script generation")
-                    script = get_mutate_script(
-                        suggestions['input_modifications'],
-                        llm_util,
-                        fields=fields,
-                        harness_code=harness_for_mode,
-                        preferred_seed=orig,
-                    )
-                    if not script:
-                        logger.debug(f"[{LogOp.ROADBLOCK}] Path A: Script generation failed, retrying")
-                        times += 1
-                        continue
+                        logger.info(f"[{LogOp.ROADBLOCK}] Path A: Starting mutation script generation")
+                        script = get_mutate_script(
+                            suggestions['input_modifications'],
+                            llm_util,
+                            fields=fields,
+                            harness_code=harness_for_mode,
+                            preferred_seed=orig,
+                        )
+                        if not script:
+                            logger.debug(f"[{LogOp.ROADBLOCK}] Path A: Script generation failed, retrying")
+                            times += 1
+                            continue
 
-                    logger.info(f"[{LogOp.ROADBLOCK}] Path A: Starting mutation script testing")
-                    solved, script, dest_file = mutate_and_test(
-                        llm_util,
-                        script,
-                        seed_id,
-                        orig,
-                        fuzzer,
-                        tracer,
-                        roadblock=roadblock,
-                        call_chain=call_chain,
-                    )
-                    if solved:
-                        logger.info(
-                            f"[{LogOp.ROADBLOCK}] Path A produced a locally validated seed via mutate_suggest_with_taint")
-                        mark_roadblock_resolved(roadblock_key, "MUT_TAINT")
-                        return True, "MUT_TAINT", seed_id, roadblock_id
-                    else:
+                        logger.info(f"[{LogOp.ROADBLOCK}] Path A: Starting mutation script testing")
+                        solved, script, dest_file = mutate_and_test(
+                            llm_util,
+                            script,
+                            seed_id,
+                            orig,
+                            fuzzer,
+                            tracer,
+                            roadblock=roadblock,
+                            call_chain=call_chain,
+                            path_prefix="taint_mutation",
+                            queue_dir=MUT_TARGET_PATH,
+                        )
+                        if solved:
+                            logger.info(
+                                f"[{LogOp.ROADBLOCK}] Path A produced a locally validated seed via mutate_suggest_with_taint")
+                            mark_roadblock_resolved(roadblock_key, "MUT_TAINT")
+                            return True, "MUT_TAINT", seed_id, roadblock_id
                         logger.debug(
                             f"[{LogOp.ROADBLOCK}] Path A: Tested but coverage not gained, will try other paths")
-                        break  # 路径A未获得覆盖，跳出并尝试路径B
-                except ScriptNotFoundError:
-                    logger.debug(f"[{LogOp.ROADBLOCK}] Path A: ScriptNotFoundError, retrying")
-                    times += 1
-                except ScriptExtractError:
-                    logger.debug(f"[{LogOp.ROADBLOCK}] Path A: ScriptExtractError, retrying")
-                    times += 1
-                except Exception as e:
-                    logger.error(f"[{LogOp.ROADBLOCK}] Path A error: {str(e)}, will try other paths")
-                    break
+                        break
+                    except ScriptNotFoundError:
+                        logger.debug(f"[{LogOp.ROADBLOCK}] Path A: ScriptNotFoundError, retrying")
+                        times += 1
+                    except ScriptExtractError:
+                        logger.debug(f"[{LogOp.ROADBLOCK}] Path A: ScriptExtractError, retrying")
+                        times += 1
+                    except Exception as e:
+                        logger.error(f"[{LogOp.ROADBLOCK}] Path A error: {str(e)}, will try other paths")
+                        break
 
-        # ========== Path B: 状态驱动语义增强 (替代原有 mutate_suggest_without_taint) ==========
-        # 白名单项目保留原有语义增强能力；其他项目在有足够证据时允许自动尝试 parser-free Path B
-        # 方法: 代码分析 + LLM 推断 + 格式规范
-        if not path_ab_policy['path_b_enabled']:
-            logger.info(
-                f"[{LogOp.ROADBLOCK}] Path B: Skipped ({path_ab_policy['reason']})")
-        else:
-            logger.info(f"[{LogOp.ROADBLOCK}] Path B: State-driven semantic enhancement")
+            if not path_ab_policy['path_b_enabled']:
+                logger.info(f"[{LogOp.ROADBLOCK}] Path B: Skipped ({path_ab_policy['reason']})")
+            else:
+                logger.info(f"[{LogOp.ROADBLOCK}] Path B: State-driven semantic enhancement")
+                MUT_TARGET_PATH = config.get_named_queue_dir(STATE_DRIVEN_FUZZER)
+                os.makedirs(MUT_TARGET_PATH, exist_ok=True)
+                seed_id = len(os.listdir(MUT_TARGET_PATH))
 
-            MUT_TARGET_PATH = Path(output_dir) / "mut" / "queue"
-            os.makedirs(MUT_TARGET_PATH, exist_ok=True)
-            seed_id = len(os.listdir(MUT_TARGET_PATH))
-
-            # ========== 尝试状态驱动映射 ==========
-            state_mapper = None
-            # 只有当 seed 存在时才能进行状态驱动映射分析
-            if ENABLE_STATE_DRIVEN_PATH_B and seed is not None and route_preferences['prefer_state_guided']:
-                try:
-                    from state_driven_mapper import StateDrivenMapper
-                    state_mapper = StateDrivenMapper(llm_util)
-
-                    # 准备样本种子路径
-                    sample_seed_path = Path(output_dir) / 'default' / 'queue' / seed
-
-                    # 准备污点信息 (如果有)
-                    taint_info = None
-                    if relevant_info and relevant_info.get('ranges'):
-                        taint_info = {'branches': [relevant_info]}
-
-                    # 准备格式信息
-                    known_format_info = {'format_info': cached_format_info} if cached_format_info else None
-
-                    logger.info(f"[{LogOp.ROADBLOCK}] Path B: Running state-driven mapping analysis")
-
-                    # 执行状态驱动映射分析
-                    mapping_result = state_mapper.analyze(
-                        code_slice=code_slice,
-                        roadblock=roadblock,
-                        sample_seed_path=sample_seed_path,
-                        taint_info=taint_info,
-                        known_format_info=known_format_info
-                    )
-
-                    if mapping_result and mapping_result.get('state_mappings'):
-                        num_mappings = len(mapping_result['state_mappings'])
-                        logger.info(f"[{LogOp.ROADBLOCK}] Path B: State-driven mapping found {num_mappings} fields")
-
-                        # 记录映射摘要
-                        for m in mapping_result['state_mappings'][:5]:
-                            spec_marker = " [SPEC]" if m.get('from_spec') else ""
-                            logger.debug(f"[{LogOp.ROADBLOCK}]   "
-                                         f"offset {m['input_offset']}: {m['state_variable']}{spec_marker}")
-
-                        # 生成变异脚本
-                        script = state_mapper.generate_mutation_script(
-                            mappings=mapping_result,
-                            constraints=constraints,
-                            output_path=MUT_TMP_PATH / f"state_{roadblock_id}"
+                if ENABLE_STATE_DRIVEN_PATH_B and seed is not None and route_preferences['prefer_state_guided']:
+                    try:
+                        state_mapper = StateDrivenMapper(llm_util)
+                        sample_seed_path = Path(output_dir) / 'default' / 'queue' / seed
+                        taint_info = {'branches': [relevant_info]} if relevant_info and relevant_info.get('ranges') else None
+                        known_format_info = {'format_info': cached_format_info} if cached_format_info else None
+                        logger.info(f"[{LogOp.ROADBLOCK}] Path B: Running state-driven mapping analysis")
+                        mapping_result = state_mapper.analyze(
+                            code_slice=code_slice,
+                            roadblock=roadblock,
+                            sample_seed_path=sample_seed_path,
+                            taint_info=taint_info,
+                            known_format_info=known_format_info,
                         )
-
-                        if script:
-                            # 提取并测试脚本
-                            script = extract_generator(script)
-                            logger.info(f"[{LogOp.ROADBLOCK}] Path B: Testing state-driven mutation")
-
-                            try:
+                        if mapping_result and mapping_result.get('state_mappings'):
+                            logger.info(
+                                f"[{LogOp.ROADBLOCK}] Path B: State-driven mapping found "
+                                f"{len(mapping_result['state_mappings'])} fields"
+                            )
+                            script = state_mapper.generate_mutation_script(
+                                mappings=mapping_result,
+                                constraints=constraints,
+                                output_path=MUT_TMP_PATH / f"state_{roadblock_id}",
+                            )
+                            if script:
+                                script = extract_generator(script)
+                                logger.info(f"[{LogOp.ROADBLOCK}] Path B: Testing state-driven mutation")
                                 solved, script, dest_file = mutate_and_test(
                                     llm_util,
                                     script,
@@ -3703,8 +4312,9 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                                     tracer,
                                     roadblock=roadblock,
                                     call_chain=call_chain,
+                                    path_prefix="state_driven",
+                                    queue_dir=MUT_TARGET_PATH,
                                 )
-
                                 if solved:
                                     logger.info(
                                         f"[{LogOp.ROADBLOCK}] Path B produced a locally validated seed "
@@ -3712,74 +4322,31 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                                     )
                                     mark_roadblock_resolved(roadblock_key, "STATE_DRIVEN")
                                     return True, "STATE_DRIVEN", seed_id, roadblock_id
-                                else:
-                                    logger.info(
-                                        f"[{LogOp.ROADBLOCK}] Path B: State-driven tested but coverage not gained")
-                            except (ScriptNotFoundError, ScriptExtractError) as e:
-                                logger.warning(
-                                    f"[{LogOp.ROADBLOCK}] Path B: State-driven script error: {e}, will try fallback")
-                    else:
-                        logger.info(f"[{LogOp.ROADBLOCK}] Path B: State-driven mapping produced no results")
+                    except Exception as e:
+                        logger.warning(f"[{LogOp.ROADBLOCK}] Path B: State-driven mapping failed: {e}", exc_info=True)
 
-                except Exception as e:
-                    logger.warning(f"[{LogOp.ROADBLOCK}] Path B: State-driven mapping failed: {e}", exc_info=True)
-                    # 继续回退逻辑
-
-                # ========== 回退 1: 原有 Path B (Kaitai fields) ==========
                 if fields is not None and (route_preferences['input_score'] >= 0.3 or route_preferences['evidence_score'] < 0.55):
                     logger.info(f"[{LogOp.ROADBLOCK}] Path B: Fallback to Kaitai-based Path B")
-
                     times = 0
-                    path_succeeded = False
-                    while times < MAX_TIME and not path_succeeded:
+                    while times < MAX_TIME:
                         try:
-                            logger.debug(
-                                f"[{LogOp.ROADBLOCK}] Path B: Fallback mutation attempt {times + 1}/{MAX_TIME}")
-
-                            suggestions = mutate_suggest_without_taint(code_slice, fields, bcode,
-                                                                       llm_util,
-                                                                       pattern_json)
+                            logger.debug(f"[{LogOp.ROADBLOCK}] Path B: Fallback mutation attempt {times + 1}/{MAX_TIME}")
+                            suggestions = mutate_suggest_without_taint(code_slice, fields, bcode, llm_util, pattern_json)
                             if not suggestions['passable']:
                                 logger.debug(
                                     f"[{LogOp.ROADBLOCK}] Path B: Fallback mutation unsatisfiable, will try path C")
                                 break
 
-                            # ========== 利用间接推理信息调整策略 ==========
                             confidence = suggestions.get('confidence', 'medium')
                             inference_types = suggestions.get('inference_types', [])
-
-                            # 记录推理类型信息
                             has_indirect = any(it.startswith('indirect') for it in inference_types)
                             if has_indirect:
-                                logger.info(
-                                    f"[{LogOp.ROADBLOCK}] Path B: Fallback using indirect inference (types={inference_types}, confidence={confidence})")
-                                # 更新统计信息
                                 inference_stats['indirect_attempts'] += 1
-                            else:
-                                logger.info(
-                                    f"[{LogOp.ROADBLOCK}] Path B: Fallback using direct evidence (confidence={confidence})")
+                            logger.info(
+                                f"[{LogOp.ROADBLOCK}] Path B: Fallback confidence={confidence}, "
+                                f"inference_types={inference_types or ['direct']}"
+                            )
 
-                            # 根据 confidence 决定最大尝试次数
-                            if confidence == 'low':
-                                # 低置信度也继续保留探索空间，不再单次失败就切走
-                                max_attempts_for_this = MAX_TIME
-                                logger.info(
-                                    f"[{LogOp.ROADBLOCK}] Path B: Fallback low confidence mode - keeping iterative exploration enabled")
-                            elif confidence == 'medium':
-                                # 中等置信度：正常尝试
-                                max_attempts_for_this = MAX_TIME
-                            else:  # high
-                                # 高置信度：正常尝试
-                                max_attempts_for_this = MAX_TIME
-
-                            # 检查是否已超过该 confidence 级别的最大尝试次数
-                            if times >= max_attempts_for_this:
-                                logger.info(
-                                    f"[{LogOp.ROADBLOCK}] Path B: Fallback reached max attempts ({max_attempts_for_this}) for confidence={confidence}, will try path C")
-                                break
-                            # ========== 间接推理策略调整结束 ==========
-
-                            logger.info(f"[{LogOp.ROADBLOCK}] Path B: Fallback starting mutation script generation")
                             script = get_mutate_script(
                                 suggestions['input_modifications'],
                                 llm_util,
@@ -3788,7 +4355,6 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                                 preferred_seed=seed,
                             )
                             if not script:
-                                logger.debug(f"[{LogOp.ROADBLOCK}] Path B: Fallback script generation failed, retrying")
                                 times += 1
                                 continue
 
@@ -3802,179 +4368,112 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                                 tracer,
                                 roadblock=roadblock,
                                 call_chain=call_chain,
+                                path_prefix="field_mutation",
+                                queue_dir=config.get_named_queue_dir(FIELD_MUTATION_FUZZER),
                             )
                             if solved:
-                                # 成功时更新统计
                                 if has_indirect:
                                     inference_stats['indirect_successes'] += 1
                                     mode_suffix = "_INDIRECT"
-                                    logger.info(
-                                        f"[{LogOp.ROADBLOCK}] Path B fallback succeeded with INDIRECT inference (types={inference_types})")
                                 else:
                                     mode_suffix = "_DIRECT"
-                                    logger.info(f"[{LogOp.ROADBLOCK}] Path B fallback succeeded with DIRECT evidence")
                                 logger.info(
                                     f"[{LogOp.ROADBLOCK}] Path B fallback produced a locally validated seed "
-                                    f"via mutate_suggest_without_taint (confidence={confidence})")
+                                    f"via mutate_suggest_without_taint"
+                                )
                                 return True, f"FALLBACK_B{mode_suffix}", seed_id, roadblock_id
-                            else:
-                                logger.debug(
-                                    f"[{LogOp.ROADBLOCK}] Path B: Fallback tested but coverage not gained, will try path C")
-                                break
+                            break
                         except ScriptNotFoundError:
-                            logger.debug(f"[{LogOp.ROADBLOCK}] Path B: Fallback ScriptNotFoundError, retrying")
                             times += 1
                         except ScriptExtractError:
-                            logger.debug(f"[{LogOp.ROADBLOCK}] Path B: Fallback ScriptExtractError, retrying")
                             times += 1
                         except Exception as e:
                             logger.error(f"[{LogOp.ROADBLOCK}] Path B: Fallback error: {str(e)}, will try path C")
                             break
 
-        # 如果到这里还没成功，继续到 Path C (原有逻辑)
-        logger.info(f"[{LogOp.ROADBLOCK}] Path B exhausted, proceeding to path C")
+            logger.info(f"[{LogOp.ROADBLOCK}] Path B exhausted, proceeding to path C")
 
-        # 尝试路径 D: 批量变异（三步突破：branch_analysis -> mutator_rule_gen -> mutate_batch_script_gen）
-        logger.info(f"[{LogOp.ROADBLOCK}] Path D: Trying batch mutation process (three-step breakthrough)")
-        if PROJECT not in ENABLE_FIELD_PARSING:
-            logger.info(
-                f"[{LogOp.ROADBLOCK}] Path D: Project '{PROJECT}' has no structure-parsing enhancement; "
-                f"continuing in parser-free mode")
-        try:
-            if not route_preferences['prefer_batch_mutation']:
-                raise RuntimeError("batch mutation deprioritized by route scoring")
-            # 获取target branch和status
-            target_branch = bcode
-            target_side = "true" if roadblock['status'] else "false"
+            logger.info(f"[{LogOp.ROADBLOCK}] Path D: Trying batch mutation process (three-step breakthrough)")
+            if PROJECT not in ENABLE_FIELD_PARSING:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Path D: Project '{PROJECT}' has no structure-parsing enhancement; "
+                    f"continuing in parser-free mode")
+            try:
+                if route_preferences['prefer_batch_mutation']:
+                    target_branch = bcode
+                    target_side = "true" if roadblock['status'] else "false"
+                    input_source = identify_input_source(code_slice)
+                    logger.info(f"[{LogOp.ROADBLOCK}] Path D: Identified input source: {input_source}")
 
-            # 识别input_source（可复用Path A/B的数据）
-            input_source = identify_input_source(code_slice)
-            logger.info(f"[{LogOp.ROADBLOCK}] Path D: Identified input source: {input_source}")
+                    branch_analysis_result = run_branch_analysis(code_slice, target_branch, input_source, llm_util)
+                    if branch_analysis_result and branch_analysis_result.get('passable', False):
+                        mutator_rule = run_mutator_rule_gen(branch_analysis_result, target_side, llm_util)
+                        if mutator_rule and mutator_rule.get('edits'):
+                            seed_dir = os.path.join(output_dir, 'default', 'queue')
+                            branch_id = mutator_rule.get("branch_id") or "llm_mut"
+                            batch_fuzzer_name = f"batch_mutation_{config.sanitize_fs_component(str(branch_id))}"
+                            branch_work_dir = config.get_branch_output_dir(branch_id)
+                            batch_out_dir = config.get_named_queue_dir(batch_fuzzer_name)
+                            manifest_dir = branch_work_dir
+                            filtered_seed_dir = config.get_batch_mutation_filtered_seed_dir(branch_id)
+                            filtered_seed_dir, filtered_seed_count = create_batch_mutation_seed_dir(seed_dir, filtered_seed_dir)
+                            logger.info(
+                                f"[{LogOp.ROADBLOCK}] Path D: Filtered batch mutation inputs to "
+                                f"{filtered_seed_count} id-prefixed files from default queue")
+                            Path(batch_out_dir).mkdir(parents=True, exist_ok=True)
+                            Path(manifest_dir).mkdir(parents=True, exist_ok=True)
 
-            # Step 1: Branch Analysis
-            logger.info(f"[{LogOp.ROADBLOCK}] Path D: Step 1 - Running branch_analysis")
-            branch_analysis_result = run_branch_analysis(code_slice, target_branch, input_source, llm_util)
-            if not branch_analysis_result or not branch_analysis_result.get('passable', False):
-                logger.warning(
-                    f"[{LogOp.ROADBLOCK}] Path D: Step 1 - Branch analysis failed or not passable, will try path C")
-            else:
-                logger.info(f"[{LogOp.ROADBLOCK}] Path D: Step 1 - Branch analysis completed, passable=True")
-                logger.debug(
-                    f"[{LogOp.ROADBLOCK}] Path D: Branch type: {branch_analysis_result.get('branch_type', 'unknown')}")
+                            batch_script = run_mutate_batch_script_gen(
+                                mutator_rule,
+                                filtered_seed_dir,
+                                os.fspath(batch_out_dir),
+                                os.fspath(manifest_dir),
+                                llm_util,
+                            )
+                            if batch_script:
+                                script_path = config.get_batch_mutation_script_path(branch_id)
+                                script_path.parent.mkdir(parents=True, exist_ok=True)
+                                with open(script_path, 'w') as f:
+                                    f.write(batch_script)
 
-                # Step 2: Mutator Rule Generation
-                logger.info(f"[{LogOp.ROADBLOCK}] Path D: Step 2 - Running mutator_rule_gen")
-                mutator_rule = run_mutator_rule_gen(branch_analysis_result, target_side, llm_util)
-                if not mutator_rule or not mutator_rule.get('edits'):
-                    logger.warning(
-                        f"[{LogOp.ROADBLOCK}] Path D: Step 2 - Mutator rule generation failed, will try path C")
-                else:
-                    logger.info(
-                        f"[{LogOp.ROADBLOCK}] Path D: Step 2 - Mutator rule generated with {len(mutator_rule['edits'])} edit(s)")
-                    logger.debug(f"[{LogOp.ROADBLOCK}] Path D: Min size: {mutator_rule.get('min_size', 0)}")
-
-                    # Step 3: Batch Mutation Script Generation
-                    logger.info(f"[{LogOp.ROADBLOCK}] Path D: Step 3 - Running mutate_batch_script_gen")
-                    seed_dir = os.path.join(output_dir, 'default', 'queue')
-                    branch_id = mutator_rule.get("branch_id") or "llm_mut"
-                    branch_work_dir = config.get_branch_output_dir(branch_id)
-                    batch_out_dir = config.get_branch_queue_dir(branch_id)
-                    manifest_dir = branch_work_dir
-                    filtered_seed_dir = config.get_batch_mutation_filtered_seed_dir(branch_id)
-                    filtered_seed_dir, filtered_seed_count = create_batch_mutation_seed_dir(seed_dir, filtered_seed_dir)
-                    logger.info(
-                        f"[{LogOp.ROADBLOCK}] Path D: Filtered batch mutation inputs to "
-                        f"{filtered_seed_count} id-prefixed files from default queue")
-                    Path(batch_out_dir).mkdir(parents=True, exist_ok=True)
-                    Path(manifest_dir).mkdir(parents=True, exist_ok=True)
-
-                    batch_script = run_mutate_batch_script_gen(
-                        mutator_rule,
-                        filtered_seed_dir,
-                        os.fspath(batch_out_dir),
-                        os.fspath(manifest_dir),
-                        llm_util,
-                    )
-                    if not batch_script:
-                        shutil.rmtree(filtered_seed_dir, ignore_errors=True)
-                        logger.warning(
-                            f"[{LogOp.ROADBLOCK}] Path D: Step 3 - Batch script generation failed, will try path C")
-                    else:
-                        # 保存批量变异脚本到PROJECT目录下（固定名称，便于管理）
-                        script_path = config.get_batch_mutation_script_path(branch_id)
-                        script_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(script_path, 'w') as f:
-                            f.write(batch_script)
-
-                        logger.info(f"[{LogOp.ROADBLOCK}] Path D: Step 3 - Executing batch mutation script")
-                        result = subprocess.run(
-                            ['python3', os.fspath(script_path), filtered_seed_dir, os.fspath(batch_out_dir), os.fspath(manifest_dir)],
-                            capture_output=True,
-                            text=True,
-                            timeout=300
-                        )
-                        shutil.rmtree(filtered_seed_dir, ignore_errors=True)
-
-                        if result.returncode != 0:
-                            logger.error(
-                                f"[{LogOp.ROADBLOCK}] Path D: Step 3 - Script execution failed: {result.stderr}")
-                        else:
-                            logger.info(f"[{LogOp.ROADBLOCK}] Path D: Step 3 - Batch mutation completed")
-                            logger.debug(
-                                f"[{LogOp.ROADBLOCK}] Path D: Output: {result.stdout[:500] if result.stdout else ''}")
-
-                            # Count and test generated files
-                            if os.path.exists(batch_out_dir):
-                                mutated_files = [f for f in os.listdir(batch_out_dir) if not f.startswith('.')]
-                                logger.info(
-                                    f"[{LogOp.ROADBLOCK}] Path D: Generated {len(mutated_files)} mutated seeds")
-
-                                sampled_files = sorted(mutated_files)[: min(8, len(mutated_files))]
-                                coverage_gained = False
-                                test_seed_id = -1
-                                accepted_sample_count = 0
-                                for test_file in sampled_files:
-                                    sample_path = os.path.join(batch_out_dir, test_file)
-                                    gate_result, eval_result = gate_seed(sample_path, roadblock=roadblock, call_chain=call_chain)
-                                    logger.info(
-                                        f"[SEED_GATE] Path D sample={test_file} decision={gate_result.decision} "
-                                        f"accepted={gate_result.accepted} reason={gate_result.reason}"
+                                result = subprocess.run(
+                                    ['python3', os.fspath(script_path), filtered_seed_dir, os.fspath(batch_out_dir), os.fspath(manifest_dir)],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=300,
+                                )
+                                shutil.rmtree(filtered_seed_dir, ignore_errors=True)
+                                if result.returncode == 0 and os.path.exists(batch_out_dir):
+                                    moved_paths = _promote_prefixed_batch_outputs(
+                                        batch_out_dir,
+                                        path_prefix=batch_fuzzer_name,
+                                        queue_dir=batch_out_dir,
                                     )
-                                    if not gate_result.accepted:
-                                        continue
-                                    accepted_sample_count += 1
-                                    match = re.search(r'id:(\d+)', test_file)
-                                    if match:
-                                        test_seed_id = int(match.group(1))
-                                        gained = _seed_eval_indicates_local_progress(eval_result)
-                                        if gained:
-                                            coverage_gained = True
+                                    sampled_paths = sorted(moved_paths)[: min(8, len(moved_paths))]
+                                    for sample_path in sampled_paths:
+                                        test_file = Path(sample_path).name
+                                        gate_result, eval_result = gate_seed(sample_path, roadblock=roadblock, call_chain=call_chain)
+                                        logger.info(
+                                            f"[SEED_GATE] Path D sample={test_file} decision={gate_result.decision} "
+                                            f"accepted={gate_result.accepted} reason={gate_result.reason}"
+                                        )
+                                        if gate_result.accepted and _seed_eval_indicates_local_progress(eval_result):
+                                            test_match = re.search(r'id:(\d+)', test_file)
+                                            test_seed_id = int(test_match.group(1)) if test_match else -1
                                             logger.info(
-                                                f"[{LogOp.ROADBLOCK}] Path D: Sampled mutated seed produced local hit evidence: {test_file}")
-                                            break
+                                                f"[{LogOp.ROADBLOCK}] Path D produced a locally validated seed via batch mutation")
+                                            mark_roadblock_resolved(roadblock_key, "BATCH_MUTATE")
+                                            return True, "BATCH_MUTATE", test_seed_id, roadblock_id
+            except subprocess.TimeoutExpired:
+                logger.warning(f"[{LogOp.ROADBLOCK}] Path D: Script execution timeout, will try path C")
+            except Exception as e:
+                logger.warning(f"[{LogOp.ROADBLOCK}] Path D error: {str(e)}, will try path C")
 
-                                if accepted_sample_count == 0:
-                                    logger.info(f"[{LogOp.ROADBLOCK}] Path D: No sampled mutated seeds passed SeedGate")
-
-                                if coverage_gained:
-                                    logger.info(
-                                        f"[{LogOp.ROADBLOCK}] Path D produced a locally validated seed via batch mutation")
-                                    mark_roadblock_resolved(roadblock_key, "BATCH_MUTATE")
-                                    return True, "BATCH_MUTATE", test_seed_id, roadblock_id
-
-        except subprocess.TimeoutExpired:
-            logger.warning(f"[{LogOp.ROADBLOCK}] Path D: Script execution timeout, will try path C")
-        except Exception as e:
-            logger.warning(f"[{LogOp.ROADBLOCK}] Path D error: {str(e)}, will try path C")
-
-        # 尝试路径 C: generate_script（原来的路径3）
-        # 即使前面的判定更偏向 state-guided，只要 Path D 已经失败，仍允许用 Path C 做最后兜底。
-        # Path D 和 Path C 的能力边界并不完全相同：批量定向变异失败，不代表直接生成一定无效。
-        if state_guided_only or not should_generate_input:
-            logger.warning(
-                f"[{LogOp.ROADBLOCK}] State-guided workflow preferred for roadblock {roadblock_id}, "
-                f"but Path D did not resolve it; falling back to direct generate_script"
-            )
+            if state_guided_only or not should_generate_input:
+                logger.warning(
+                    f"[{LogOp.ROADBLOCK}] State-guided workflow preferred for roadblock {roadblock_id}, "
+                    f"but Path D did not resolve it; falling back to direct generate_script"
+                )
 
         if not route_preferences['allow_direct_generation']:
             logger.warning(
@@ -3987,30 +4486,12 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
         logger.info(
             f"[{LogOp.ROADBLOCK}] Path C: Trying "
             f"{'direct text generation' if generation_mode == 'text_direct' else 'script generation'}")
-        if generation_mode == "text_direct" and text_direct_attempted:
-            logger.info(
-                f"[{LogOp.ROADBLOCK}] Path C: Skipping duplicate direct text generation because Path T0 already exhausted"
-            )
-            mark_roadblock_failed(roadblock_key, "ALL_PATHS_FAILED", roadblock)
-            return False, "", -1, roadblock_id
-        LLM_TARGET_PATH = Path(output_dir) / "LLM" / "queue"
-        os.makedirs(LLM_TARGET_PATH, exist_ok=True)
-        seed_id = len(os.listdir(LLM_TARGET_PATH))
-        # if test:
-        #     pass_roadblock[roadblock_key] = {"roadblock": roadblock, "timestamp": time.time()}
-        #     pass_roadblock_id[roadblock_key] = time.time()
-        #     return False, "skip while test", -1, roadblock_id
-
-        # 记录可用的补充信息
         if fields:
             logger.info(
                 f"[{LogOp.ROADBLOCK}] Path C: Using semantic fields info ({len(fields.get('fields', []))} fields)")
         if bcode:
             logger.info(f"[{LogOp.ROADBLOCK}] Path C: Using target branch code")
 
-        logger.info(f"[{LogOp.ROADBLOCK}] Path C: Starting Python script generation (max {MAX_TIME} attempts)")
-
-        # ========== NEW: For fallback slice mode, get harness code ==========
         harness_code = supplemental_harness_code
         if harness_code:
             logger.info(f"[{LogOp.ROADBLOCK}] Path C: Reusing supplemental harness code ({len(harness_code)} chars)")
@@ -4021,141 +4502,65 @@ def handle_roadblock(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
                 logger.info(f"[{LogOp.ROADBLOCK}] Harness code extracted: {len(harness_code)} chars")
             else:
                 logger.warning(f"[{LogOp.ROADBLOCK}] Failed to extract harness code, proceeding without it")
-        # ========== End harness code extraction ==========
-
-        if generation_mode == "text_direct":
-            generation_messages = build_direct_text_generation_messages(
-                code_slice,
-                constraints,
-                summary,
-                fields=fields,
-                target_branch=bcode,
-                state_hints=state_hints,
-                harness_code=harness_code,
-                preferred_seed=seed,
-            )
-        else:
-            generation_messages = build_generate_script_messages(
-                code_slice,
-                constraints,
-                summary,
-                fields=fields,
-                target_branch=bcode,
-                state_hints=state_hints,
-                harness_code=harness_code,
-                preferred_seed=seed,
-            )
+        attempt_ctx = SimplifiedAttemptContext(
+            roadblock=roadblock,
+            roadblock_id=roadblock_id,
+            roadblock_key=roadblock_key,
+            tracer=tracer,
+            llm_util=llm_util,
+            call_chain=call_chain,
+            code_slice=code_slice,
+            constraints=constraints,
+            summary=summary,
+            bcode=bcode,
+            seed=seed,
+            orig=orig,
+            fields=fields,
+            relevant_info=relevant_info,
+            harness_for_mode=harness_code,
+            state_hints=state_hints,
+            generation_mode=generation_mode,
+        )
+        plan = plan_direct_generation(
+            llm_util=llm_util,
+            code_slice=code_slice,
+            constraints=constraints,
+            summary=summary,
+            target_branch=bcode,
+            fields=fields,
+            state_hints=state_hints,
+            harness_code=harness_code,
+            preferred_seed=seed,
+            inferred_mode=generation_mode,
+        )
         logger.info(
             f"[{LogOp.ROADBLOCK}] Final code_slice for Path C "
-            f"(mode={generation_mode}, chars={len(code_slice) if code_slice else 0})\n"
+            f"(planner_mode={plan.generation_mode}, chars={len(code_slice) if code_slice else 0})\n"
             f"{code_slice or ''}"
         )
-        _log_full_prompt_messages(f"Path C {generation_mode} prompt", generation_messages)
-        times = 0
-        while times < MAX_TIME:
-            try:
-                logger.debug(
-                    f"[{LogOp.ROADBLOCK}] Path C: "
-                    f"{'Text' if generation_mode == 'text_direct' else 'Script'} generation attempt "
-                    f"{times + 1}/{MAX_TIME}")
-                if generation_mode == "text_direct":
-                    seed_path = os.path.join(LLM_TARGET_PATH, f"id:{int(seed_id):06},bid:{int(roadblock_id):06}")
-                    text_result = write_direct_text_seed_and_test(
-                        llm_util,
-                        generation_messages,
-                        seed_path,
-                        roadblock=roadblock,
-                        call_chain=call_chain,
-                        max_attempts=MAX_TIME,
-                        no_progress_feedback="该文本输入没有带来新的覆盖。请继续生成更短、更直接、更贴近目标分支状态的文本输入。",
-                        require_local_progress=True,
-                    )
-                    if text_result.attempt_made:
-                        logger.info(f"[{LogOp.ROADBLOCK}] Path C: Text seed written to {text_result.candidate_path}")
-                        if text_result.gate_result:
-                            logger.info(
-                                f"[SEED_GATE] Path C text decision={text_result.gate_result.decision} "
-                                f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
-                            )
-                    if text_result.success:
-                        logger.info(
-                            f"[{LogOp.ROADBLOCK}] Path C produced a locally validated seed via direct text generation")
-                        mark_roadblock_resolved(roadblock_key, "LLM_TEXT")
-                        return True, "LLM_TEXT", seed_id, roadblock_id
+        result = execute_direct_generation_plan(
+            attempt_ctx,
+            plan,
+            queue_dir=config.get_named_queue_dir(DIRECT_GENERATION_FUZZER),
+            defer_effectiveness_to_outer_check=False,
+            log_prefix="Path C",
+        )
+        if result.gate_result:
+            logger.info(
+                f"[SEED_GATE] Path C {result.mode} decision={result.gate_result.decision} "
+                f"accepted={result.gate_result.accepted} reason={result.gate_result.reason}"
+            )
+        if result.success:
+            resolved_mode = "LLM_TEXT" if result.mode == "text_direct" else "LLM"
+            logger.info(
+                f"[{LogOp.ROADBLOCK}] Path C produced a locally validated seed via {result.mode}"
+            )
+            mark_roadblock_resolved(roadblock_key, resolved_mode)
+            return True, resolved_mode, result.seed_id, roadblock_id
 
-                    fail_mode = (
-                        text_result.eval_result.rejection_reason
-                        if text_result.eval_result is not None
-                        else "NO_NEW_EDGES"
-                    ) or "NO_NEW_EDGES"
-                    mark_roadblock_failed(roadblock_key, fail_mode, roadblock)
-                    logger.debug(f"[{LogOp.ROADBLOCK}] Path C: Generated text but local validation did not accept it")
-                    return False, "LLM text generated but local validation failed", seed_id, roadblock_id
-
-                resp = llm_util.get_response(generation_messages)
-                match = extract_json_with_fallback(resp, pattern_json)
-                if not match:
-                    logger.debug(f"[{LogOp.LLM}] Path C: JSON pattern not found, requesting regeneration")
-                    append_llm_retry_feedback(
-                        generation_messages,
-                        resp,
-                        "返回内容中没有可解析的 JSON。请只返回一个 JSON object，并且必须包含字符串字段 generation_script。"
-                    )
-                    times += 1
-                    continue
-                try:
-                    res = json.loads(match.group(1).strip())
-                except json.JSONDecodeError as exc:
-                    logger.warning(f"[{LogOp.LLM}] Path C: JSON parse failed: {exc}; requesting regeneration")
-                    append_llm_retry_feedback(
-                        generation_messages,
-                        resp,
-                        f"JSON 解析失败：{exc}。请只返回一个合法的 JSON object，并包含字符串字段 generation_script。"
-                    )
-                    times += 1
-                    continue
-                schema_error = validate_generation_result(res)
-                if schema_error:
-                    logger.warning(f"[{LogOp.LLM}] Path C: Invalid generation schema: {schema_error}; requesting regeneration")
-                    append_llm_retry_feedback(
-                        generation_messages,
-                        resp,
-                        f"返回结构不符合要求：{schema_error}。请只返回一个 JSON object，并且 generation_script 必须是 Python 脚本字符串。"
-                    )
-                    times += 1
-                    continue
-                res['library'] = PROJECT
-                script = res['generation_script']
-                if script:
-                    logger.info(f"[{LogOp.ROADBLOCK}] Path C: Starting generated script testing")
-                    solved, script, dest_file = extract_and_test(llm_util, script, roadblock_id, seed_id, tracer,
-                                                                 fuzzer, roadblock=roadblock, call_chain=call_chain,
-                                                                 code_slice=code_slice)
-                    if solved:
-                        logger.info(
-                            f"[{LogOp.ROADBLOCK}] Path C produced a locally validated seed via generate_script")
-                        mark_roadblock_resolved(roadblock_key, "LLM")
-                        return True, "LLM", seed_id, roadblock_id
-                    else:
-                        mark_roadblock_failed(roadblock_key, "NO_LOCAL_TARGET_HIT", roadblock)
-                        logger.debug(f"[{LogOp.ROADBLOCK}] Path C: Generated but local validation did not pass")
-                        return False, "LLM generated but local validation failed", seed_id, roadblock_id
-                else:
-                    mark_roadblock_failed(roadblock_key, "PATH_C_NO_SCRIPT", roadblock)
-                    return False, "", -1, roadblock_id
-            except ScriptNotFoundError:
-                logger.debug(f"[{LogOp.ROADBLOCK}] Path C: ScriptNotFoundError, retrying")
-                times += 1
-            except ScriptExtractError:
-                logger.debug(f"[{LogOp.ROADBLOCK}] Path C: ScriptExtractError, retrying")
-                times += 1
-            except (KeyError, TypeError) as e:
-                logger.debug(
-                    f"[{LogOp.ROADBLOCK}] Path C: Response shape error {e} - retrying")
-                times += 1
-
-        mark_roadblock_failed(roadblock_key, "ALL_PATHS_FAILED", roadblock)
-        return False, "", -1, roadblock_id
+        fail_mode = result.failure_reason or "NO_LOCAL_TARGET_HIT"
+        mark_roadblock_failed(roadblock_key, fail_mode, roadblock)
+        return False, fail_mode, result.seed_id, roadblock_id
 
     mark_roadblock_failed(roadblock_key, "NO_ROADBLOCKS_REMAIN", roadblock)
     return False, "No roadblocks remain", -1, roadblock_id
@@ -4194,6 +4599,7 @@ def infer_input_generation_mode(code_context: str = "", harness_code: str | None
         context_parts.append(harness_code)
 
     joined = "\n".join(context_parts).lower()
+    combined_target_class = classify_input_target(harness_code=harness_code)
 
     text_format_keywords = (
         'xml', 'json', 'yaml', 'toml', 'ini', 'csv', 'sql', 'html', 'javascript',
@@ -4219,6 +4625,12 @@ def infer_input_generation_mode(code_context: str = "", harness_code: str | None
 
     if any(keyword in joined for keyword in binary_format_keywords):
         return "binary_script"
+
+    # Structured text parsers like xmllint may expose byte-buffer fuzz wrappers in
+    # the harness while still fundamentally consuming text documents. Preserve the
+    # direct-text path so grammar-aware generators are not short-circuited.
+    if combined_target_class == "structured_text_parser":
+        return "text_direct"
 
     if any(signal in joined for signal in wrapper_binary_signals) and any(
         keyword in joined for keyword in ('json', 'xml', 'text', 'parser', 'yyparse', 'token')
@@ -4301,6 +4713,7 @@ def write_direct_text_seed_and_test(
     empty_payload_feedback: str | None = None,
     no_progress_feedback: str | None = None,
     require_local_progress: bool = False,
+    skip_seed_gate: bool = False,
 ) -> DirectTextSeedResult:
     try:
         check_fuzzer_alive()
@@ -4338,6 +4751,16 @@ def write_direct_text_seed_and_test(
             if attempt < max_attempts - 1:
                 append_llm_retry_feedback(generation_messages, resp, empty_payload_feedback)
             continue
+
+        if skip_seed_gate:
+            return DirectTextSeedResult(
+                success=True,
+                attempt_made=True,
+                candidate_path=seed_path,
+                gate_result=None,
+                eval_result=None,
+                response_text=resp,
+            )
 
         gate_result, eval_result = gate_seed(seed_path, roadblock=roadblock, call_chain=call_chain)
         candidate_path = gate_result.audit_path or seed_path
@@ -4387,6 +4810,260 @@ def write_direct_text_seed_and_test(
     )
 
 
+def _seed_id_from_path(seed_path: str | None) -> int:
+    if not seed_path:
+        return -1
+    match = re.search(r"id:(\d+)", Path(seed_path).name)
+    return int(match.group(1)) if match else -1
+
+
+def _normalize_direct_generation_mode(mode: str | None, inferred_mode: str) -> str:
+    candidate = (mode or "").strip().lower()
+    if candidate in {"text_direct", "text", "direct_text"}:
+        return "text_direct"
+    if candidate in {"generate_script", "script", "binary_script", "python_script"}:
+        return "generate_script"
+    return "text_direct" if inferred_mode == "text_direct" else "generate_script"
+
+
+def plan_direct_generation(
+    *,
+    llm_util: LLMUtil,
+    code_slice: str,
+    constraints,
+    summary: str,
+    target_branch: str,
+    fields=None,
+    state_hints=None,
+    harness_code: str | None = None,
+    preferred_seed: str | None = None,
+    inferred_mode: str,
+    max_retries: int = 3,
+) -> DirectGenerationPlan:
+    constraint_text = constraints if isinstance(constraints, str) else json.dumps(constraints, ensure_ascii=False)
+    planner_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a fuzz seed generation planner. "
+                "Choose exactly one generation_mode: text_direct or generate_script. "
+                "Use text_direct only when the final answer should be raw seed text written directly into the seed file. "
+                "Use generate_script when the model should output a Python script that writes the seed."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"<project>{PROJECT}</project>\n"
+                f"<inferred_mode>{inferred_mode}</inferred_mode>\n"
+                f"<target_branch>{target_branch}</target_branch>\n"
+                f"<preferred_seed>{preferred_seed or '(none)'}</preferred_seed>\n"
+                f"<has_fields>{bool(fields)}</has_fields>\n"
+                f"<has_state_hints>{bool(state_hints)}</has_state_hints>\n"
+                f"<harness_present>{bool(harness_code)}</harness_present>\n"
+                f"<summary>{summary[:1200]}</summary>\n"
+                f"<constraints>{constraint_text[:1800]}</constraints>\n"
+                f"<code_slice>{code_slice[:3000]}</code_slice>\n"
+                "Return one JSON object with keys: generation_mode, strategy, reason."
+            ),
+        },
+    ]
+    pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
+    planner_result = None
+    for attempt in range(max_retries):
+        resp = llm_util.get_response(planner_messages)
+        match = extract_json_with_fallback(resp, pattern_json)
+        if not match:
+            if attempt < max_retries - 1:
+                append_llm_retry_feedback(
+                    planner_messages,
+                    resp,
+                    "请只返回一个 JSON object，并且必须包含 generation_mode、strategy、reason。",
+                )
+            continue
+        try:
+            planner_result = json.loads(match.group(1).strip())
+        except json.JSONDecodeError as exc:
+            if attempt < max_retries - 1:
+                append_llm_retry_feedback(
+                    planner_messages,
+                    resp,
+                    f"JSON 解析失败：{exc}。请只返回一个合法的 JSON object。",
+                )
+            continue
+        if not isinstance(planner_result, dict):
+            planner_result = None
+            continue
+        break
+
+    generation_mode = _normalize_direct_generation_mode(
+        planner_result.get("generation_mode") if isinstance(planner_result, dict) else None,
+        inferred_mode,
+    )
+    return DirectGenerationPlan(
+        generation_mode=generation_mode,
+        strategy=str((planner_result or {}).get("strategy") or generation_mode),
+        reason=str((planner_result or {}).get("reason") or f"fallback_to_{generation_mode}"),
+        inferred_mode=inferred_mode,
+        planner_result=planner_result,
+    )
+
+
+def _append_direct_generation_plan_message(
+    messages: list[dict[str, str]],
+    plan: DirectGenerationPlan,
+) -> list[dict[str, str]]:
+    enriched = list(messages)
+    enriched.append(
+        {
+            "role": "user",
+            "content": (
+                "<generation_plan>\n"
+                f"mode: {plan.generation_mode}\n"
+                f"strategy: {plan.strategy}\n"
+                f"reason: {plan.reason}\n"
+                f"inferred_mode: {plan.inferred_mode}\n"
+                "</generation_plan>\n"
+                "Follow this plan strictly when generating the seed."
+            ),
+        }
+    )
+    return enriched
+
+
+def execute_direct_generation_plan(
+    ctx: SimplifiedAttemptContext,
+    plan: DirectGenerationPlan,
+    *,
+    queue_dir: str | Path | None = None,
+    skip_seed_gate: bool = False,
+    defer_effectiveness_to_outer_check: bool = False,
+    log_prefix: str = "Path C",
+) -> DirectGenerationExecutionResult:
+    llm_target_path = Path(queue_dir) if queue_dir is not None else config.get_named_queue_dir(DIRECT_GENERATION_FUZZER)
+    llm_target_path.mkdir(parents=True, exist_ok=True)
+    seed_id = len(os.listdir(llm_target_path))
+
+    if plan.generation_mode == "text_direct":
+        generation_messages = _append_direct_generation_plan_message(
+            build_direct_text_generation_messages(
+                ctx.code_slice,
+                ctx.constraints,
+                ctx.summary,
+                fields=ctx.fields,
+                target_branch=ctx.bcode,
+                state_hints=ctx.state_hints,
+                harness_code=ctx.harness_for_mode,
+                preferred_seed=ctx.seed,
+            ),
+            plan,
+        )
+        _log_full_prompt_messages(f"{log_prefix} direct_generation text prompt", generation_messages)
+        seed_path = os.fspath(config.next_queue_seed_path(llm_target_path, roadblock_id=ctx.roadblock_id))
+        text_result = write_direct_text_seed_and_test(
+            ctx.llm_util,
+            generation_messages,
+            seed_path,
+            roadblock=ctx.roadblock,
+            call_chain=ctx.call_chain,
+            max_attempts=MAX_TIME,
+            no_progress_feedback="该文本输入没有带来新的覆盖。请继续生成更短、更直接、更贴近目标分支状态的文本输入。",
+            require_local_progress=not defer_effectiveness_to_outer_check and not skip_seed_gate,
+            skip_seed_gate=skip_seed_gate,
+        )
+        return DirectGenerationExecutionResult(
+            attempted=text_result.attempt_made,
+            success=text_result.attempt_made if defer_effectiveness_to_outer_check else text_result.success,
+            mode="text_direct",
+            seed_id=_seed_id_from_path(text_result.candidate_path or seed_path),
+            candidate_path=text_result.candidate_path or seed_path,
+            failure_reason=text_result.failure_reason,
+            gate_result=text_result.gate_result,
+            eval_result=text_result.eval_result,
+        )
+
+    generation_messages = _append_direct_generation_plan_message(
+        build_generate_script_messages(
+            ctx.code_slice,
+            ctx.constraints,
+            ctx.summary,
+            fields=ctx.fields,
+            target_branch=ctx.bcode,
+            state_hints=ctx.state_hints,
+            harness_code=ctx.harness_for_mode,
+            preferred_seed=ctx.seed,
+        ),
+        plan,
+    )
+    _log_full_prompt_messages(f"{log_prefix} direct_generation script prompt", generation_messages)
+    pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
+    times = 0
+    while times < MAX_TIME:
+        resp = ctx.llm_util.get_response(generation_messages)
+        match = extract_json_with_fallback(resp, pattern_json)
+        if not match:
+            append_llm_retry_feedback(
+                generation_messages,
+                resp,
+                "返回内容中没有可解析的 JSON。请只返回一个 JSON object，并且必须包含字符串字段 generation_script。",
+            )
+            times += 1
+            continue
+        try:
+            res = json.loads(match.group(1).strip())
+        except json.JSONDecodeError as exc:
+            append_llm_retry_feedback(
+                generation_messages,
+                resp,
+                f"JSON 解析失败：{exc}。请只返回一个合法的 JSON object，并包含字符串字段 generation_script。",
+            )
+            times += 1
+            continue
+        schema_error = validate_generation_result(res)
+        if schema_error:
+            append_llm_retry_feedback(
+                generation_messages,
+                resp,
+                f"返回结构不符合要求：{schema_error}。请只返回一个 JSON object，并且 generation_script 必须是 Python 脚本字符串。",
+            )
+            times += 1
+            continue
+        script = res.get("generation_script")
+        if not script:
+            return DirectGenerationExecutionResult(
+                attempted=False,
+                success=False,
+                mode="generate_script",
+                failure_reason="EMPTY_SCRIPT",
+            )
+        solved, _, dest_file = extract_and_test(
+            ctx.llm_util,
+            script,
+            ctx.roadblock_id,
+            seed_id,
+            ctx.tracer,
+            fuzzer,
+            roadblock=ctx.roadblock,
+            call_chain=ctx.call_chain,
+            code_slice=ctx.code_slice,
+            queue_dir=llm_target_path,
+        )
+        attempted = solved or bool(dest_file)
+        return DirectGenerationExecutionResult(
+            attempted=attempted,
+            success=attempted if defer_effectiveness_to_outer_check else solved,
+            mode="generate_script",
+            seed_id=_seed_id_from_path(dest_file),
+            candidate_path=dest_file,
+        )
+    return DirectGenerationExecutionResult(
+        attempted=False,
+        success=False,
+        mode="generate_script",
+        failure_reason="GENERATION_RETRIES_EXHAUSTED",
+    )
+
+
 def _looks_textual_semantic_input(fields=None, harness_code: str | None = None) -> bool:
     text_keywords = {"xml", "json", "yaml", "toml", "ini", "csv", "sql", "javascript", "text", "source"}
     if cached_format_info:
@@ -4415,16 +5092,7 @@ def _looks_textual_semantic_input(fields=None, harness_code: str | None = None) 
 
 
 def should_force_direct_llm_generation(fields=None, harness_code: str | None = None) -> bool:
-    if PROJECT == "xmllint":
-        return True
-    if not _looks_textual_semantic_input(fields=fields, harness_code=harness_code):
-        return False
-    if cached_format_info:
-        format_name = str(cached_format_info.get("format_name", "")).lower()
-        format_desc = str(cached_format_info.get("format_description", "")).lower()
-        if "xml" in format_name or "xml" in format_desc:
-            return True
-    return False
+    return classify_input_target(fields=fields, harness_code=harness_code) == "structured_text_parser"
 
 
 def build_input_type_contract(generation_mode: str) -> str:
@@ -4821,63 +5489,6 @@ def build_parser_rich_generation_bias(
     return "\n".join(lines) + "\n"
 
 
-def extract_function_context(target, context_lines=30):
-    """
-    提取函数上下文（LLVM切片失败时的回退策略）：
-    1. 函数签名在首位
-    2. zero-branch 为中心的 ±30 行上下文
-    3. 上下文的最前与最后边界为函数体本身的上下界
-    """
-    func = None
-    for f in funcs:
-        if f['name'] == target['function']:
-            func = f
-            break
-
-    if not func:
-        logger.error(f"[ZERO_COV] Function {target['function']} not found in static analysis")
-        return None
-
-    try:
-        # 确定源文件路径
-        if os.path.exists(SRC_BEAR_PATH / func['file_name']):
-            src_file = SRC_BEAR_PATH / func['file_name']
-        else:
-            src_file = SRC_PATH / func['file_name']
-
-        with open(src_file, 'r') as f:
-            lines = f.readlines()
-
-        # 构造结果：[函数签名] + [branch上下文]
-        result = []
-
-        # 1. 函数签名部分
-        result.append(f"// === FUNCTION: {target['function']} ===\n")
-        sig_end = min(func['lineStart'] + 5, len(lines) + 1)
-        result.append(''.join(lines[func['lineStart']-1:sig_end]))
-        result.append("\n// ... [middle code omitted]\n\n")
-
-        # 2. zero-branch 为中心的 ±30 行（受函数体限制）
-        branch_line = target['line']
-        context_start = max(func['lineStart'], branch_line - context_lines)
-        context_end = min(func['lineEnd'], branch_line + context_lines)
-
-        result.append(f"// === BRANCH CONTEXT (line {branch_line}) ===\n")
-        result.extend(lines[context_start-1:context_end])
-
-        code_slice = ''.join(result)
-        logger.info(f"[ZERO_COV] Extracted function context: {len(code_slice)} chars")
-        logger.info(
-            f"[ZERO_COV] Full extracted function context for {target['function']}:{branch_line}\n"
-            f"{code_slice}"
-        )
-        return code_slice
-
-    except Exception as e:
-        logger.error(f"[ZERO_COV] Failed to extract function context: {e}")
-        return None
-
-
 def _lookup_func_meta_by_name(func_name: str) -> dict | None:
     for func in funcs:
         if func.get('name') == func_name:
@@ -4921,21 +5532,6 @@ def _describe_seed_delivery() -> str:
     )
 
 
-def _get_zero_cov_supporting_context(llm_util: LLMUtil) -> dict[str, str]:
-    ensure_cached_format_info(llm_util)
-    harness_code = get_harness_code() or ""
-    format_section = ""
-    if cached_format_info:
-        format_section = InputFormatDetector.format_info_to_prompt_section(cached_format_info)
-    return {
-        "runtime_command_context": build_runtime_command_context(),
-        "seed_delivery_context": _describe_seed_delivery(),
-        "input_container_context": build_input_container_profile("binary_script", harness_code=harness_code),
-        "format_context": format_section,
-        "harness_code": harness_code,
-    }
-
-
 def _score_input_driven_call_chain(chain) -> tuple[int, int, int]:
     cli_penalty = 0
     parser_bonus = 0
@@ -4965,363 +5561,6 @@ def _score_input_driven_call_chain(chain) -> tuple[int, int, int]:
     # 3. Prefer chains anchored at harness entry points.
     # 4. Use length only as a final tie-breaker.
     return (-cli_penalty, parser_bonus + harness_bonus, len(chain))
-
-
-def get_code_slice_with_fallback(target, tracer: CoverageTracer, llm_util: LLMUtil):
-    """
-    获取代码切片，带回退策略：
-    1. 尝试标准 LLVM 切片
-    2. 失败时使用函数上下文回退
-    """
-    # 策略 1: 尝试获取调用链并做 LLVM 切片
-    call_chains = get_call_chain(target['function'])
-    if call_chains:
-        logger.info(f"[ZERO_COV] Found {len(call_chains)} call chains, attempting LLVM slice")
-        # 使用 None 作为 only_side（零覆盖分支不关心方向）
-        ranked_chains = sorted(call_chains, key=_score_input_driven_call_chain, reverse=True)
-        best_chain = ranked_chains[0]
-        logger.info(f"[ZERO_COV] Using best call chain: {format_call_chain(best_chain)}")
-        logger.debug(
-            f"[ZERO_COV] Best call chain score={_score_input_driven_call_chain(best_chain)}; "
-            f"top_candidates={[format_call_chain(chain) for chain in ranked_chains[:3]]}"
-        )
-        code_slice = get_function_slice(best_chain, target['line'], None, llm_util)
-        if code_slice and "No matching instruction found" not in code_slice:
-            logger.info(f"[ZERO_COV] LLVM slice successful: {len(code_slice)} chars")
-            return code_slice
-        else:
-            logger.warning(f"[ZERO_COV] LLVM slice failed or returned error")
-
-    # 策略 2: 回退到函数上下文
-    logger.info("[ZERO_COV] Falling back to function context extraction")
-    code_slice = extract_function_context(target)
-    if code_slice:
-        return code_slice
-
-    logger.error("[ZERO_COV] All slice strategies failed")
-    return None
-
-
-def analyze_reachability_constraints(target, code_slice, llm_util: LLMUtil):
-    """
-    分析到达零覆盖分支的可达性约束
-    """
-    logger.info(f"[ZERO_COV] Analyzing reachability constraints for {target['function']}:{target['line']}")
-
-    # 构造 roadblock_info（复用现有格式）
-    rb_info = {
-        'filename': target['file'],
-        'line': target['line'],
-        'function': target['function'],
-        'status': 'zero_covered',  # 特殊状态
-    }
-
-    # 添加代码信息
-    if code_slice:
-        rb_info['code'] = extract_branch_code_from_slice(code_slice, target['line'])
-
-    # 使用专门的 analyze_zero_covered_branch prompt
-    pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
-    support_context = _get_zero_cov_supporting_context(llm_util)
-
-    messages = [
-        {'role': 'system',
-         'content': prompts['prompt']['analyze_zero_covered_branch']['sys_prompt']},
-        {'role': 'user',
-         'content': get_formatted_user_prompt(
-             'analyze_zero_covered_branch',
-             filename=target['file'],
-             line=target['line'],
-             function=target['function'],
-             code_slice=code_slice,
-             runtime_command_context=support_context['runtime_command_context'],
-             seed_delivery_context=support_context['seed_delivery_context'],
-             format_context=support_context['format_context'] or "(unknown)",
-             harness_code=support_context['harness_code'] or "(unavailable)",
-         )}
-    ]
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            resp = llm_util.get_response(messages)
-            match = extract_json_with_fallback(resp, pattern_json)
-
-            if not match:
-                logger.warning(f"[ZERO_COV] No JSON found in LLM response (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    append_llm_retry_feedback(
-                        messages,
-                        resp,
-                        "请只返回一个 JSON object，描述零覆盖分支的可达性约束。"
-                    )
-                continue
-
-            constraints = json.loads(match.group(1).strip())
-            schema_error = validate_generic_object_result(constraints, "zero-covered reachability analysis result")
-            if schema_error:
-                logger.warning(f"[ZERO_COV] Invalid reachability constraints schema: {schema_error}")
-                if attempt < max_retries - 1:
-                    append_llm_retry_feedback(
-                        messages,
-                        resp,
-                        f"返回结构不符合要求：{schema_error}。请只返回一个 JSON object。"
-                    )
-                continue
-
-            logger.info(f"[ZERO_COV] Reachability constraints analyzed: {len(constraints.get('path_prerequisites', []))} prerequisites")
-            return constraints
-        except Exception as e:
-            logger.error(f"[ZERO_COV] Error analyzing reachability constraints (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                append_llm_retry_feedback(
-                    messages,
-                    resp if 'resp' in locals() else "",
-                    f"上一次返回无法解析：{e}。请只返回一个合法的 JSON object。"
-                )
-
-    return None
-
-
-def extract_branch_code_from_slice(code_slice, target_line):
-    """从切片中提取目标分支的代码"""
-    lines = code_slice.split('\n')
-    for i, line in enumerate(lines):
-        # 查找包含目标行号的代码
-        if f"// === BRANCH CONTEXT (line {target_line}) ===" in line:
-            # 找到了分支上下文，提取分支条件代码
-            context_lines = []
-            for j in range(i+1, min(i+10, len(lines))):
-                if lines[j].strip() and not lines[j].strip().startswith('//'):
-                    context_lines.append(lines[j])
-                elif '//' in lines[j]:
-                    break
-            return '\n'.join(context_lines[:3])  # 返回前几行作为分支代码
-    return "if (condition) { /* branch */ }"
-
-
-def generate_input_for_zero_covered(target, constraints, llm_util: LLMUtil):
-    """
-    为零覆盖分支生成输入
-    """
-    if not constraints:
-        logger.error("[ZERO_COV] No constraints available for input generation")
-        return None, None
-
-    generation_mode = infer_input_generation_mode(
-        constraints.get('code_slice', ''),
-        get_harness_code(),
-    )
-    if generation_mode == "text_direct":
-        return generation_mode, generate_text_input_for_zero_covered(constraints, target, llm_util)
-    return generation_mode, generate_binary_script_for_zero_covered(constraints, target, llm_util)
-
-
-def generate_text_input_for_zero_covered(constraints, target, llm_util: LLMUtil):
-    """
-    为文本输入型库（mujs, sqlite等）生成文本内容。
-
-    使用 LLM 直接生成满足约束的文本输入，而非 Python 脚本。
-    """
-    logger.info(f"[ZERO_COV] Generating text input for {PROJECT}")
-
-    # 构造简化的 prompt 用于文本生成
-    code_slice = constraints.get('code_slice', '')
-    path_prerequisites = constraints.get('path_prerequisites', '')
-    support_context = _get_zero_cov_supporting_context(llm_util)
-    input_examples = collect_input_examples_context("text_direct")
-
-    messages = [
-        {'role': 'system', 'content': prompts['prompt']['zero_covered_text_input_generation']['sys_prompt']},
-        {'role': 'user', 'content': get_formatted_user_prompt(
-            'zero_covered_text_input_generation',
-            project=PROJECT,
-            function=target['function'],
-            line=target['line'],
-            path_prerequisites=path_prerequisites,
-            code_slice=code_slice[:2000],
-            runtime_command_context=support_context['runtime_command_context'],
-            seed_delivery_context=support_context['seed_delivery_context'],
-            format_context=support_context['format_context'] or "(unknown)",
-            harness_code=support_context['harness_code'] or "(unavailable)",
-            input_examples=input_examples or "(none)",
-        )}
-    ]
-
-    try:
-        resp = llm_util.get_response(messages)
-
-        cleaned_resp = extract_direct_text_payload(resp)
-        if cleaned_resp is None:
-            logger.error("[ZERO_COV] Text generation returned no extractable payload")
-            return None
-
-        logger.info(f"[ZERO_COV] Generated text input (length: {len(cleaned_resp)})")
-        return cleaned_resp
-
-    except Exception as e:
-        logger.error(f"[ZERO_COV] Text generation failed: {e}")
-        return None
-
-
-def generate_binary_script_for_zero_covered(constraints, target, llm_util: LLMUtil):
-    """为二进制输入型库生成 Python 脚本"""
-    logger.info(f"[ZERO_COV] Generating binary script for {PROJECT}")
-
-    # 构造 roadblock_info
-    rb_info = {
-        'filename': target['file'],
-        'line': target['line'],
-        'function': target['function'],
-        'status': 'zero_covered',
-    }
-
-    # 使用 generate_script prompt 生成脚本
-    summary = "Generate input that reaches the target branch location"
-    pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
-
-    messages = build_generate_script_messages(
-        constraints.get('code_slice', ''),
-        constraints.get('path_prerequisites', ''),
-        summary,
-        target_branch=f"{target['function']}:{target['line']}",
-        preferred_seed=None,
-    )
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        resp = llm_util.get_response(messages)
-        match = extract_json_with_fallback(resp, pattern_json)
-        if not match:
-            logger.warning(f"[ZERO_COV] Binary script generation returned no JSON (attempt {attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                append_llm_retry_feedback(
-                    messages,
-                    resp,
-                    "请只返回一个 JSON object，并且必须包含字符串字段 generation_script。"
-                )
-            continue
-        try:
-            res = json.loads(match.group(1).strip())
-        except json.JSONDecodeError as exc:
-            logger.warning(f"[ZERO_COV] Binary script generation JSON parse failed: {exc}")
-            if attempt < max_retries - 1:
-                append_llm_retry_feedback(
-                    messages,
-                    resp,
-                    f"JSON 解析失败：{exc}。请只返回一个合法的 JSON object，并包含字符串字段 generation_script。"
-                )
-            continue
-        schema_error = validate_generation_result(res)
-        if schema_error:
-            logger.warning(f"[ZERO_COV] Invalid binary script generation schema: {schema_error}")
-            if attempt < max_retries - 1:
-                append_llm_retry_feedback(
-                    messages,
-                    resp,
-                    f"返回结构不符合要求：{schema_error}。请只返回一个 JSON object，并且 generation_script 必须是字符串。"
-                )
-            continue
-        return res.get('generation_script', None)
-    return None
-
-
-def handle_zero_covered_branch(target, tracer: CoverageTracer, llm_util: LLMUtil):
-    """
-    处理零覆盖分支（两边都未执行）。
-
-    完整实现流程：
-    1. 获取代码切片（带回退策略）
-    2. 分析可达性约束
-    3. 生成输入（文本或脚本）
-    4. 测试并入队
-    """
-    global pass_roadblock, inference_stats
-    global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
-
-    logger.info(f"[{LogOp.ROADBLOCK}] Processing zero-covered branch: {target['file']}:{target['line']}")
-
-    try:
-        check_fuzzer_alive()
-    except FuzzerProcessDiedError as e:
-        logger.critical(f"[{LogOp.FUZZER}] {e}")
-        logger.critical("[{LogOp.FUZZER}] Fuzzer died, aborting...")
-        raise
-
-    target_key = f"{target['file']}:{target['line']}:zero_covered"
-    target_id = target['id']
-
-    # 步骤 1: 获取代码切片（带回退策略）
-    code_slice = get_code_slice_with_fallback(target, tracer, llm_util)
-    if not code_slice:
-        logger.error(f"[ZERO_COV] Failed to get code slice for {target['function']}:{target['line']}")
-        mark_roadblock_failed(target_key, "SLICE_FAILED", target)
-        return False, "Code slice extraction failed", -1, target_id
-
-    # 步骤 2: 分析可达性约束
-    constraints = analyze_reachability_constraints(target, code_slice, llm_util)
-    if not constraints:
-        logger.error(f"[ZERO_COV] Failed to analyze reachability constraints")
-        mark_roadblock_failed(target_key, "CONSTRAINT_ANALYSIS_FAILED", target)
-        return False, "Constraint analysis failed", -1, target_id
-
-    # 步骤 3: 生成输入
-    generation_mode, script_or_text = generate_input_for_zero_covered(target, constraints, llm_util)
-    if not script_or_text:
-        logger.error(f"[ZERO_COV] Failed to generate input")
-        mark_roadblock_failed(target_key, "INPUT_GENERATION_FAILED", target)
-        return False, "Input generation failed", -1, target_id
-
-    # 步骤 4: 根据库类型处理
-    LLM_TARGET_PATH = Path(output_dir) / "LLM" / "queue"
-    os.makedirs(LLM_TARGET_PATH, exist_ok=True)
-    seed_id = len(os.listdir(LLM_TARGET_PATH))
-
-    try:
-        if generation_mode == "text_direct":
-            # 文本输入型库：直接写入文本文件
-            seed_path = os.path.join(LLM_TARGET_PATH, f"id:{int(seed_id):06},src:zero_cov")
-            with open(seed_path, 'w', encoding='utf-8') as f:
-                f.write(script_or_text)
-            logger.info(f"[ZERO_COV] Text seed written: {seed_path}")
-        else:
-            # 二进制输入型库：执行 Python 脚本
-            from LLM.LLMUtil import run_generator
-            script = script_or_text  # 已经是 Python 脚本
-            stdout, stderr, new_seed_path = run_generator(script, target_id, seed_id, output_dir)
-
-            if stderr and "Connected" not in stderr:
-                logger.warning(f"[ZERO_COV] Script execution had errors, retrying...")
-                # 简化处理，直接返回失败
-                mark_roadblock_failed(target_key, "SCRIPT_EXECUTION_FAILED", target)
-                return False, "Script execution failed", -1, target_id
-
-            seed_path = new_seed_path
-
-        gate_result, eval_result = gate_seed(seed_path, roadblock=target)
-        logger.info(
-            f"[SEED_GATE] ZERO_COV decision={gate_result.decision} accepted={gate_result.accepted} "
-            f"reason={gate_result.reason}"
-        )
-        local_progress = gate_result.accepted and _seed_eval_indicates_local_progress(eval_result)
-        logger.info(
-            f"[ZERO_COV] Local seed evaluation: class={eval_result.coverage_gain_class}, "
-            f"parse_family_hit={eval_result.parse_family_hit}, target_file_hit={eval_result.target_file_hit}, "
-            f"target_line_window_hit={eval_result.target_line_window_hit}, new_edges={eval_result.new_edges}"
-        )
-
-        if local_progress:
-            logger.info(f"[{LogOp.ROADBLOCK}] Zero-covered branch produced a locally validated seed")
-            return True, "ZERO_COV", seed_id, target_id
-        else:
-            logger.info(f"[ZERO_COV] Seed generated but local validation did not accept it")
-            mark_roadblock_failed(target_key, eval_result.rejection_reason or "NO_NEW_EDGES", target)
-            return False, "No coverage gain", seed_id, target_id
-
-    except Exception as e:
-        logger.error(f"[ZERO_COV] Error during processing: {e}", exc_info=True)
-        mark_roadblock_failed(target_key, "EXCEPTION", target)
-        return False, f"Exception: {str(e)}", -1, target_id
 
 
 def handle_uncalled_function(target, tracer: CoverageTracer, llm_util: LLMUtil):
@@ -6944,7 +7183,7 @@ def attempt_simplified_flag_path(
         script = extract_script_from_flag_result(flag_result)
         if not script:
             return False
-        llm_target_path = Path(output_dir) / "LLM" / "queue"
+        llm_target_path = config.get_named_queue_dir(FLAG_FUZZER)
         os.makedirs(llm_target_path, exist_ok=True)
         seed_id = len(os.listdir(llm_target_path))
         solved, _, dest_file = extract_and_test(
@@ -6957,6 +7196,8 @@ def attempt_simplified_flag_path(
             roadblock=ctx.roadblock,
             call_chain=ctx.call_chain,
             code_slice=ctx.code_slice,
+            queue_dir=llm_target_path,
+            path_prefix="flag",
         )
         return solved or bool(dest_file)
     except Exception as e:
@@ -6971,7 +7212,7 @@ def attempt_simplified_taint_mutation_path(ctx: SimplifiedAttemptContext, patter
         return False
 
     try:
-        mut_target_path = Path(output_dir) / "mut" / "queue"
+        mut_target_path = config.get_named_queue_dir(TAINT_MUTATION_FUZZER)
         os.makedirs(mut_target_path, exist_ok=True)
         seed_id = len(os.listdir(mut_target_path))
         field = ctx.relevant_info['fields']
@@ -7001,6 +7242,8 @@ def attempt_simplified_taint_mutation_path(ctx: SimplifiedAttemptContext, patter
             ctx.tracer,
             roadblock=ctx.roadblock,
             call_chain=ctx.call_chain,
+            path_prefix="taint_mutation",
+            queue_dir=mut_target_path,
         )
         return solved or bool(dest_file)
     except Exception as e:
@@ -7015,7 +7258,7 @@ def attempt_simplified_state_driven_path(ctx: SimplifiedAttemptContext) -> bool:
         return False
 
     try:
-        mut_target_path = Path(output_dir) / "mut" / "queue"
+        mut_target_path = config.get_named_queue_dir(STATE_DRIVEN_FUZZER)
         os.makedirs(mut_target_path, exist_ok=True)
         seed_id = len(os.listdir(mut_target_path))
         state_mapper = StateDrivenMapper(ctx.llm_util)
@@ -7048,6 +7291,8 @@ def attempt_simplified_state_driven_path(ctx: SimplifiedAttemptContext) -> bool:
             ctx.tracer,
             roadblock=ctx.roadblock,
             call_chain=ctx.call_chain,
+            path_prefix="state_driven",
+            queue_dir=mut_target_path,
         )
         return solved or bool(dest_file)
     except Exception as e:
@@ -7062,7 +7307,7 @@ def attempt_simplified_field_mutation_path(ctx: SimplifiedAttemptContext, patter
         return False
 
     try:
-        mut_target_path = Path(output_dir) / "mut" / "queue"
+        mut_target_path = config.get_named_queue_dir(FIELD_MUTATION_FUZZER)
         os.makedirs(mut_target_path, exist_ok=True)
         seed_id = len(os.listdir(mut_target_path))
         suggestions = mutate_suggest_without_taint(
@@ -7092,6 +7337,8 @@ def attempt_simplified_field_mutation_path(ctx: SimplifiedAttemptContext, patter
             ctx.tracer,
             roadblock=ctx.roadblock,
             call_chain=ctx.call_chain,
+            path_prefix="field_mutation",
+            queue_dir=mut_target_path,
         )
         return solved or bool(dest_file)
     except Exception as e:
@@ -7100,13 +7347,35 @@ def attempt_simplified_field_mutation_path(ctx: SimplifiedAttemptContext, patter
 
 
 def _next_seed_output_path(queue_dir: Path, *, roadblock_id: int | str) -> str:
-    queue_dir.mkdir(parents=True, exist_ok=True)
-    next_id = len([p for p in queue_dir.iterdir() if p.is_file()])
-    while True:
-        candidate = queue_dir / f"id:{int(next_id):06},bid:{int(roadblock_id):06}"
-        if not candidate.exists():
-            return os.fspath(candidate)
-        next_id += 1
+    return os.fspath(config.next_queue_seed_path(queue_dir, roadblock_id=roadblock_id))
+
+
+def _promote_prefixed_batch_outputs(
+    src_dir: str | Path,
+    *,
+    path_prefix: str,
+    queue_dir: str | Path | None = None,
+) -> list[str]:
+    source_dir = Path(src_dir)
+    if not source_dir.exists():
+        return []
+
+    destination_dir = Path(queue_dir) if queue_dir is not None else Path(config.MUT_QUEUE_PATH)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    moved_paths: list[str] = []
+    for artifact_path in sorted(p for p in source_dir.rglob("*") if p.is_file()):
+        suffix = artifact_path.suffix if artifact_path.suffix else ""
+        dest_path = config.next_queue_seed_path(
+            destination_dir,
+            path_prefix=path_prefix,
+            suffix=suffix,
+        )
+        shutil.move(os.fspath(artifact_path), os.fspath(dest_path))
+        moved_paths.append(os.fspath(dest_path))
+
+    shutil.rmtree(source_dir, ignore_errors=True)
+    return moved_paths
 
 
 def _load_text_seed_for_xml(seed_name: str | None) -> str | None:
@@ -7275,11 +7544,11 @@ def attempt_simplified_xml_grammar_path(ctx: SimplifiedAttemptContext) -> bool:
         if not candidates:
             return False
 
-        llm_target_path = Path(output_dir) / "LLM" / "queue"
+        llm_target_path = config.get_named_queue_dir(XML_GRAMMAR_FUZZER)
         attempted = False
         accepted = False
         for candidate in candidates:
-            seed_path = _next_seed_output_path(llm_target_path, roadblock_id=ctx.roadblock_id)
+            seed_path = os.fspath(config.next_queue_seed_path(llm_target_path, roadblock_id=ctx.roadblock_id))
             Path(seed_path).write_text(candidate.text, encoding="utf-8")
             attempted = True
             gate_result, eval_result = gate_seed(seed_path, roadblock=ctx.roadblock, call_chain=ctx.call_chain)
@@ -7313,8 +7582,9 @@ def attempt_simplified_batch_mutation_path(ctx: SimplifiedAttemptContext) -> boo
             return False
         seed_dir = os.path.join(output_dir, 'default', 'queue')
         branch_id = mutator_rule.get("branch_id") or "llm_mut"
+        batch_fuzzer_name = f"batch_mutation_{config.sanitize_fs_component(str(branch_id))}"
         branch_work_dir = config.get_branch_output_dir(branch_id)
-        batch_out_dir = config.get_branch_queue_dir(branch_id)
+        batch_out_dir = config.get_named_queue_dir(batch_fuzzer_name)
         manifest_dir = branch_work_dir
         filtered_seed_dir = config.get_batch_mutation_filtered_seed_dir(branch_id)
         filtered_seed_dir, _ = create_batch_mutation_seed_dir(seed_dir, filtered_seed_dir)
@@ -7343,11 +7613,11 @@ def attempt_simplified_batch_mutation_path(ctx: SimplifiedAttemptContext) -> boo
         shutil.rmtree(filtered_seed_dir, ignore_errors=True)
         if result.returncode != 0 or not os.path.exists(batch_out_dir):
             return False
-        mutated_files = [f for f in os.listdir(batch_out_dir) if not f.startswith('.')]
-        if not mutated_files:
+        moved_paths = _promote_prefixed_batch_outputs(batch_out_dir, path_prefix=batch_fuzzer_name, queue_dir=batch_out_dir)
+        if not moved_paths:
             return False
         logger.info(
-            f"[{LogOp.ROADBLOCK}] Simplified Path D generated {len(mutated_files)} candidate seed(s); "
+            f"[{LogOp.ROADBLOCK}] Simplified Path D generated {len(moved_paths)} candidate seed(s); "
             f"deferring effectiveness judgment to the outer coverage check"
         )
         return True
@@ -7359,89 +7629,58 @@ def attempt_simplified_batch_mutation_path(ctx: SimplifiedAttemptContext) -> boo
         return False
 
 
-def attempt_simplified_direct_generation_path(ctx: SimplifiedAttemptContext, pattern_json: str) -> bool:
+def run_direct_generation(
+    ctx: SimplifiedAttemptContext,
+    *,
+    skip_seed_gate: bool = False,
+    log_prefix: str = "Direct generation",
+) -> bool:
     global fuzzer, output_dir
 
     if not ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH:
         return False
 
-    logger.info(f"[{LogOp.ROADBLOCK}] Simplified Path C: trying direct generation")
+    logger.info(f"[{LogOp.ROADBLOCK}] {log_prefix}: trying direct generation")
     try:
-        llm_target_path = Path(output_dir) / "LLM" / "queue"
-        os.makedirs(llm_target_path, exist_ok=True)
-        seed_id = len(os.listdir(llm_target_path))
-        if ctx.generation_mode == "text_direct":
-            generation_messages = build_direct_text_generation_messages(
-                ctx.code_slice,
-                ctx.constraints,
-                ctx.summary,
-                fields=ctx.fields,
-                target_branch=ctx.bcode,
-                state_hints=ctx.state_hints,
-                harness_code=ctx.harness_for_mode,
-                preferred_seed=ctx.seed,
-            )
-            seed_path = os.path.join(llm_target_path, f"id:{int(seed_id):06},bid:{int(ctx.roadblock_id):06}")
-            text_result = write_direct_text_seed_and_test(
-                ctx.llm_util,
-                generation_messages,
-                seed_path,
-                roadblock=ctx.roadblock,
-                call_chain=ctx.call_chain,
-                max_attempts=MAX_TIME,
-            )
-            if text_result.attempt_made:
-                logger.info(
-                    f"[{LogOp.ROADBLOCK}] Simplified Path C wrote a direct-text candidate; "
-                    f"deferring effectiveness judgment to the outer coverage check"
-                )
-                if text_result.gate_result:
-                    logger.info(
-                        f"[SEED_GATE] Simplified Path C text decision={text_result.gate_result.decision} "
-                        f"accepted={text_result.gate_result.accepted} reason={text_result.gate_result.reason}"
-                    )
-                return True
-            return False
-
-        generation_messages = build_generate_script_messages(
-            ctx.code_slice,
-            ctx.constraints,
-            ctx.summary,
-            fields=ctx.fields,
+        plan = plan_direct_generation(
+            llm_util=ctx.llm_util,
+            code_slice=ctx.code_slice,
+            constraints=ctx.constraints,
+            summary=ctx.summary,
             target_branch=ctx.bcode,
+            fields=ctx.fields,
             state_hints=ctx.state_hints,
             harness_code=ctx.harness_for_mode,
             preferred_seed=ctx.seed,
+            inferred_mode=ctx.generation_mode,
         )
-        resp = ctx.llm_util.get_response(generation_messages)
-        match = extract_json_with_fallback(resp, pattern_json)
-        if not match:
-            return False
-        res = json.loads(match.group(1).strip())
-        schema_error = validate_generation_result(res)
-        if schema_error:
-            return False
-        script = res['generation_script']
-        if not script:
-            return False
-        solved, _, dest_file = extract_and_test(
-            ctx.llm_util,
-            script,
-            ctx.roadblock_id,
-            seed_id,
-            ctx.tracer,
-            fuzzer,
-            roadblock=ctx.roadblock,
-            call_chain=ctx.call_chain,
-            code_slice=ctx.code_slice,
+        result = execute_direct_generation_plan(
+            ctx,
+            plan,
+            queue_dir=config.get_named_queue_dir(DIRECT_GENERATION_FUZZER),
+            skip_seed_gate=skip_seed_gate,
+            defer_effectiveness_to_outer_check=True,
+            log_prefix=log_prefix,
         )
-        return solved or bool(dest_file)
+        if result.attempted and result.gate_result:
+            logger.info(
+                f"[SEED_GATE] {log_prefix} {result.mode} decision={result.gate_result.decision} "
+                f"accepted={result.gate_result.accepted} reason={result.gate_result.reason}"
+            )
+        return result.attempted
     except Exception as e:
-        logger.error(f"[{LogOp.ROADBLOCK}] Simplified Path C error: {e}", exc_info=True)
+        logger.error(f"[{LogOp.ROADBLOCK}] {log_prefix} error: {e}", exc_info=True)
         return False
 
 
-def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
+def handle_roadblock_simplified(
+    roadblock,
+    tracer: CoverageTracer,
+    llm_util: LLMUtil,
+    *,
+    selected_paths: set[str] | None = None,
+    mark_attempted: bool = True,
+):
     global inference_stats, attempted_roadblocks
     global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
 
@@ -7455,7 +7694,8 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
     roadblock_key = roadblock.get('roadblock_key') or get_roadblock_key(roadblock)
     roadblock_id = roadblock.get('roadblock_id') or get_rb_id(roadblock)
     logger.info(f"[{LogOp.ROADBLOCK}] Simplified processing roadblock {roadblock_id} (key: {roadblock_key})")
-    mark_roadblock_attempted(roadblock_key, roadblock, stage="handle_roadblock_simplified")
+    if mark_attempted:
+        mark_roadblock_attempted(roadblock_key, roadblock, stage="handle_roadblock_simplified")
 
     seeds = tracer.get_rb_seed(roadblock)
     rb_file = roadblock['filename']
@@ -7639,6 +7879,7 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
 
         harness_for_mode = get_harness_code()
         generation_mode = infer_input_generation_mode(code_slice, harness_for_mode)
+        target_class = classify_input_target(fields=fields, harness_code=harness_for_mode)
         attempt_ctx = SimplifiedAttemptContext(
             roadblock=roadblock,
             roadblock_id=roadblock_id,
@@ -7659,18 +7900,29 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
             generation_mode=generation_mode,
         )
 
-        path_attempts = [
-            ("flag", ENABLE_SIMPLIFIED_FLAG_PATH, lambda: attempt_simplified_flag_path(attempt_ctx, relevant_flags, constant_groups)),
-            ("taint_mutation", ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH, lambda: attempt_simplified_taint_mutation_path(attempt_ctx, pattern_json)),
-            ("state_driven", ENABLE_SIMPLIFIED_STATE_DRIVEN_PATH and ENABLE_STATE_DRIVEN_PATH_B, lambda: attempt_simplified_state_driven_path(attempt_ctx)),
-            ("field_mutation", ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH, lambda: attempt_simplified_field_mutation_path(attempt_ctx, pattern_json)),
-            ("xml_grammar", ENABLE_SIMPLIFIED_XML_GRAMMAR_PATH, lambda: attempt_simplified_xml_grammar_path(attempt_ctx)),
-            ("batch_mutation", ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH, lambda: attempt_simplified_batch_mutation_path(attempt_ctx)),
-            ("direct_generation", ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH, lambda: attempt_simplified_direct_generation_path(attempt_ctx, pattern_json)),
-        ]
+        if target_class == "structured_text_parser":
+            path_attempts = [
+                ("xml_grammar", ENABLE_SIMPLIFIED_XML_GRAMMAR_PATH, lambda: attempt_simplified_xml_grammar_path(attempt_ctx)),
+                ("field_mutation", ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH, lambda: attempt_simplified_field_mutation_path(attempt_ctx, pattern_json)),
+                ("direct_generation", ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH, lambda: run_direct_generation(attempt_ctx, log_prefix="Simplified Path C")),
+                ("batch_mutation", ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH, lambda: attempt_simplified_batch_mutation_path(attempt_ctx)),
+                ("taint_mutation", ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH, lambda: attempt_simplified_taint_mutation_path(attempt_ctx, pattern_json)),
+            ]
+        else:
+            path_attempts = [
+                ("flag", ENABLE_SIMPLIFIED_FLAG_PATH, lambda: attempt_simplified_flag_path(attempt_ctx, relevant_flags, constant_groups)),
+                ("taint_mutation", ENABLE_SIMPLIFIED_TAINT_MUTATION_PATH, lambda: attempt_simplified_taint_mutation_path(attempt_ctx, pattern_json)),
+                ("state_driven", ENABLE_SIMPLIFIED_STATE_DRIVEN_PATH and ENABLE_STATE_DRIVEN_PATH_B, lambda: attempt_simplified_state_driven_path(attempt_ctx)),
+                ("field_mutation", ENABLE_SIMPLIFIED_FIELD_MUTATION_PATH, lambda: attempt_simplified_field_mutation_path(attempt_ctx, pattern_json)),
+                ("xml_grammar", ENABLE_SIMPLIFIED_XML_GRAMMAR_PATH, lambda: attempt_simplified_xml_grammar_path(attempt_ctx)),
+                ("batch_mutation", ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH, lambda: attempt_simplified_batch_mutation_path(attempt_ctx)),
+                ("direct_generation", ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH, lambda: run_direct_generation(attempt_ctx, log_prefix="Simplified Path C")),
+            ]
 
         attempt_made = False
         for path_name, enabled, path_runner in path_attempts:
+            if selected_paths is not None and path_name not in selected_paths:
+                continue
             if not enabled:
                 logger.info(f"[{LogOp.ROADBLOCK}] Simplified path `{path_name}` disabled by config")
                 continue
@@ -7686,75 +7938,158 @@ def handle_roadblock_simplified(roadblock, tracer: CoverageTracer, llm_util: LLM
     return False, "NO_ROADBLOCKS_REMAIN", -1, roadblock_id
 
 
-def resolve_coverage_stuck(tracer: CoverageTracer, last_scan_time, read_files, stuck_time):
-    global fuzzer, input_dir, output_dir, fuzzing_args, target_prog, trace_prog
+def handle_roadblock_direct_generation_only(roadblock, tracer: CoverageTracer, llm_util: LLMUtil):
+    global attempted_roadblocks
 
-    ret, last_scan_time, error_info, roadblocks = tracer.get_trace(read_files, last_scan_time)
-    if not ret:
-        if "没有新的seed" in error_info:
-            logger.info(f"[{LogOp.ROADBLOCK}] {error_info}")
-            logger.info(f"[{LogOp.ROADBLOCK}] Reusing existing roadblocks without pre-screening")
-            roadblocks = tracer.get_roadblocks(STATIC_PATH)
-            ret = True
-        else:
-            logger.critical(f"[{LogOp.ROADBLOCK}] Coverage trace extraction failed: {error_info}")
-            logger.critical("Cannot proceed without valid trace data")
-            sys.exit(1)
+    try:
+        check_fuzzer_alive()
+    except FuzzerProcessDiedError as e:
+        logger.critical(f"[{LogOp.FUZZER}] {e}")
+        logger.critical("[{LogOp.FUZZER}] Fuzzer died before direct-generation-only roadblock processing, aborting...")
+        raise
 
-    llm_util = LLMUtil(MODEL, API_KEY, BASE_URL)
+    roadblock_key = roadblock.get('roadblock_key') or get_roadblock_key(roadblock)
+    roadblock_id = roadblock.get('roadblock_id') or get_rb_id(roadblock)
+    if roadblock_key in attempted_roadblocks:
+        logger.info(f"[{LogOp.ROADBLOCK}] Direct-generation scheduler skipping attempted roadblock: {roadblock_key}")
+        return False, "ALREADY_ATTEMPTED", -1, roadblock_id
 
-    global cached_format_info
-    cached_format_info = ensure_cached_format_info(llm_util)
+    logger.info(f"[{LogOp.ROADBLOCK}] Direct-generation scheduler processing {roadblock_id} (key: {roadblock_key})")
+    mark_roadblock_attempted(roadblock_key, roadblock, stage="handle_roadblock_direct_generation_only")
 
-    stuck_time = tracer.check_coverage_growth()
-    if stuck_time < THRESHOLD_TIME:
-        logger.info(
-            f"[{LogOp.ROADBLOCK}] Coverage changed after collecting roadblocks "
-            f"(stuck_time={stuck_time}s < {THRESHOLD_TIME}s), skipping this batch"
-        )
-        return True, last_scan_time, read_files
+    seeds = tracer.get_rb_seed(roadblock)
+    rb_file = roadblock['filename']
+    rb_line = roadblock['line']
+    slice_line = rb_line
+    if roadblock.get('group_type', None) == 'switch':
+        switch_line = get_switch_statement_line(roadblock)
+        if switch_line:
+            slice_line = switch_line
 
-    prepared_roadblocks = []
-    for rb in roadblocks:
-        rb['roadblock_id'] = rb.get('roadblock_id') or get_rb_id(rb)
-        rb['roadblock_key'] = rb.get('roadblock_key') or get_roadblock_key(rb)
-        rb['function'] = rb.get('function') or get_function_name(rb)[0]
-        prepared_roadblocks.append(rb)
+    rb_fname = roadblock.get('function') or ""
+    if not rb_fname:
+        func_meta = tracer._find_function_for_location(rb_file, rb_line)
+        if func_meta and func_meta.get('name'):
+            rb_fname = str(func_meta.get('name'))
+    if not rb_fname:
+        mark_roadblock_failed(roadblock_key, "NO_FUNCTION_NAME", roadblock)
+        return False, "NO_FUNCTION_NAME", -1, roadblock_id
 
-    if not prepared_roadblocks:
-        logger.info(f"[{LogOp.ROADBLOCK}] No roadblocks available after stagnation detection")
-        return False, last_scan_time, read_files
+    call_chains = get_call_chain(rb_fname.split('.')[0])
+    using_fallback_slice = False
+    if call_chains is None or len(call_chains) == 0:
+        code_slice = ensure_cached_single_function_slice(roadblock, llm_util)
+        if not code_slice or "No matching instruction found" in code_slice or len(code_slice) <= 50:
+            mark_roadblock_failed(roadblock_key, "CODE_SLICE_FAILED", roadblock)
+            return False, "CODE_SLICE_FAILED", -1, roadblock_id
+        using_fallback_slice = True
+        call_chains = [[rb_fname.split('.')[0]]]
+    else:
+        call_chains = sorted(call_chains, key=_score_input_driven_call_chain, reverse=True)
 
-    logger.info(
-        f"[{LogOp.ROADBLOCK}] Simplified stage: attempting {len(prepared_roadblocks)} roadblock(s) in order"
-    )
-    for roadblock in prepared_roadblocks:
-        attempted, mode, id, roadblock_id = handle_roadblock_simplified(roadblock, tracer, llm_util)
+    pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
+    bcode = roadblock['code']
 
-        stuck_time = tracer.check_coverage_growth()
-
-        try:
-            check_fuzzer_alive()
-        except FuzzerProcessDiedError as e:
-            logger.critical(f"[{LogOp.FUZZER}] {e}")
-            logger.critical("[{LogOp.FUZZER}] Fuzzer died during simplified roadblock resolution")
-            raise
-
-        if stuck_time < THRESHOLD_TIME:
-            reset_roadblock_outcomes()
-            logger.info(
-                f"[{LogOp.ROADBLOCK}] Coverage breakthrough detected after full path attempts "
-                f"(stuck_time={stuck_time}s < {THRESHOLD_TIME}s)"
+    for call_chain in call_chains:
+        if not using_fallback_slice:
+            if len(call_chain) < DEPTH_THRESHOLD:
+                continue
+            code_slice = get_function_slice(
+                call_chain,
+                slice_line,
+                roadblock['status'],
+                llm_util,
+                original_target_line=rb_line,
+                target_file=roadblock.get('filename'),
             )
-            return True, last_scan_time, read_files
+            if "No matching instruction found" in code_slice:
+                mark_roadblock_failed(roadblock_key, "SLICE_FAILED", roadblock)
+                return False, "SLICE_FAILED", -1, roadblock_id
 
-        logger.info(
-            f"[{LogOp.ROADBLOCK}] Simplified attempt finished for {roadblock.get('roadblock_key')} "
-            f"(attempted={attempted}, mode={mode})"
+        constraint_messages = build_constraints_messages(roadblock, code_slice)
+        res = None
+        retries = 0
+        while retries < MAX_TIME:
+            resp = llm_util.get_response(constraint_messages)
+            match = extract_json_with_fallback(resp, pattern_json)
+            if not match:
+                append_llm_retry_feedback(
+                    constraint_messages,
+                    resp,
+                    "请只返回一个 JSON object，并完整包含 analise_branch_v2 需要的所有字段。",
+                )
+                retries += 1
+                continue
+            try:
+                res = json.loads(match.group(1).strip())
+            except json.JSONDecodeError as exc:
+                append_llm_retry_feedback(
+                    constraint_messages,
+                    resp,
+                    f"JSON 解析失败：{exc}。请只返回一个合法的 JSON object，并完整包含 analise_branch_v2 需要的所有字段。",
+                )
+                retries += 1
+                continue
+            analysis_error = validate_analysis_result_v2(res)
+            if analysis_error:
+                append_llm_retry_feedback(
+                    constraint_messages,
+                    resp,
+                    f"返回结构不符合要求：{analysis_error}。请只返回一个 JSON object，并完整包含 analise_branch_v2 需要的所有字段。",
+                )
+                res = None
+                retries += 1
+                continue
+            break
+
+        if res is None:
+            mark_roadblock_failed(roadblock_key, "CONSTRAINT_ANALYSIS_FAILED", roadblock)
+            return False, "CONSTRAINT_ANALYSIS_FAILED", -1, roadblock_id
+
+        constraints = res["global_merged_constraints_in_natural_language"]
+        summary = res["reasoning_summary"]
+        ranked_seed_names = tracer.select_seed_names_for_roadblock(
+            roadblock,
+            seed_names=seeds,
+            max_seeds=max(1, min(8, len(seeds))),
+        )
+        seed = ranked_seed_names[0] if ranked_seed_names else None
+        harness_for_mode = get_harness_code()
+        generation_mode = infer_input_generation_mode(code_slice, harness_for_mode)
+
+        attempt_ctx = SimplifiedAttemptContext(
+            roadblock=roadblock,
+            roadblock_id=roadblock_id,
+            roadblock_key=roadblock_key,
+            tracer=tracer,
+            llm_util=llm_util,
+            call_chain=call_chain,
+            code_slice=code_slice,
+            constraints=constraints,
+            summary=summary,
+            bcode=bcode,
+            seed=seed,
+            orig=None,
+            fields=None,
+            relevant_info=None,
+            harness_for_mode=harness_for_mode,
+            state_hints=[],
+            generation_mode=generation_mode,
         )
 
-    logger.info(f"[{LogOp.ROADBLOCK}] All current simplified roadblock attempts finished without coverage growth")
-    return False, last_scan_time, read_files
+        path_attempted = run_direct_generation(attempt_ctx, log_prefix="Direct-generation scheduler")
+        if path_attempted:
+            logger.info(f"[{LogOp.ROADBLOCK}] Direct-generation scheduler produced candidate output")
+            return True, "ATTEMPTED_DIRECT_GENERATION_ONLY", -1, roadblock_id
+
+    mark_roadblock_failed(roadblock_key, "DIRECT_GENERATION_FAILED", roadblock)
+    return False, "DIRECT_GENERATION_FAILED", -1, roadblock_id
+
+
+def resolve_coverage_stuck(orchestrator: PlateauAttemptOrchestrator, tracer: CoverageTracer, last_scan_time, read_files, stuck_time):
+    global cached_format_info
+    cached_format_info = ensure_cached_format_info(orchestrator.llm_util)
+    return orchestrator.run_cycle(last_scan_time, read_files, stuck_time)
 
 
 class FuzzerProcessDiedError(Exception):
@@ -7838,6 +8173,12 @@ def main():
             funcs,
             input_adapter_spec=get_input_adapter_spec(),
         )
+        llm_util = LLMUtil(MODEL, API_KEY, BASE_URL)
+        cached_format_info = ensure_cached_format_info(llm_util)
+        orchestrator = PlateauAttemptOrchestrator(tracer, llm_util)
+        logger.info(
+            f"[{LogOp.ROADBLOCK}] Coverage monitor is active; roadblock tracing remains demand-driven until plateau"
+        )
         iteration_count = 0
         while True:
             # Check if fuzzer process is still alive
@@ -7849,9 +8190,19 @@ def main():
                 raise
 
             stuck_time = tracer.check_coverage_growth()
-            if stuck_time < THRESHOLD_TIME:
+            epoch_active = orchestrator.has_active_epoch()
+            if not epoch_active and stuck_time < THRESHOLD_TIME:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Coverage monitor waiting for plateau "
+                    f"(stuck_time={stuck_time:.1f}s, threshold={THRESHOLD_TIME}s)"
+                )
                 time.sleep(CHECK_INTERVAL)
                 continue
+            if epoch_active and stuck_time < THRESHOLD_TIME:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Continuing active plateau epoch despite recent coverage growth "
+                    f"(stuck_time={stuck_time:.1f}s < {THRESHOLD_TIME}s)"
+                )
 
             # Iterative update before processing roadblocks
             removed_count = update_pass_roadblock()
@@ -7859,7 +8210,9 @@ def main():
                 logger.info(
                     f"[{LogOp.ROADBLOCK}] Main loop: Iterative update removed {removed_count} expired roadblock(s)")
 
-            success, last_scan_time, read_files = resolve_coverage_stuck(tracer, last_scan_time, read_files, stuck_time)
+            success, last_scan_time, read_files = resolve_coverage_stuck(
+                orchestrator, tracer, last_scan_time, read_files, stuck_time
+            )
             iteration_count += 1
             logger.info(f"[{LogOp.ROADBLOCK}] Main loop iteration {iteration_count} completed")
     except KeyboardInterrupt:

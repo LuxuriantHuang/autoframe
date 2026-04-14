@@ -11,6 +11,7 @@ class InputAdapterSpec:
     payload_offset: int = 0
     prefix_constraints: list[dict[str, Any]] = field(default_factory=list)
     delivery: str = "unknown"
+    stdin_argv_mode: str = "keep"
     payload_kind: str = "unknown"
     evidence: list[str] = field(default_factory=list)
 
@@ -20,6 +21,7 @@ class InputAdapterSpec:
             self.payload_offset > 0
             or bool(self.prefix_constraints)
             or self.delivery != "unknown"
+            or self.stdin_argv_mode != "keep"
             or self.payload_kind != "unknown"
         )
 
@@ -45,22 +47,43 @@ def infer_input_adapter_from_harness(harness_code: str | None, exec_args: list[s
 
     joined = harness_code
     lowered = joined.lower()
+    exec_args = list(exec_args or [])
+    joined_exec_args = " ".join(exec_args)
 
-    if "@@" in " ".join(exec_args or []):
-        spec.delivery = "file_placeholder"
-        spec.evidence.append("seed delivered through @@ placeholder")
-    elif re.search(r"\b(getchar|getc|fgetc)\s*\(", joined):
+    shell_like_stdin = bool(
+        re.search(r'process_input\s*\([^;]*"<stdin>"', joined)
+        or "stdin_is_interactive" in lowered
+        or re.search(r"\bfgets\s*\([^;]*stdin", lowered)
+    )
+    explicit_stdin = bool(
+        re.search(r"\b(getchar|getc|fgetc)\s*\(", joined)
+        or "stdin" in lowered
+    )
+
+    if shell_like_stdin:
         spec.delivery = "stdin"
-        spec.evidence.append("seed consumed from stdin character stream")
-    elif "stdin" in lowered:
+        spec.evidence.append("shell-style harness executes commands from stdin")
+    elif explicit_stdin:
         spec.delivery = "stdin"
         spec.evidence.append("seed consumed from stdin")
+    elif "@@" in joined_exec_args:
+        spec.delivery = "file_placeholder"
+        spec.evidence.append("seed delivered through @@ placeholder")
     elif "argv[1]" in joined or "argc" in joined:
         spec.delivery = "argv_file"
         spec.evidence.append("seed delivered through argv/file path")
     elif "LLVMFuzzerTestOneInput" in joined:
         spec.delivery = "in_memory_buffer"
         spec.evidence.append("libFuzzer-style in-memory input")
+
+    if spec.delivery == "stdin" and "@@" in joined_exec_args:
+        spec.evidence.append("runtime placeholder stores the seed file, but replay should pipe seed bytes to stdin")
+        if set(exec_args).issubset({"@@", "/dev/null"}):
+            spec.stdin_argv_mode = "drop_all"
+            spec.evidence.append("drop sqlite-style placeholder argv during stdin replay")
+        else:
+            spec.stdin_argv_mode = "drop_placeholders"
+            spec.evidence.append("drop file placeholder argv during stdin replay")
 
     if any(token in lowered for token in ("json", "cjson_parse", "json_load", "parse_json")):
         spec.payload_kind = "json_text"
@@ -121,6 +144,8 @@ def summarize_input_adapter(spec: InputAdapterSpec | None) -> list[str]:
     lines = [f"payload_offset={spec.payload_offset}"]
     if spec.delivery != "unknown":
         lines.append(f"delivery={spec.delivery}")
+    if spec.stdin_argv_mode != "keep":
+        lines.append(f"stdin_argv_mode={spec.stdin_argv_mode}")
     if spec.payload_kind != "unknown":
         lines.append(f"payload_kind={spec.payload_kind}")
     if spec.prefix_constraints:
@@ -142,13 +167,19 @@ def build_seed_invocation(
     seed_path_str = str(seed_path)
     cmd = [program_path]
 
+    if spec and spec.delivery == "stdin":
+        if spec.stdin_argv_mode == "drop_all":
+            adapted_args = []
+        elif spec.stdin_argv_mode == "drop_placeholders":
+            adapted_args = [arg for arg in args if "@@" not in arg]
+        else:
+            adapted_args = args
+        cmd.extend(adapted_args)
+        return cmd, Path(seed_path).read_bytes()
+
     if "@@" in args:
         cmd.extend(arg.replace("@@", seed_path_str) for arg in args)
         return cmd, None
-
-    if spec and spec.delivery == "stdin":
-        cmd.extend(args)
-        return cmd, Path(seed_path).read_bytes()
 
     if spec and spec.delivery == "argv_file" and not args:
         cmd.append(seed_path_str)

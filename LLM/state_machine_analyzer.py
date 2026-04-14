@@ -29,6 +29,15 @@ from LLM.prompt_constructor import get_prompt
 
 logger = logging.getLogger(config.LOGGER_NAME + __name__)
 
+_INVALID_SLICE_MARKERS = (
+    "No matching instruction found",
+    "Source file not found",
+    "source file not found",
+    "failed to load source",
+    "unable to load source",
+    "无法加载",
+)
+
 
 def get_llm_logger():
     """Get the LLM logger instance from main module."""
@@ -435,6 +444,12 @@ class StateMachineInference:
         self.mapper = StateToInputMapper(llm_util)
         self.dependency_analyzer = StateDependencyAnalyzer(llm_util)
 
+    @staticmethod
+    def _is_valid_code_slice(code_slice: str) -> bool:
+        if not code_slice or len(code_slice.strip()) < 32:
+            return False
+        return not any(marker in code_slice for marker in _INVALID_SLICE_MARKERS)
+
     def infer_state_machine(
         self,
         code_slice: str,
@@ -452,6 +467,9 @@ class StateMachineInference:
             Dictionary containing complete state analysis, or None if pipeline fails
         """
         logger.info(f"[STATE_INFERENCE] Starting state inference for {lib}")
+        if not self._is_valid_code_slice(code_slice):
+            logger.warning("[STATE_INFERENCE] Skipping state inference because code slice is invalid or unresolved")
+            return None
 
         # Step 1: Extract state variables
         state_vars = self.extractor.extract(code_slice, target_branch, lib)
@@ -562,6 +580,9 @@ class StateMachineInference:
         from LLM.multi_stage_analyzer import MultiStageStateAnalyzer
 
         logger.info(f"[STATE_INFERENCE] Using multi-stage progressive analysis for {lib}")
+        if not self._is_valid_code_slice(code_slice):
+            logger.warning("[STATE_INFERENCE] Skipping multi-stage inference because code slice is invalid or unresolved")
+            return None
 
         # Create multi-stage analyzer for this library
         multi_stage_analyzer = MultiStageStateAnalyzer(self.llm_util, lib)

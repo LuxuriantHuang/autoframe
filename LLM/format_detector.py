@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import config
-from config import funcs, PROJECT_HOME, LOGGER_NAME
+from config import funcs, PROJECT_HOME, LOGGER_NAME, STATIC_PATH
 from LLM.LLMUtil import LLMUtil, parse_llm_json_response
 from LLM.prompt_constructor import get_prompt
 
@@ -21,6 +21,7 @@ logger = logging.getLogger(LOGGER_NAME + __name__)
 
 # Global cache for detected format info (per project)
 _input_format_cache: Dict[str, Dict[str, Any]] = {}
+_FORMAT_CACHE_FILE = "input_format_cache.json"
 
 
 class InputFormatDetector:
@@ -34,6 +35,55 @@ class InputFormatDetector:
         """
         self.llm_util = llm_util
         self._format_info: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _cache_file_path() -> Path:
+        return STATIC_PATH / _FORMAT_CACHE_FILE
+
+    @staticmethod
+    def _read_disk_cache() -> Dict[str, Dict[str, Any]]:
+        cache_file = InputFormatDetector._cache_file_path()
+        if not cache_file.exists():
+            return {}
+        try:
+            with open(cache_file, "r") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return {
+                    str(key): value
+                    for key, value in payload.items()
+                    if isinstance(value, dict)
+                }
+        except Exception as e:
+            logger.warning(f"[FORMAT_DETECT] Failed to read disk cache from {cache_file}: {e}")
+        return {}
+
+    @staticmethod
+    def _write_disk_cache(cache_payload: Dict[str, Dict[str, Any]]) -> None:
+        cache_file = InputFormatDetector._cache_file_path()
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w") as f:
+                json.dump(cache_payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"[FORMAT_DETECT] Failed to write disk cache to {cache_file}: {e}")
+
+    @staticmethod
+    def _sync_memory_cache_from_disk(lib: str) -> Optional[Dict[str, Any]]:
+        disk_cache = InputFormatDetector._read_disk_cache()
+        cached = disk_cache.get(lib)
+        if isinstance(cached, dict):
+            _input_format_cache[lib] = cached
+            logger.info(f"[FORMAT_DETECT] Using disk-cached format info for {lib}")
+            return cached
+        return None
+
+    @staticmethod
+    def _persist_cache(lib: str, format_info: Dict[str, Any]) -> None:
+        _input_format_cache[lib] = format_info
+        disk_cache = InputFormatDetector._read_disk_cache()
+        disk_cache[lib] = format_info
+        InputFormatDetector._write_disk_cache(disk_cache)
 
     def detect_format(self, lib: str = None, detection_context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """Detect the input format for the given library/project.
@@ -52,10 +102,16 @@ class InputFormatDetector:
         if lib is None:
             lib = config.PROJECT
 
-        # Check global cache first
+        # Check in-memory cache first
         if lib in _input_format_cache:
             logger.info(f"[FORMAT_DETECT] Using cached format info for {lib}")
             self._format_info = _input_format_cache[lib]
+            return self._format_info
+
+        # Then try persistent cache under static/
+        cached_from_disk = self._sync_memory_cache_from_disk(lib)
+        if cached_from_disk is not None:
+            self._format_info = cached_from_disk
             return self._format_info
 
         logger.info(f"[FORMAT_DETECT] Detecting input format for {lib}")
@@ -70,8 +126,8 @@ class InputFormatDetector:
         format_info = self._call_llm_for_format(func_content, lib, detection_context=detection_context)
         if format_info:
             format_info = self._augment_with_input_subspace_info(format_info, lib, detection_context=detection_context)
-            # Cache the result
-            _input_format_cache[lib] = format_info
+            # Cache the result in memory and under static/ for reuse across runs.
+            self._persist_cache(lib, format_info)
             self._format_info = format_info
             logger.info(f"[FORMAT_DETECT] Detected format: {format_info.get('format_name', 'unknown')}")
 
@@ -286,7 +342,10 @@ class InputFormatDetector:
         """
         if lib is None:
             lib = config.PROJECT
-        return _input_format_cache.get(lib)
+        cached = _input_format_cache.get(lib)
+        if cached is not None:
+            return cached
+        return InputFormatDetector._sync_memory_cache_from_disk(lib)
 
     @staticmethod
     def format_info_to_prompt_section(format_info: Dict[str, Any]) -> str:
@@ -347,10 +406,15 @@ class InputFormatDetector:
             lib: Library name (defaults to all if None)
         """
         global _input_format_cache
+        disk_cache = InputFormatDetector._read_disk_cache()
         if lib is None:
             _input_format_cache.clear()
-        elif lib in _input_format_cache:
-            del _input_format_cache[lib]
+            disk_cache.clear()
+        else:
+            if lib in _input_format_cache:
+                del _input_format_cache[lib]
+            disk_cache.pop(lib, None)
+        InputFormatDetector._write_disk_cache(disk_cache)
 
 
 def get_format_detector(llm_util: LLMUtil) -> InputFormatDetector:

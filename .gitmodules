@@ -1,3 +1,6 @@
 [submodule "ipl-modeling"]
 	path = ipl-modeling
 	url = git@github.com:LuxuriantHuang/ipl-modeling.git
+[submodule "AutoBug"]
+	path = AutoBug
+	url = git@github.com:LuxuriantHuang/AutoBug

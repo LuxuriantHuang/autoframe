@@ -78,8 +78,13 @@ clean_make_src() {
 prepare_targets() {
   mkdir -p "${HOME_DIR}/target/afl" "${HOME_DIR}/target/trace" "${HOME_DIR}/target/llvmcov" "${HOME_DIR}/target/ipl"
   case "${PROJECT}" in
-    cjson|cflow|cxxfilt|jhead|lcms|libpng|xmllint|mujs|pdf2text)
+    cjson|cflow|cxxfilt|jhead|lcms|libpng|xmllint|mujs|pdf2text|sqlite3)
       mkdir -p "${HOME_DIR}/target/cmplog"
+      ;;
+  esac
+  case "${PROJECT}" in
+    cjson|cflow|cxxfilt|mujs|xmllint|sqlite3)
+    mkdir -p "${HOME_DIR}/target/autobug"
       ;;
   esac
 }
@@ -396,6 +401,150 @@ build_transform_variant() {
   popd >/dev/null
 }
 
+build_sqlite3_variant() {
+  local cc="$1" cxx="$2" cflags="$3" outbin="$4" target_dir="$5" afl_cmplog="${6:-0}"
+  local sqlite_limits="-DSQLITE_MAX_LENGTH=128000000 \
+ -DSQLITE_MAX_SQL_LENGTH=128000000 \
+ -DSQLITE_MAX_MEMORY=25000000 \
+ -DSQLITE_PRINTF_PRECISION_LIMIT=1048576 \
+ -DSQLITE_DEBUG=1 \
+ -DSQLITE_MAX_PAGE_COUNT=16384"
+  local sqlite_core_src="sqlite3-all.c"
+  clean_make_src
+  pushd "${SRC_DIR}" >/dev/null
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags} ${sqlite_limits}" CXXFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
+  if [ ! -f "${sqlite_core_src}" ]; then
+    sqlite_core_src="sqlite3.c"
+  fi
+  "${CC}" ${CFLAGS} -c ossfuzz.c
+  "${CC}" ${CFLAGS} -c -w driver.c
+  "${CC}" ${CFLAGS} -c -w "${sqlite_core_src}"
+  "${CXX}" ${CXXFLAGS} \
+    "$(basename "${sqlite_core_src}" .c).o" ossfuzz.o driver.o \
+    -ldl -pthread \
+    -o "${outbin}"
+  install_binary "${SRC_DIR}/${outbin}" "${target_dir}" "${outbin}"
+  unset AFL_LLVM_CMPLOG || true
+  popd >/dev/null
+}
+
+run_sqlite3_ipl_post() {
+  local trace_name="$1"
+  local ipl_name="$2"
+  shift 2 || true
+  pushd "${HOME_DIR}/target/ipl" >/dev/null
+  cp "${HOME_DIR}/target/trace/${trace_name}.bc" "./${ipl_name}.bc"
+  USE_ZLIB=1 "${BASE}/ipl-modeling/install/test-clang++" "${ipl_name}.bc" -o "${ipl_name}" "$@"
+  popd >/dev/null
+}
+
+ensure_autobug_built() {
+  local autobug_dir="${BASE}/AutoBug"
+  if [ -x "${autobug_dir}/AutoTrace" ] && [ -x "${autobug_dir}/autobug" ] && [ -x "${autobug_dir}/e9tool" ]; then
+    return
+  fi
+  pushd "${autobug_dir}" >/dev/null
+  bash ./build.sh
+  popd >/dev/null
+}
+
+instrument_with_autobug() {
+  local binary_path="$1"
+  local autobug_dir="${BASE}/AutoBug"
+  local subject_name
+  subject_name="$(basename "${binary_path}")"
+  ensure_autobug_built
+  pushd "${autobug_dir}" >/dev/null
+  rm -f "${subject_name}.autotrace"
+  ./AutoTrace instrument "${binary_path}"
+  cp "${subject_name}.autotrace" "${HOME_DIR}/target/autobug/${subject_name}.autotrace"
+  popd >/dev/null
+}
+
+build_cjson_autobug() {
+  local build_dir="${BUILD_ROOT}/autobug"
+  rm -rf "${build_dir}"
+  mkdir -p "${build_dir}"
+  pushd "${HOME_DIR}" >/dev/null
+  export CC=clang CFLAGS="-O0 -g" AFL_CC=clang-18 AFL_CXX=clang++-18 LLVM_COMPILER=clang
+  cmake -S "${SRC_DIR}" -B "${build_dir}" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DCMAKE_C_COMPILER="${CC}" \
+    -DENABLE_FUZZING=On \
+    -DENABLE_SANITIZERS=On \
+    -DENABLE_CUSTOM_COMPILER_FLAGS=Off \
+    -DBUILD_SHARED_LIBS=Off \
+    -DCMAKE_C_FLAGS="${CFLAGS}"
+  cmake --build "${build_dir}" -j"${JOBS}" --target afl-main
+  install_binary "${build_dir}/fuzzing/afl-main" "autobug" "cjson_ori"
+  instrument_with_autobug "${build_dir}/fuzzing/afl-main"
+  popd >/dev/null
+}
+
+build_cflow_autobug() {
+  clean_autotools_src
+  pushd "${SRC_DIR}" >/dev/null
+  export CC=gcc CXX=g++ CFLAGS="-O0 -g" CXXFLAGS="-O0 -g" AFL_CC=clang-18 AFL_CXX=clang++-18
+  autoreconf -fi
+  ./configure --enable-debug
+  make -j"${JOBS}"
+  install_binary "${SRC_DIR}/src/cflow" "autobug" "cflow_ori"
+  instrument_with_autobug "${SRC_DIR}/src/cflow"
+  popd >/dev/null
+}
+
+build_cxxfilt_autobug() {
+  build_cxxfilt_variant gcc g++ "-O0 -g" "-O0 -g" cxxfilt autobug
+  pushd "${HOME_DIR}/target/autobug" >/dev/null
+  cp cxxfilt cxxfilt_ori
+  popd >/dev/null
+  instrument_with_autobug "${SRC_DIR}/cxxfilt"
+}
+
+build_xmllint_autobug() {
+  build_xmllint_variant gcc g++ "-O0 -g" "-O0 -g" xmllint autobug
+  pushd "${HOME_DIR}/target/autobug" >/dev/null
+  cp xmllint xmllint_ori
+  popd >/dev/null
+  instrument_with_autobug "${SRC_DIR}/xmllint"
+}
+
+build_mujs_autobug() {
+  build_mujs_variant gcc g++ "-O0 -g" "-O0 -g" mujs autobug
+  pushd "${HOME_DIR}/target/autobug" >/dev/null
+  cp mujs mujs_ori
+  popd >/dev/null
+  instrument_with_autobug "${SRC_DIR}/mujs"
+}
+
+build_sqlite3_autobug() {
+  local sqlite_limits="-DSQLITE_MAX_LENGTH=128000000 \
+ -DSQLITE_MAX_SQL_LENGTH=128000000 \
+ -DSQLITE_MAX_MEMORY=25000000 \
+ -DSQLITE_PRINTF_PRECISION_LIMIT=1048576 \
+ -DSQLITE_DEBUG=1 \
+ -DSQLITE_MAX_PAGE_COUNT=16384"
+  local sqlite_core_src="sqlite3-all.c"
+  clean_make_src
+  pushd "${SRC_DIR}" >/dev/null
+  export CC=gcc CXX=g++ CFLAGS="-O0 -g ${sqlite_limits}" CXXFLAGS="-O0 -g"
+  if [ ! -f "${sqlite_core_src}" ]; then
+    sqlite_core_src="sqlite3.c"
+  fi
+  "${CC}" ${CFLAGS} -c ossfuzz.c
+  "${CC}" ${CFLAGS} -c -w driver.c
+  "${CC}" ${CFLAGS} -c -w "${sqlite_core_src}"
+  "${CXX}" ${CXXFLAGS} \
+    "$(basename "${sqlite_core_src}" .c).o" ossfuzz.o driver.o \
+    -ldl -pthread \
+    -o "sqlite3_ori"
+  install_binary "${SRC_DIR}/sqlite3_ori" "autobug" "sqlite3_ori"
+  popd >/dev/null
+
+  instrument_with_autobug "${SRC_DIR}/sqlite3_ori"
+}
+
 main() {
   prepare_targets
   case "${PROJECT}" in
@@ -407,6 +556,7 @@ main() {
       build_cjson_variant clang-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
       run_ipl_post cjson_trace cjson_ipl
       run_svf_static cjson_trace
+      build_cjson_autobug
       build_cjson_bear
       clean_cmake_src
       ;;
@@ -418,6 +568,7 @@ main() {
       build_cflow_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
       run_ipl_post cflow_trace cflow_ipl
       run_svf_static cflow_trace
+      build_cflow_autobug
       build_cflow_bear
       clean_autotools_src
       ;;
@@ -429,6 +580,7 @@ main() {
       build_cxxfilt_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
       run_ipl_post cxxfilt_trace cxxfilt_ipl
       run_svf_static cxxfilt_trace
+      build_cxxfilt_autobug
       clean_autotools_src
       ;;
     jhead)
@@ -473,6 +625,7 @@ main() {
       run_ipl_post xmllint_trace xmllint_ipl
       build_xmllint_bear
       run_svf_static xmllint_trace
+      build_xmllint_autobug
       clean_autotools_src
       ;;
     mujs)
@@ -483,6 +636,7 @@ main() {
       build_mujs_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov "-std=c++11"
       run_ipl_post mujs_trace mujs_ipl -lm
       run_svf_static mujs_trace
+      build_mujs_autobug
       build_mujs_bear
       clean_make_src
       ;;
@@ -521,6 +675,17 @@ main() {
       run_trace_post transform_trace
       build_transform_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
       run_svf_static transform_trace
+      clean_make_src
+      ;;
+    sqlite3)
+      build_sqlite3_variant afl-clang-fast afl-clang-fast++ "-g -O0" sqlite3_fuzz afl
+      build_sqlite3_variant afl-clang-fast afl-clang-fast++ "-g -O0" sqlite3_cmplog cmplog 1
+      build_sqlite3_variant gclang gclang++ "-g -O0" sqlite3_trace trace
+      run_trace_post sqlite3_trace -ldl -pthread
+      build_sqlite3_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      run_sqlite3_ipl_post sqlite3_trace sqlite3_ipl -ldl -pthread
+      run_svf_static sqlite3_trace
+      build_sqlite3_autobug
       clean_make_src
       ;;
     *)

@@ -163,6 +163,7 @@ else:
 # 旧逻辑保留：
 CHECK_INTERVAL = 10  # 每 10 秒检查一次
 TIMEOUT = 30
+AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND = int(os.getenv("AF_AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND", "32"))
 PROJECT_HOME = ROOT_DIR / "benchmarks" / PROJECT
 STATIC_PATH = Path(PROJECT_HOME) / "static"
 OUTPUT_PATH = PROJECT_HOME / OUTPUT_DIR_NAME
@@ -181,7 +182,7 @@ RUN_SYMBOLIC_PATH = RUN_RUNTIME_PATH / "symbolic"
 PLOT_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "plot_data"
 SEED_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "queue"
 FUZZER_STATS_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "fuzzer_stats"
-DEPTH_THRESHOLD = 3
+DEPTH_THRESHOLD = 0
 
 # ============================================================
 # Input/Output Paths
@@ -232,6 +233,10 @@ def resolve_source_path(path_like) -> Path | None:
             candidate_strings.append((SRC_BEAR_PATH / candidate_path).as_posix())
             candidate_strings.append((SRC_PATH / candidate_path).as_posix())
 
+        # Some projects keep generated sources as templates such as shell.c.in.
+        if not candidate.endswith(".in"):
+            candidate_strings.append(f"{candidate}.in")
+
         for build_base in base_candidates:
             for variant in build_variants:
                 build_prefix = f"{build_base}/{variant}/"
@@ -250,6 +255,9 @@ def resolve_source_path(path_like) -> Path | None:
         if filename:
             candidate_strings.append((SRC_BEAR_PATH / filename).as_posix())
             candidate_strings.append((SRC_PATH / filename).as_posix())
+            if not filename.endswith(".in"):
+                candidate_strings.append((SRC_BEAR_PATH / f"{filename}.in").as_posix())
+                candidate_strings.append((SRC_PATH / f"{filename}.in").as_posix())
 
     seen = set()
     for candidate in candidate_strings:
@@ -259,6 +267,19 @@ def resolve_source_path(path_like) -> Path | None:
         resolved = Path(candidate)
         if resolved.exists():
             return resolved
+
+    filename = Path(str(path_like)).name
+    if filename:
+        recursive_targets = [filename]
+        if not filename.endswith(".in"):
+            recursive_targets.append(f"{filename}.in")
+        for source_root in (SRC_BEAR_PATH, SRC_PATH):
+            if not source_root.exists():
+                continue
+            for target_name in recursive_targets:
+                for match in source_root.rglob(target_name):
+                    if match.exists():
+                        return match
 
     return None
 
@@ -305,7 +326,7 @@ def update_indirect_calls(static_func, new_edges):
             existing_calls.update(new_calls)  # 原地合并
             func["calls"] = list(existing_calls)
 
-EXEC_ARGS = "@@ /dev/null"
+EXEC_ARGS = ""
 
 # llvm-cov config
 COV_TARGET_PATH = PROJECT_HOME / "target" / "llvmcov" / "target"
@@ -498,6 +519,14 @@ def get_branch_queue_dir(branch_id: str) -> Path:
     return get_branch_output_dir(branch_id) / "queue"
 
 
+def get_named_output_dir(name: str) -> Path:
+    return OUTPUT_PATH / sanitize_fs_component(name)
+
+
+def get_named_queue_dir(name: str) -> Path:
+    return get_named_output_dir(name) / "queue"
+
+
 def get_batch_mutation_dir(branch_id: str) -> Path:
     return get_branch_output_dir(branch_id) / "batch_mutation"
 
@@ -510,15 +539,74 @@ def get_batch_mutation_filtered_seed_dir(branch_id: str) -> Path:
     return get_batch_mutation_dir(branch_id) / "filtered_seeds"
 
 
+def build_queue_seed_name(
+    seed_id: int,
+    *,
+    path_prefix: str | None = None,
+    roadblock_id: int | str | None = None,
+    src_id: int | str | None = None,
+    aux_id: int | str | None = None,
+    suffix: str = "",
+) -> str:
+    parts = [f"id:{int(seed_id):06}"]
+    if path_prefix:
+        parts.append(f"path:{sanitize_fs_component(path_prefix)}")
+    if roadblock_id is not None:
+        parts.append(f"bid:{int(roadblock_id):06}")
+    if src_id is not None:
+        parts.append(f"src:{int(src_id):06}")
+    if aux_id is not None:
+        parts.append(f"aux:{int(aux_id):02}")
+    return ",".join(parts) + suffix
+
+
+def next_queue_seed_path(
+    queue_dir: str | Path,
+    *,
+    path_prefix: str | None = None,
+    roadblock_id: int | str | None = None,
+    src_id: int | str | None = None,
+    aux_id: int | str | None = None,
+    suffix: str = "",
+) -> Path:
+    queue_path = Path(queue_dir)
+    queue_path.mkdir(parents=True, exist_ok=True)
+    next_id = 0
+    for entry in queue_path.iterdir():
+        if not entry.is_file():
+            continue
+        match = re.match(r"id:(\d+)", entry.name)
+        if not match:
+            continue
+        next_id = max(next_id, int(match.group(1)) + 1)
+
+    while True:
+        candidate = queue_path / build_queue_seed_name(
+            next_id,
+            path_prefix=path_prefix,
+            roadblock_id=roadblock_id,
+            src_id=src_id,
+            aux_id=aux_id,
+            suffix=suffix,
+        )
+        if not candidate.exists():
+            return candidate
+        next_id += 1
+
+
 def iter_experiment_queue_dirs() -> list[Path]:
     queue_dirs = [SEED_PATH, LLM_QUEUE_PATH, MUT_QUEUE_PATH, SYMBOLIC_QUEUE_PATH]
+    seen: set[str] = {os.fspath(path.resolve()) for path in queue_dirs if path.exists()}
     try:
         for entry in sorted(OUTPUT_PATH.iterdir()):
-            if not entry.is_dir() or not entry.name.startswith("branch_"):
+            if not entry.is_dir():
                 continue
             queue_path = entry / "queue"
             if queue_path.is_dir():
-                queue_dirs.append(queue_path)
+                resolved = os.fspath(queue_path.resolve())
+                if resolved not in seen:
+                    queue_dirs.append(queue_path)
+                    seen.add(resolved)
     except FileNotFoundError:
         pass
     return queue_dirs
@@ -626,11 +714,11 @@ STATE_DRIVEN_DEBUG = False  # 输出详细的映射分析日志
 # 未覆盖代码探索配置 (Uncovered Code Exploration)
 # ============================================================
 
-# Fallback to zero-branch only when no one-sided roadblocks are available
-ENABLE_ZERO_BRANCH_SECOND_STAGE = True
+# Zero-branch path has been removed from the active scheduler/main flow.
+ENABLE_ZERO_BRANCH_SECOND_STAGE = False
 
 # 启用开关：控制是否探索不同类型的未覆盖代码
-ENABLE_ZERO_COVERED_EXPLORATION = True   # 探索零覆盖分支（两边都未执行）
+ENABLE_ZERO_COVERED_EXPLORATION = False  # 零覆盖分支路径已停用
 ENABLE_UNCALLED_FUNC_EXPLORATION = True  # 探索未调用函数
 ENABLE_UNEXECUTED_BLOCK_EXPLORATION = True  # 探索未执行基本块
 

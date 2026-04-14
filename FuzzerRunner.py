@@ -44,6 +44,7 @@ class FuzzerRunner:
         env['AFL_DISABLE_TRIM'] = '1'
         env['AFL_NO_UI'] = '1'
         env['AFL_QUIET'] = '1'
+        env['AFL_FUZZER_STATS_UPDATE_INTERVAL'] = '5'  # 每5秒更新一次 stats 文件
         logger.info(f"Fuzzer执行命令：{' '.join(cmd)}")
         self.fuzzer_process = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
                                                stderr=subprocess.DEVNULL)

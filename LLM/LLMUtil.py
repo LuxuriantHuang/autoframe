@@ -170,17 +170,21 @@ def _make_generator_run_dir(bottleneck_id, seed_id) -> Path:
     return run_dir
 
 
-def _move_generator_artifacts_to_queue(run_dir: Path, bottleneck_id: int) -> list[str]:
+def _move_generator_artifacts_to_queue(run_dir: Path, bottleneck_id: int, path_prefix: str | None = None) -> list[str]:
     llm_target_path = Path(config.LLM_QUEUE_PATH)
     llm_target_path.mkdir(parents=True, exist_ok=True)
 
     moved_paths = []
     artifact_index = 0
     for artifact_path in sorted(p for p in run_dir.rglob("*") if p.is_file()):
-        queue_size = len(os.listdir(llm_target_path))
         suffix = artifact_path.suffix if artifact_path.suffix else ""
-        dest_name = f"id:{int(queue_size):06},bid:{int(bottleneck_id):06},aux:{artifact_index:02}{suffix}"
-        dest_path = llm_target_path / dest_name
+        dest_path = config.next_queue_seed_path(
+            llm_target_path,
+            path_prefix=path_prefix,
+            roadblock_id=bottleneck_id,
+            aux_id=artifact_index,
+            suffix=suffix,
+        )
         shutil.move(os.fspath(artifact_path), os.fspath(dest_path))
         moved_paths.append(os.fspath(dest_path))
         artifact_index += 1
@@ -239,17 +243,21 @@ def _make_mutator_run_dir(seed_id) -> Path:
     return run_dir
 
 
-def _move_mutator_artifacts_to_queue(run_dir: Path, orig_id: int) -> list[str]:
+def _move_mutator_artifacts_to_queue(run_dir: Path, orig_id: int, path_prefix: str | None = None) -> list[str]:
     mut_target_path = Path(config.MUT_QUEUE_PATH)
     mut_target_path.mkdir(parents=True, exist_ok=True)
 
     moved_paths = []
     artifact_index = 0
     for artifact_path in sorted(p for p in run_dir.rglob("*") if p.is_file()):
-        queue_size = len(os.listdir(mut_target_path))
         suffix = artifact_path.suffix if artifact_path.suffix else ""
-        dest_name = f"id:{int(queue_size):06},src:{orig_id:06},aux:{artifact_index:02}{suffix}"
-        dest_path = mut_target_path / dest_name
+        dest_path = config.next_queue_seed_path(
+            mut_target_path,
+            path_prefix=path_prefix,
+            src_id=orig_id,
+            aux_id=artifact_index,
+            suffix=suffix,
+        )
         shutil.move(os.fspath(artifact_path), os.fspath(dest_path))
         moved_paths.append(os.fspath(dest_path))
         artifact_index += 1
@@ -257,7 +265,14 @@ def _move_mutator_artifacts_to_queue(run_dir: Path, orig_id: int) -> list[str]:
     return moved_paths
 
 
-def run_generator(generator, bottleneck_id, seed_id, output_dir):
+def run_generator(
+    generator,
+    bottleneck_id,
+    seed_id,
+    output_dir,
+    path_prefix: str | None = None,
+    queue_dir: str | Path | None = None,
+):
     generator = normalize_python_script(generator)
     # 记录脚本内容（debug级别）
     logger.debug(f"[GENERATOR_SCRIPT] ===== Generator Script Content (attempt for seed_id={seed_id}) =====")
@@ -271,10 +286,15 @@ def run_generator(generator, bottleneck_id, seed_id, output_dir):
         file.write(generator)
 
     # 直接写入LLM/queue，跳过LLM_TMP_PATH
-    LLM_TARGET_PATH = Path(config.LLM_QUEUE_PATH)
+    LLM_TARGET_PATH = Path(queue_dir) if queue_dir is not None else Path(config.LLM_QUEUE_PATH)
     os.makedirs(LLM_TARGET_PATH, exist_ok=True)
-    n = len(os.listdir(LLM_TARGET_PATH))
-    new_seed_path = os.fspath(LLM_TARGET_PATH / f"id:{int(n):06},bid:{int(bottleneck_id):06}")
+    new_seed_path = os.fspath(
+        config.next_queue_seed_path(
+            LLM_TARGET_PATH,
+            path_prefix=path_prefix,
+            roadblock_id=bottleneck_id,
+        )
+    )
     run_dir = _make_generator_run_dir(bottleneck_id, seed_id)
     logger.info(f"生成脚本执行 - 目标文件: {new_seed_path}")
     logger.info(f"生成脚本执行 - 隔离目录: {run_dir}")
@@ -290,7 +310,7 @@ def run_generator(generator, bottleneck_id, seed_id, output_dir):
             timeout=30  # 添加超时限制
         )
 
-        artifact_paths = _move_generator_artifacts_to_queue(run_dir, bottleneck_id)
+        artifact_paths = _move_generator_artifacts_to_queue(run_dir, bottleneck_id, path_prefix=path_prefix)
         if artifact_paths:
             logger.info(f"生成脚本执行 - 从隔离目录收集到 {len(artifact_paths)} 个附加种子")
 
@@ -347,7 +367,14 @@ def run_generator(generator, bottleneck_id, seed_id, output_dir):
             shutil.rmtree(run_dir, ignore_errors=True)
 
 
-def run_mutate_script(script, seed_id, orig_seed, output_dir):
+def run_mutate_script(
+    script,
+    seed_id,
+    orig_seed,
+    output_dir,
+    path_prefix: str | None = None,
+    queue_dir: str | Path | None = None,
+):
     script = normalize_python_script(script)
     # 记录脚本内容（debug级别）
     logger.debug(f"[MUTATE_SCRIPT] ===== Mutate Script Content (attempt for seed_id={seed_id}) =====")
@@ -362,18 +389,19 @@ def run_mutate_script(script, seed_id, orig_seed, output_dir):
 
     orig_id = re.search(r'id:(\d+)', orig_seed).group(1)
     orig_id = int(orig_id) if int(orig_id) else 0
-    if "LLM" in orig_seed:
-        orig_seed_path = config.LLM_QUEUE_PATH / orig_seed
-    elif "mut" in orig_seed:
-        orig_seed_path = config.MUT_QUEUE_PATH / orig_seed
-    else:
-        orig_seed_path = os.path.join(config.SEED_PATH, orig_seed)
+    resolved_seed = config.find_seed_path(orig_seed)
+    orig_seed_path = os.fspath(resolved_seed) if resolved_seed is not None else os.path.join(config.SEED_PATH, orig_seed)
 
     # 直接写入mut/queue，跳过MUT_TMP_PATH
-    MUT_TARGET_PATH = config.MUT_QUEUE_PATH
+    MUT_TARGET_PATH = Path(queue_dir) if queue_dir is not None else Path(config.MUT_QUEUE_PATH)
     os.makedirs(MUT_TARGET_PATH, exist_ok=True)
-    n = len(os.listdir(MUT_TARGET_PATH))
-    new_seed_path = os.path.join(MUT_TARGET_PATH, f"id:{int(n):06},src:{orig_id:06}")
+    new_seed_path = os.fspath(
+        config.next_queue_seed_path(
+            MUT_TARGET_PATH,
+            path_prefix=path_prefix,
+            src_id=orig_id,
+        )
+    )
     run_dir = _make_mutator_run_dir(seed_id)
     logger.info(f"变异脚本执行 - 原种子: {orig_seed_path}")
     logger.info(f"变异脚本执行 - 新种子: {new_seed_path}")
@@ -389,7 +417,7 @@ def run_mutate_script(script, seed_id, orig_seed, output_dir):
             timeout=30  # 添加超时限制
         )
 
-        artifact_paths = _move_mutator_artifacts_to_queue(run_dir, orig_id)
+        artifact_paths = _move_mutator_artifacts_to_queue(run_dir, orig_id, path_prefix=path_prefix)
         if artifact_paths:
             logger.info(f"变异脚本执行 - 从隔离目录收集到 {len(artifact_paths)} 个附加种子")
 
