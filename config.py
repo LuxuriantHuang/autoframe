@@ -45,7 +45,7 @@ LLM_LOGGING_FORMAT = "%(asctime)s - %(name)s:%(lineno)d - %(levelname)s - %(mess
 ROOT_DIR = Path(os.getenv("AF_HOME", Path(__file__).resolve().parent)).resolve()
 load_dotenv(ROOT_DIR / ".env")
 
-test = os.getenv("AF_TEST_MODE", "1").lower() in {"1", "true", "yes", "on"}
+test = os.getenv("AF_TEST_MODE", "0").lower() in {"1", "true", "yes", "on"}
 DEFAULT_DELETE_OUT = True
 HOUR = 3600
 MAX_DURATION = 3 * HOUR
@@ -163,6 +163,7 @@ else:
 # 旧逻辑保留：
 CHECK_INTERVAL = 10  # 每 10 秒检查一次
 TIMEOUT = 30
+AUTOBUG_SCAN_INTERVAL = 180
 AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND = int(os.getenv("AF_AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND", "32"))
 PROJECT_HOME = ROOT_DIR / "benchmarks" / PROJECT
 STATIC_PATH = Path(PROJECT_HOME) / "static"
@@ -494,6 +495,7 @@ def ensure_runtime_layout() -> None:
         RUN_MUT_PATH / "tmp",
         RUN_MUT_PATH / "scripts",
         RUN_SLICE_PATH,
+        RUN_SLICE_PATH / "direct_generation",
         RUN_TRACE_PATH,
         RUN_TAINT_PATH,
         RUN_SEMANTIC_FIELDS_PATH,
@@ -627,6 +629,15 @@ def find_seed_path(seed_name: str) -> Path | None:
 def get_slice_output_path(label: str | None = None) -> Path:
     suffix = sanitize_fs_component(label or "slice")
     return RUN_SLICE_PATH / f"{suffix}.txt"
+
+
+def get_direct_generation_slice_dir() -> Path:
+    return RUN_SLICE_PATH / "direct_generation"
+
+
+def get_direct_generation_slice_path(label: str | None = None) -> Path:
+    suffix = sanitize_fs_component(label or "direct_generation_slice")
+    return get_direct_generation_slice_dir() / f"{suffix}.txt"
 
 
 def get_generator_script_path(bottleneck_id: int | str, seed_id: int | str) -> Path:

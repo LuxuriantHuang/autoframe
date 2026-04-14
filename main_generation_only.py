@@ -184,6 +184,7 @@ class GenerationOnlyCoordinator:
             ret, new_last_scan_time, error_info, roadblocks = self.tracer.get_trace(
                 self.read_files, self.last_scan_time
             )
+            self.tracer.kick_autobug_prime_async()
             if "没有新的seed" in error_info and not roadblocks:
                 core.logger.info(f"[{core.LogOp.ROADBLOCK}] {error_info}")
                 roadblocks = self.tracer.get_current_one_sided_branches()
@@ -263,6 +264,8 @@ class GenerationOnlyCoordinator:
 
     def monitor_roadblock_pool(self, every_n_seconds=ROADBLOCK_REFRESH_INTERVAL):
         while not self.stop_event.is_set():
+            self.tracer.poll_autobug_seed_queue()
+            self.tracer.kick_autobug_prime_async()
             cur_time = time.time()
             if cur_time - self.last_refresh_time >= every_n_seconds:
                 try:
@@ -279,6 +282,8 @@ class GenerationOnlyCoordinator:
 
     def monitor_coverage_plateau(self, every_n_seconds=PLATEAU_MONITOR_INTERVAL):
         while not self.stop_event.is_set():
+            self.tracer.poll_autobug_seed_queue()
+            self.tracer.kick_autobug_prime_async()
             cur_time = time.time()
             if cur_time - self.last_solve_check_time < every_n_seconds:
                 time.sleep(1)

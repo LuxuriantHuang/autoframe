@@ -7,11 +7,12 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections import defaultdict
+import threading
+from collections import defaultdict, deque
 from input_adapter import build_seed_invocation
 import time
 import config
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from shlex import split
@@ -1479,12 +1480,19 @@ class CoverageTracer:
         self._autobug_cache_dir = self.trace_dir / "autobug"
         self._autobug_cache_dir.mkdir(parents=True, exist_ok=True)
         self._autobug_branch_cache_path = self._autobug_cache_dir / "seed_branches.json"
+        self._autobug_pending_seed_names: deque[str] = deque()
+        self._autobug_pending_seed_name_set: set[str] = set()
+        self._autobug_prime_lock = threading.Lock()
+        self._autobug_prime_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autobug-prime")
+        self._autobug_prime_future = None
+        self._autobug_queue_read_files: set[Path] = set()
+        self._autobug_queue_last_scan_time_ns = 0
+        self._autobug_last_queue_poll_at = 0.0
         self._load_persisted_autobug_branch_cache()
         stats = self._read_fuzzer_stats_summary()
         if stats.get("edges_found") is not None:
             self.last_coverage = int(stats["edges_found"])
-        if stats.get("time_wo_finds") is not None:
-            self.last_growth_time = time.time() - float(stats["time_wo_finds"])
+        self.last_growth_time = time.time()
 
     def _read_fuzzer_stats_summary(self) -> dict[str, int | None]:
         stats: dict[str, int | None] = {
@@ -1570,6 +1578,111 @@ class CoverageTracer:
             )
         except Exception as exc:
             logger.warning("[AUTOBUG] Failed to save branch cache %s: %s", self._autobug_branch_cache_path, exc)
+
+    def enqueue_autobug_seed_names(self, seed_names: list[str]) -> None:
+        if not seed_names:
+            return
+        pending_after = 0
+        with self._autobug_prime_lock:
+            enqueued = 0
+            for seed_name in seed_names:
+                if seed_name in self._autobug_seed_branch_cache:
+                    continue
+                if seed_name in self._autobug_pending_seed_name_set:
+                    continue
+                self._autobug_pending_seed_names.append(seed_name)
+                self._autobug_pending_seed_name_set.add(seed_name)
+                enqueued += 1
+            pending_after = len(self._autobug_pending_seed_names)
+        if enqueued > 0:
+            logger.info(
+                "[AUTOBUG] Enqueued %d seed(s) for async branch-cache priming (pending=%d)",
+                enqueued,
+                pending_after,
+            )
+
+    def poll_autobug_seed_queue(self) -> int:
+        now = time.time()
+        if self._autobug_last_queue_poll_at > 0 and now - self._autobug_last_queue_poll_at < AUTOBUG_SCAN_INTERVAL:
+            return 0
+        self._autobug_last_queue_poll_at = now
+        discovered_seed_names: list[str] = []
+        latest_scan = int(self._autobug_queue_last_scan_time_ns or 0)
+        queue_dir = SEED_PATH
+        if queue_dir.exists() and queue_dir.is_dir():
+            try:
+                files_to_run, _, latest_scan = get_new_seeds(
+                    queue_dir,
+                    self._autobug_queue_read_files,
+                    latest_scan,
+                    prof_dir=None,
+                )
+                discovered_seed_names.extend(path.name for path in files_to_run)
+            except FileNotFoundError:
+                pass
+        self._autobug_queue_last_scan_time_ns = latest_scan
+        if discovered_seed_names:
+            logger.info(
+                "[AUTOBUG] Queue scan discovered %d new seed(s) from %s for branch-cache backlog",
+                len(discovered_seed_names),
+                queue_dir,
+            )
+            self.enqueue_autobug_seed_names(discovered_seed_names)
+        else:
+            logger.info(
+                "[AUTOBUG] Queue scan found no new seed in %s (interval=%ss)",
+                queue_dir,
+                AUTOBUG_SCAN_INTERVAL,
+            )
+        return len(discovered_seed_names)
+
+    def kick_autobug_prime_async(self) -> bool:
+        with self._autobug_prime_lock:
+            if self._autobug_prime_future is not None and not self._autobug_prime_future.done():
+                logger.info(
+                    "[AUTOBUG] Async branch-cache priming already running (pending=%d)",
+                    len(self._autobug_pending_seed_names),
+                )
+                return False
+            if self._autobug_prime_future is not None and self._autobug_prime_future.done():
+                try:
+                    self._autobug_prime_future.result()
+                except Exception as exc:
+                    logger.warning("[AUTOBUG] Async priming task failed: %s", exc)
+                self._autobug_prime_future = None
+
+            max_per_round = max(1, int(AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND))
+            batch: list[str] = []
+            while self._autobug_pending_seed_names and len(batch) < max_per_round:
+                seed_name = self._autobug_pending_seed_names.popleft()
+                self._autobug_pending_seed_name_set.discard(seed_name)
+                if seed_name in self._autobug_seed_branch_cache:
+                    continue
+                batch.append(seed_name)
+            deferred = len(self._autobug_pending_seed_names)
+        if not batch:
+            return False
+        logger.info(
+            "[AUTOBUG] Scheduling async branch-cache priming for %d seed(s) (deferred=%d, cap=%d)",
+            len(batch),
+            deferred,
+            max_per_round,
+        )
+        self._autobug_prime_future = self._autobug_prime_executor.submit(self._run_autobug_prime_batch, batch)
+        return True
+
+    def _run_autobug_prime_batch(self, seed_names: list[str]) -> None:
+        start_time = time.time()
+        self._prime_autobug_seed_branches(seed_names)
+        elapsed = max(time.time() - start_time, 0.0)
+        with self._autobug_prime_lock:
+            remaining = len(self._autobug_pending_seed_names)
+        logger.info(
+            "[AUTOBUG] Async branch-cache priming batch finished: processed=%d, elapsed=%.1fs, pending=%d",
+            len(seed_names),
+            elapsed,
+            remaining,
+        )
 
     def _prime_autobug_seed_branches(self, seed_names: list[str]) -> None:
         if not seed_names:
@@ -1985,6 +2098,7 @@ class CoverageTracer:
         with tempfile.TemporaryDirectory(prefix="autobug-branch-", dir=self._autobug_cache_dir) as tmpdir:
             tmpdir_path = Path(tmpdir)
             trace_path = tmpdir_path / "TRACE.dump"
+
             command, stdin_data = build_seed_invocation(
                 os.fspath(subject),
                 self.fuzzing_args,
@@ -2239,7 +2353,7 @@ class CoverageTracer:
         return self.last_coverage
 
     def check_coverage_growth(self):
-        """通过滑动窗口获得瓶颈时间"""
+        """Use sampled edges_found deltas to determine stagnation."""
         stats = self._read_fuzzer_stats_summary()
         current_coverage = (
             int(stats["edges_found"]) if stats.get("edges_found") is not None else self.last_coverage
@@ -2248,28 +2362,24 @@ class CoverageTracer:
         now = time.time()
         time_wo_finds = stats.get("time_wo_finds")
         last_find = stats.get("last_find")
-        if time_wo_finds is not None:
-            logger.info(
-                f"[COVERAGE] edges_found={current_coverage}, time_wo_finds={int(time_wo_finds)}s, "
-                f"sample_delta={growth}, last_find={last_find or 0}"
-            )
-            self.last_coverage = current_coverage
-            self.last_growth_time = now - float(time_wo_finds)
-            return float(time_wo_finds)
-
-        logger.info(
-            f"[COVERAGE] edges_found={current_coverage}, sample_delta={growth}, "
-            f"fallback_stagnation={now - self.last_growth_time:.1f}s"
-        )
         if growth >= THRESHOLD_COV_DELTA:
-            logger.info(f"[COVERAGE] Coverage increased by {growth} edges since last sample")
+            logger.info(
+                f"[COVERAGE] edges_found={current_coverage}, sample_delta={growth}, "
+                f"last_find={last_find or 0}"
+            )
+            # logger.info(f"[COVERAGE] Coverage increased by {growth} edges since last sample")
             self.last_coverage = current_coverage
             self.last_growth_time = now
             return 0
-        else:
-            stagnation_time = now - self.last_growth_time
-            logger.info(f"[COVERAGE] Fallback stagnation time: {stagnation_time:.1f}s")
-            return stagnation_time
+
+        self.last_coverage = current_coverage
+        stagnation_time = now - self.last_growth_time
+        logger.info(
+            f"[COVERAGE] edges_found={current_coverage}, sample_delta={growth}, "
+            f"stagnation={stagnation_time:.1f}s, time_wo_finds={int(time_wo_finds) if time_wo_finds is not None else 0}s, "
+            f"last_find={last_find or 0}"
+        )
+        return stagnation_time
 
     def get_trace(self, read_files: set, last_scan_time: int):  # 后续修改为多进程
         new_call_edge = CallEdge()
@@ -2412,7 +2522,7 @@ class CoverageTracer:
 
         self.last_trace_timestamp_ns = max(self.last_trace_timestamp_ns, int(last_scan_time or 0))
         self._save_trace_progress(self.last_trace_timestamp_ns, seed_lst_to_run[-1].name if seed_lst_to_run else None)
-        self._prime_autobug_seed_branches([seed_path.name for seed_path in seed_lst_to_run])
+        self.enqueue_autobug_seed_names([seed_path.name for seed_path in seed_lst_to_run])
         logger.debug("llvmcov merge end, indirect calls update begin")
         # update_indirect_calls(funcs, new_call_edge.call_edges)
         logger.debug("indirect calls updated")

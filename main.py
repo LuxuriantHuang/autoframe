@@ -947,6 +947,15 @@ def _probe_slice_line_for_roadblock(roadblock: dict[str, Any]) -> int | None:
     return rb_line if isinstance(rb_line, int) else None
 
 
+def _direct_generation_slice_cache_path(roadblock: dict[str, Any]) -> Path:
+    roadblock_key = roadblock.get('roadblock_key') or get_roadblock_key(roadblock)
+    digest = hashlib.sha1(str(roadblock_key).encode("utf-8", errors="ignore")).hexdigest()[:10]
+    stem = sanitize_fs_component(
+        f"{Path(str(roadblock.get('filename', 'unknown'))).name}_{roadblock.get('line', 0)}_{digest}"
+    )
+    return config.get_direct_generation_slice_path(stem)
+
+
 def ensure_cached_single_function_slice(
     roadblock: dict[str, Any],
     llm_util: LLMUtil,
@@ -956,6 +965,13 @@ def ensure_cached_single_function_slice(
     cached_slice = roadblock.get('cached_single_function_slice')
     if cached_slice and isinstance(cached_slice, str):
         return cached_slice
+    disk_cache_path = _direct_generation_slice_cache_path(roadblock)
+    if disk_cache_path.exists():
+        disk_cached_slice = disk_cache_path.read_text(encoding="utf-8", errors="ignore").strip()
+        if disk_cached_slice:
+            roadblock['cached_single_function_slice'] = disk_cached_slice
+            roadblock['cached_single_function_call_chain'] = roadblock.get('cached_single_function_call_chain') or []
+            return disk_cached_slice
 
     rb_fname = roadblock.get('function') or get_function_name(roadblock)[0] or ""
     if not rb_fname:
@@ -977,6 +993,8 @@ def ensure_cached_single_function_slice(
 
     roadblock['cached_single_function_slice'] = code_slice
     roadblock['cached_single_function_call_chain'] = fallback_chain
+    disk_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    disk_cache_path.write_text(code_slice, encoding="utf-8")
     return code_slice
 
 
@@ -2124,6 +2142,7 @@ class PlateauAttemptOrchestrator:
             self.start_new_epoch(stuck_time)
 
         ret, last_scan_time, error_info, roadblocks = self.tracer.get_trace(read_files, last_scan_time)
+        self.tracer.kick_autobug_prime_async()
         if not ret:
             if "没有新的seed" in error_info:
                 logger.info(f"[{LogOp.ROADBLOCK}] {error_info}")
@@ -8177,7 +8196,8 @@ def main():
         cached_format_info = ensure_cached_format_info(llm_util)
         orchestrator = PlateauAttemptOrchestrator(tracer, llm_util)
         logger.info(
-            f"[{LogOp.ROADBLOCK}] Coverage monitor is active; roadblock tracing remains demand-driven until plateau"
+            f"[{LogOp.ROADBLOCK}] Coverage monitor is active; trace extraction starts on plateau, "
+            f"while AutoBug branch-cache priming may continue asynchronously in the background"
         )
         iteration_count = 0
         while True:
@@ -8189,7 +8209,9 @@ def main():
                 logger.critical("[{LogOp.FUZZER}] Fuzzer died, initiating graceful shutdown...")
                 raise
 
+            tracer.poll_autobug_seed_queue()
             stuck_time = tracer.check_coverage_growth()
+            tracer.kick_autobug_prime_async()
             epoch_active = orchestrator.has_active_epoch()
             if not epoch_active and stuck_time < THRESHOLD_TIME:
                 logger.info(

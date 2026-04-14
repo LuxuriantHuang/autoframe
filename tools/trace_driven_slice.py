@@ -12,6 +12,11 @@ if REPO_ROOT.as_posix() not in sys.path:
     sys.path.insert(0, REPO_ROOT.as_posix())
 
 from pyTracer.SeedTracer import SeedTracer
+from tree_sitter_languages import get_language, get_parser
+
+
+PARSER = get_parser("c")
+C_LANGUAGE = get_language("c")
 
 
 def _same_source_file(lhs: str, rhs: str) -> bool:
@@ -139,7 +144,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-bin", required=True, help="Path to the *_trace binary")
     parser.add_argument("--trace-args", required=True, help="Trace binary args, use @@ as seed placeholder")
     parser.add_argument("--seed", required=True, help="Seed path")
-    parser.add_argument("--static-json", required=True, help="Path to static/static.json")
+    parser.add_argument("--static-json", required=False, default="", help="Optional legacy static/static.json path")
     parser.add_argument("--source-root", required=True, help="Project source root")
     parser.add_argument("--target-loc", required=True, help="Target location like parser.c:10513")
     parser.add_argument("--window", type=int, default=20, help="Post-target trace window size")
@@ -159,6 +164,105 @@ def _load_static_index(static_json: Path) -> dict[str, dict]:
         if not name or name in index:
             continue
         index[name] = item
+    return index
+
+
+def _get_text(source_bytes: bytes, node) -> str:
+    return source_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+
+
+def _find_identifier(node, source_bytes: bytes) -> Optional[str]:
+    if node is None:
+        return None
+    if node.type == "identifier":
+        return _get_text(source_bytes, node)
+    for child in getattr(node, "children", []) or []:
+        found = _find_identifier(child, source_bytes)
+        if found:
+            return found
+    return None
+
+
+def _iter_function_definitions(root):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "function_definition":
+            yield node
+        children = list(getattr(node, "children", []) or [])
+        stack.extend(reversed(children))
+
+
+def _function_metadata_by_name(source_file: Path, function_name: str) -> Optional[dict]:
+    try:
+        source_bytes = source_file.read_bytes()
+    except OSError:
+        return None
+    tree = PARSER.parse(source_bytes)
+    for node in _iter_function_definitions(tree.root_node):
+        declarator = node.child_by_field_name("declarator")
+        identifier = _find_identifier(declarator, source_bytes)
+        if identifier != function_name:
+            continue
+        return {
+            "name": function_name,
+            "file_name": source_file.as_posix(),
+            "lineStart": int(node.start_point[0]) + 1,
+            "lineEnd": int(node.end_point[0]) + 1,
+        }
+    return None
+
+
+def _find_enclosing_function_metadata(source_file: Path, line_no: int) -> Optional[dict]:
+    try:
+        source_bytes = source_file.read_bytes()
+    except OSError:
+        return None
+    tree = PARSER.parse(source_bytes)
+    target_row = max(0, int(line_no) - 1)
+    best_node = None
+    for node in _iter_function_definitions(tree.root_node):
+        if node.start_point[0] <= target_row <= node.end_point[0]:
+            if best_node is None or (
+                node.start_point[0] >= best_node.start_point[0]
+                and node.end_point[0] <= best_node.end_point[0]
+            ):
+                best_node = node
+    if best_node is None:
+        return None
+    declarator = best_node.child_by_field_name("declarator")
+    identifier = _find_identifier(declarator, source_bytes) or source_file.stem
+    return {
+        "name": identifier,
+        "file_name": source_file.as_posix(),
+        "lineStart": int(best_node.start_point[0]) + 1,
+        "lineEnd": int(best_node.end_point[0]) + 1,
+    }
+
+
+def _build_function_index(summary: TraceDrivenSummary, source_root: Path) -> dict[str, dict]:
+    index: dict[str, dict] = {}
+    target_source = _find_source_file(source_root, summary.target_file)
+    target_meta = _find_enclosing_function_metadata(target_source, summary.target_line) if target_source else None
+    if target_meta:
+        index[str(target_meta["name"])] = target_meta
+
+    for func_name in summary.call_path:
+        if func_name in index:
+            continue
+        file_candidates = list((summary.function_locations.get(func_name) or {}).keys())
+        for file_name in file_candidates:
+            source_file = _find_source_file(source_root, file_name)
+            if source_file is None:
+                continue
+            meta = _function_metadata_by_name(source_file, func_name)
+            if meta:
+                index[func_name] = meta
+                break
+        if func_name in index:
+            continue
+        if target_meta and str(target_meta.get("name")) == func_name:
+            index[func_name] = target_meta
     return index
 
 
@@ -388,7 +492,7 @@ def _collect_file_includes(source_file: Path) -> list[str]:
     return includes
 
 
-def _render_trace_driven_slice(summary: TraceDrivenSummary, static_index: dict[str, dict], source_root: Path, radius: int, branch_cover: str) -> str:
+def _render_trace_driven_slice(summary: TraceDrivenSummary, function_index: dict[str, dict], source_root: Path, radius: int, branch_cover: str) -> str:
     header = [
         "/* TRACE-DRIVEN MULTI-FUNCTION SLICE */",
         f"/* seed: {summary.seed_name} */",
@@ -404,7 +508,7 @@ def _render_trace_driven_slice(summary: TraceDrivenSummary, static_index: dict[s
     target_focus_files: set[str] = set()
 
     for func_name in summary.call_path[-2:]:
-        meta = static_index.get(func_name)
+        meta = function_index.get(func_name)
         if not meta:
             continue
         file_name = meta.get("file_name") or ""
@@ -417,7 +521,7 @@ def _render_trace_driven_slice(summary: TraceDrivenSummary, static_index: dict[s
         focus_include_files.append(source_file)
 
     for index, func_name in enumerate(summary.call_path, start=1):
-        meta = static_index.get(func_name)
+        meta = function_index.get(func_name)
         if not meta:
             continue
         file_name = meta.get("file_name") or ""
@@ -555,8 +659,14 @@ def build_trace_driven_slice(
 
     retcode, stopped_early = tracer.trace_seed_stream(seed_path, 30.0, handle_line)
     summary = builder.build(trace_complete=(retcode == 0 or stopped_early))
-    static_index = _load_static_index(Path(static_json))
-    rendered = _render_trace_driven_slice(summary, static_index, Path(source_root), radius, branch_cover)
+    function_index: dict[str, dict] = {}
+    if static_json:
+        static_path = Path(static_json)
+        if static_path.exists():
+            function_index.update(_load_static_index(static_path))
+    if not function_index:
+        function_index.update(_build_function_index(summary, Path(source_root)))
+    rendered = _render_trace_driven_slice(summary, function_index, Path(source_root), radius, branch_cover)
     return summary, rendered
 
 
