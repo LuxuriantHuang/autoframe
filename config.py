@@ -183,7 +183,7 @@ RUN_SYMBOLIC_PATH = RUN_RUNTIME_PATH / "symbolic"
 PLOT_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "plot_data"
 SEED_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "queue"
 FUZZER_STATS_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "fuzzer_stats"
-DEPTH_THRESHOLD = 0
+DEPTH_THRESHOLD = 1
 
 # ============================================================
 # Input/Output Paths
@@ -554,7 +554,7 @@ def build_queue_seed_name(
     if path_prefix:
         parts.append(f"path:{sanitize_fs_component(path_prefix)}")
     if roadblock_id is not None:
-        parts.append(f"bid:{int(roadblock_id):06}")
+        parts.append(f"bid:{normalize_roadblock_id(roadblock_id):06}")
     if src_id is not None:
         parts.append(f"src:{int(src_id):06}")
     if aux_id is not None:
@@ -655,12 +655,19 @@ def get_flagrec_output_dir() -> Path:
     return STATIC_PATH / "flagrec_output"
 
 
+def normalize_roadblock_id(roadblock_id: int | str | None) -> int:
+    try:
+        return int(roadblock_id)
+    except (TypeError, ValueError):
+        return 999999
+
+
 def get_taint_artifact_dir(seed_name: str, roadblock_id: int | str) -> Path:
-    return RUN_TAINT_PATH / f"rb_{int(roadblock_id):06}_{sanitize_fs_component(seed_name)}"
+    return RUN_TAINT_PATH / f"rb_{normalize_roadblock_id(roadblock_id):06}_{sanitize_fs_component(seed_name)}"
 
 
 def get_semantic_fields_artifact_dir(seed_name: str, roadblock_id: int | str) -> Path:
-    return RUN_SEMANTIC_FIELDS_PATH / f"rb_{int(roadblock_id):06}_{sanitize_fs_component(seed_name)}"
+    return RUN_SEMANTIC_FIELDS_PATH / f"rb_{normalize_roadblock_id(roadblock_id):06}_{sanitize_fs_component(seed_name)}"
 
 # Failed roadblock bookkeeping
 # Failed roadblocks are retained for the whole session and are not retried by

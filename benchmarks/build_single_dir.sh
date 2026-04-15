@@ -451,13 +451,12 @@ ensure_autobug_built() {
 
 instrument_with_autobug() {
   local binary_path="$1"
+  local subject_name="${2:-$(basename "${binary_path}")}"
   local autobug_dir="${BASE}/AutoBug"
-  local subject_name
-  subject_name="$(basename "${binary_path}")"
   ensure_autobug_built
   pushd "${autobug_dir}" >/dev/null
   rm -f "${subject_name}.autotrace"
-  ./AutoTrace instrument "${binary_path}"
+  ./AutoTrace instrument "${binary_path}" "${subject_name}"
   cp "${subject_name}.autotrace" "${HOME_DIR}/target/autobug/${subject_name}.autotrace"
   popd >/dev/null
 }
@@ -477,8 +476,8 @@ build_cjson_autobug() {
     -DBUILD_SHARED_LIBS=Off \
     -DCMAKE_C_FLAGS="${CFLAGS}"
   cmake --build "${build_dir}" -j"${JOBS}" --target afl-main
-  install_binary "${build_dir}/fuzzing/afl-main" "autobug" "cjson_ori"
-  instrument_with_autobug "${build_dir}/fuzzing/afl-main"
+  install_binary "${build_dir}/fuzzing/afl-main" "autobug" "cjson"
+  instrument_with_autobug "${build_dir}/fuzzing/afl-main" "cjson"
   popd >/dev/null
 }
 
@@ -489,33 +488,24 @@ build_cflow_autobug() {
   autoreconf -fi
   ./configure --enable-debug
   make -j"${JOBS}"
-  install_binary "${SRC_DIR}/src/cflow" "autobug" "cflow_ori"
-  instrument_with_autobug "${SRC_DIR}/src/cflow"
+  install_binary "${SRC_DIR}/src/cflow" "autobug" "cflow"
+  instrument_with_autobug "${SRC_DIR}/src/cflow" "cflow"
   popd >/dev/null
 }
 
 build_cxxfilt_autobug() {
   build_cxxfilt_variant gcc g++ "-O0 -g" "-O0 -g" cxxfilt autobug
-  pushd "${HOME_DIR}/target/autobug" >/dev/null
-  cp cxxfilt cxxfilt_ori
-  popd >/dev/null
-  instrument_with_autobug "${SRC_DIR}/cxxfilt"
+  instrument_with_autobug "${SRC_DIR}/cxxfilt" "cxxfilt"
 }
 
 build_xmllint_autobug() {
   build_xmllint_variant gcc g++ "-O0 -g" "-O0 -g" xmllint autobug
-  pushd "${HOME_DIR}/target/autobug" >/dev/null
-  cp xmllint xmllint_ori
-  popd >/dev/null
-  instrument_with_autobug "${SRC_DIR}/xmllint"
+  instrument_with_autobug "${SRC_DIR}/xmllint" "xmllint"
 }
 
 build_mujs_autobug() {
   build_mujs_variant gcc g++ "-O0 -g" "-O0 -g" mujs autobug
-  pushd "${HOME_DIR}/target/autobug" >/dev/null
-  cp mujs mujs_ori
-  popd >/dev/null
-  instrument_with_autobug "${SRC_DIR}/mujs"
+  instrument_with_autobug "${SRC_DIR}/mujs" "mujs"
 }
 
 build_sqlite3_autobug() {
@@ -538,11 +528,11 @@ build_sqlite3_autobug() {
   "${CXX}" ${CXXFLAGS} \
     "$(basename "${sqlite_core_src}" .c).o" ossfuzz.o driver.o \
     -ldl -pthread \
-    -o "sqlite3_ori"
-  install_binary "${SRC_DIR}/sqlite3_ori" "autobug" "sqlite3_ori"
+    -o "sqlite3"
+  install_binary "${SRC_DIR}/sqlite3" "autobug" "sqlite3"
   popd >/dev/null
 
-  instrument_with_autobug "${SRC_DIR}/sqlite3_ori"
+  instrument_with_autobug "${SRC_DIR}/sqlite3" "sqlite3"
 }
 
 main() {

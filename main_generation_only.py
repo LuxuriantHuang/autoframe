@@ -752,6 +752,8 @@ def main_generation_only() -> None:
     finally:
         if "coordinator" in locals():
             coordinator.stop_event.set()
+        if "tracer" in locals():
+            tracer.shutdown_background_workers(wait=False)
         core.logger.info("=" * 60)
         core.logger.info("INFERENCE STATISTICS")
         core.logger.info("=" * 60)

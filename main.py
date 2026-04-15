@@ -8244,6 +8244,8 @@ def main():
         logger.critical(f"Unexpected error in main loop: {str(e)}", exc_info=True)
         logger.critical("Attempting graceful shutdown...")
     finally:
+        if "tracer" in locals():
+            tracer.shutdown_background_workers(wait=False)
         logger.info("Saving coverage state to static.json")
         with open(STATIC_PATH / "static.json", 'w') as f:
             ujson.dump({"basic_blocks": bbs, "functions": funcs}, f)

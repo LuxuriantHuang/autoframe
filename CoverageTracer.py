@@ -1,5 +1,6 @@
 import concurrent.futures
 import csv
+import hashlib
 import importlib.util
 import json
 import os
@@ -63,6 +64,22 @@ def _log_full_slice_result(tag: str, file_name: str, line: int, content: str):
         f"[SLICE] {tag} full output for {file_name}:{line} ({len(content)} chars)\n"
         f"{content}"
     )
+
+
+def _extract_source_slice_body(content: str) -> str:
+    text = str(content or "")
+    match = re.search(
+        r"=== Source Slice ===\s*(?P<body>.*?)\s*=== End Source Slice ===",
+        text,
+        re.DOTALL,
+    )
+    if match:
+        return match.group("body").strip()
+    return text.strip()
+
+
+def _slice_has_meaningful_content(content: str) -> bool:
+    return bool(_extract_source_slice_body(content))
 
 
 def get_text(source_bytes, node):
@@ -1154,14 +1171,16 @@ def get_function_slice(call_chain, rb_line, only_side, llm_util, dynamic_context
             f"[SLICE] Reusing cached LLVM slice for {file}:{line} "
             f"(case_line={original_target_line}, svf_callpath={use_svf_callpath})"
         )
-        function_snippet = _post_filter_slice_with_dynamic_context(cached_snippet, context, file, line)
-        logger.info(f"[SLICE] get_function_slice completed - code_snippet length: {len(function_snippet)} chars")
-        return function_snippet + '\n'
+        if _slice_has_meaningful_content(cached_snippet):
+            function_snippet = _post_filter_slice_with_dynamic_context(cached_snippet, context, file, line)
+            logger.info(f"[SLICE] get_function_slice completed - code_snippet length: {len(function_snippet)} chars")
+            return function_snippet + '\n'
+        logger.warning(f"[SLICE] Ignoring cached empty LLVM slice for {file}:{line}")
     slice_label = _build_slice_cache_label(target_name, line, original_target_line, use_svf_callpath)
     slice_path = config.get_slice_output_path(slice_label)
     if slice_path.exists():
         function_snippet = slice_path.read_text(encoding='utf-8', errors='ignore').strip()
-        if function_snippet and "No matching instruction found" not in function_snippet:
+        if _slice_has_meaningful_content(function_snippet) and "No matching instruction found" not in function_snippet:
             _LLVM_SLICE_CACHE[cache_key] = function_snippet
             logger.info(
                 f"[SLICE] Reusing disk-cached LLVM slice for {file}:{line} "
@@ -1170,6 +1189,8 @@ def get_function_slice(call_chain, rb_line, only_side, llm_util, dynamic_context
             function_snippet = _post_filter_slice_with_dynamic_context(function_snippet, context, file, line)
             logger.info(f"[SLICE] get_function_slice completed - code_snippet length: {len(function_snippet)} chars")
             return function_snippet + '\n'
+        if function_snippet and "No matching instruction found" not in function_snippet:
+            logger.warning(f"[SLICE] Ignoring disk-cached empty LLVM slice for {file}:{line}")
     llvm_slice(
         file,
         line,
@@ -1185,12 +1206,21 @@ def get_function_slice(call_chain, rb_line, only_side, llm_util, dynamic_context
         if "No matching instruction found" in function_snippet:
             logger.warning(f"[SLICE] Slice failed for {file}:{line} - 'No matching instruction found'")
             return "No matching instruction found"
-        if function_snippet:
+        if _slice_has_meaningful_content(function_snippet):
             _LLVM_SLICE_CACHE[cache_key] = function_snippet
             function_snippet = _post_filter_slice_with_dynamic_context(function_snippet, context, file, line)
             logger.info(f"[SLICE] get_function_slice completed - code_snippet length: {len(function_snippet)} chars")
             _log_full_slice_result("LLVM slice", file, line, function_snippet)
             return function_snippet + '\n'
+        if function_snippet:
+            logger.warning(f"[SLICE] LLVM slice markers were present but source body was empty for {file}:{line}")
+
+    autobug_slice = str(context.get("autobug_slice") or "").strip()
+    if _slice_has_meaningful_content(autobug_slice):
+        autobug_slice = _post_filter_slice_with_dynamic_context(autobug_slice, context, file, line)
+        logger.info(f"[SLICE] Falling back to autobug slice for {file}:{line}")
+        _log_full_slice_result("autobug fallback slice", file, line, autobug_slice)
+        return autobug_slice + '\n'
 
     logger.warning(f"[SLICE] Empty slice for {file}:{line}, falling back to target function source")
     start = target_meta['lineStart']
@@ -1651,25 +1681,53 @@ class CoverageTracer:
                     logger.warning("[AUTOBUG] Async priming task failed: %s", exc)
                 self._autobug_prime_future = None
 
-            max_per_round = max(1, int(AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND))
-            batch: list[str] = []
-            while self._autobug_pending_seed_names and len(batch) < max_per_round:
-                seed_name = self._autobug_pending_seed_names.popleft()
-                self._autobug_pending_seed_name_set.discard(seed_name)
-                if seed_name in self._autobug_seed_branch_cache:
-                    continue
-                batch.append(seed_name)
-            deferred = len(self._autobug_pending_seed_names)
+            pending_seed_names = list(self._autobug_pending_seed_names)
+            pending_cov = [
+                seed_name for seed_name in pending_seed_names
+                if seed_name not in self._autobug_seed_branch_cache and self._seed_has_cov(seed_name)
+            ]
+            if pending_cov:
+                selected = set(pending_cov)
+                batch = [seed_name for seed_name in pending_seed_names if seed_name in selected]
+                mode = "all_cov"
+            else:
+                non_cov_pending = [
+                    seed_name for seed_name in pending_seed_names
+                    if seed_name not in self._autobug_seed_branch_cache
+                ]
+                batch = non_cov_pending[:max(1, int(AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND))]
+                mode = "non_cov_batch"
+
+            if batch:
+                selected_names = set(batch)
+                retained = deque()
+                while self._autobug_pending_seed_names:
+                    seed_name = self._autobug_pending_seed_names.popleft()
+                    if seed_name in selected_names:
+                        self._autobug_pending_seed_name_set.discard(seed_name)
+                        continue
+                    retained.append(seed_name)
+                self._autobug_pending_seed_names = retained
         if not batch:
             return False
         logger.info(
-            "[AUTOBUG] Scheduling async branch-cache priming for %d seed(s) (deferred=%d, cap=%d)",
+            "[AUTOBUG] Scheduling async branch-cache priming for %d seed(s) from current backlog (mode=%s)",
             len(batch),
-            deferred,
-            max_per_round,
+            mode,
         )
         self._autobug_prime_future = self._autobug_prime_executor.submit(self._run_autobug_prime_batch, batch)
         return True
+
+    def shutdown_background_workers(self, wait: bool = False) -> None:
+        with self._autobug_prime_lock:
+            future = self._autobug_prime_future
+            self._autobug_prime_future = None
+        if future is not None and future.done():
+            try:
+                future.result()
+            except Exception as exc:
+                logger.warning("[AUTOBUG] Async priming task failed during shutdown: %s", exc)
+        self._autobug_prime_executor.shutdown(wait=wait, cancel_futures=True)
 
     def _run_autobug_prime_batch(self, seed_names: list[str]) -> None:
         start_time = time.time()
@@ -1707,18 +1765,9 @@ class CoverageTracer:
             reverse=True,
         )
 
-        max_per_round = max(1, int(AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND))
-        total_pending = len(pending_seed_names)
-        deferred = max(total_pending - max_per_round, 0)
-        if total_pending > max_per_round:
-            pending_seed_names = pending_seed_names[:max_per_round]
-
         logger.info(
-            "[AUTOBUG] Priming branch cache for %d/%d seed(s) this round (deferred=%d, cap=%d)",
+            "[AUTOBUG] Priming branch cache for %d seed(s) this round (+cov prioritized)",
             len(pending_seed_names),
-            len(seed_names),
-            deferred,
-            max_per_round,
         )
         updated = False
         progress_interval = 25
@@ -1749,11 +1798,6 @@ class CoverageTracer:
                 )
         if updated:
             self._save_persisted_autobug_branch_cache()
-        if deferred > 0:
-            logger.info(
-                "[AUTOBUG] Deferred %d seed(s) for later branch-cache priming",
-                deferred,
-            )
 
     @staticmethod
     def _matching_summary_lines(line_map: dict[str, list[int]] | None, target_file: str) -> list[int]:
@@ -2159,6 +2203,157 @@ class CoverageTracer:
             self._autobug_seed_branch_cache[seed_name] = parsed
             return parsed
 
+    def _autobug_slice_cache_path(self, roadblock: dict, seed_name: str) -> Path:
+        target_file = Path(str(roadblock.get("filename", "unknown"))).name
+        target_line = int(roadblock.get("line", 0) or 0)
+        digest_input = f"{roadblock.get('roadblock_key') or target_file}:{target_line}:{seed_name}"
+        digest = hashlib.sha1(digest_input.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        stem = config.sanitize_fs_component(f"{target_file}_{target_line}_{seed_name}_{digest}")
+        slice_cache_dir = self._autobug_cache_dir / "slices"
+        slice_cache_dir.mkdir(parents=True, exist_ok=True)
+        return slice_cache_dir / f"{stem}.c"
+
+    def _autobug_branch_coverage_arg(self, roadblock: dict, seed_name: str) -> str | None:
+        branches_by_cond = self._load_autobug_seed_branches(seed_name) or {}
+        for cond_key, payload in branches_by_cond.items():
+            if not self._autobug_cond_matches_roadblock(cond_key, roadblock):
+                continue
+            branches = sorted(int(branch_id) for branch_id in payload.get("branches", set()))
+            if branches:
+                return ",".join(str(branch_id) for branch_id in branches)
+        expected_branch = self._roadblock_expected_branch_id(roadblock)
+        return str(expected_branch) if expected_branch is not None else None
+
+    def _build_autobug_slice_for_seed(self, roadblock: dict, seed_path: Path) -> str | None:
+        analyzer = self._autobug_analyzer_path()
+        subject = self._autobug_subject_path()
+        if analyzer is None or subject is None:
+            return None
+
+        seed_name = seed_path.name
+        cache_path = self._autobug_slice_cache_path(roadblock, seed_name)
+        if cache_path.exists():
+            cached = cache_path.read_text(encoding="utf-8", errors="ignore").strip()
+            if _slice_has_meaningful_content(cached):
+                return cached
+
+        coverage_arg = self._autobug_branch_coverage_arg(roadblock, seed_name)
+        if not coverage_arg:
+            logger.info(
+                "[AUTOBUG] No branch coverage metadata for %s on %s:%s",
+                seed_name,
+                roadblock.get("filename", ""),
+                roadblock.get("line", 0),
+            )
+            return None
+
+        with tempfile.TemporaryDirectory(prefix="autobug-slice-", dir=self._autobug_cache_dir) as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            trace_path = tmpdir_path / "TRACE.dump"
+            sliced_path = tmpdir_path / "SLICED_CODE.c"
+
+            command, stdin_data = build_seed_invocation(
+                os.fspath(subject),
+                self.fuzzing_args,
+                seed_path,
+                self.input_adapter_spec,
+            )
+            try:
+                run_result = subprocess.run(
+                    command,
+                    stdin=subprocess.PIPE if stdin_data is not None else None,
+                    input=stdin_data,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={**os.environ, "TRACE_DUMP": os.fspath(trace_path)},
+                    check=False,
+                    timeout=TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning("[AUTOBUG] Slice replay timed out for seed %s", seed_name)
+                return None
+
+            if run_result.returncode != 0 and not trace_path.exists():
+                stderr = (run_result.stderr or b"").decode("utf-8", errors="replace").strip()[:400]
+                logger.warning("[AUTOBUG] Slice replay failed for %s: %s", seed_name, stderr)
+                return None
+            if not trace_path.exists():
+                logger.warning("[AUTOBUG] TRACE_DUMP not created for autobug slice seed %s", seed_name)
+                return None
+
+            target_loc = f"{roadblock.get('filename', '')}:{int(roadblock.get('line', 0) or 0)}"
+            slice_cmd = [
+                os.fspath(analyzer),
+                "flip-branch",
+                os.fspath(SRC_PATH),
+                os.fspath(trace_path),
+                "--target",
+                target_loc,
+                "--coverage",
+                coverage_arg,
+                "--output",
+                os.fspath(sliced_path),
+                "--comments",
+                "--window",
+                "10",
+            ]
+            slice_result = subprocess.run(
+                slice_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                cwd=tmpdir,
+            )
+            if slice_result.returncode != 0 or not sliced_path.exists():
+                stderr = (slice_result.stderr or slice_result.stdout or "").strip()[:400]
+                logger.warning("[AUTOBUG] flip-branch failed for %s: %s", seed_name, stderr)
+                return None
+
+            slice_text = sliced_path.read_text(encoding="utf-8", errors="replace").strip()
+            if not _slice_has_meaningful_content(slice_text):
+                logger.warning(
+                    "[AUTOBUG] flip-branch produced empty slice for %s at %s",
+                    seed_name,
+                    target_loc,
+                )
+                return None
+
+            try:
+                cache_path.write_text(slice_text, encoding="utf-8")
+            except OSError as exc:
+                logger.warning("[AUTOBUG] Failed to persist slice cache %s: %s", cache_path, exc)
+            return slice_text
+
+    def build_autobug_slice_context(
+        self,
+        roadblock: dict,
+        seed_names: list[str] | None = None,
+        *,
+        max_attempts: int = 3,
+    ) -> dict[str, object] | None:
+        candidate_names = list(seed_names) if seed_names is not None else self.select_seed_names_for_roadblock(
+            roadblock,
+            max_seeds=max_attempts,
+        )
+        if not candidate_names:
+            return None
+
+        for seed_name in candidate_names[:max_attempts]:
+            seed_path = self._resolve_seed_candidate_path(seed_name)
+            if seed_path is None:
+                continue
+            slice_text = self._build_autobug_slice_for_seed(roadblock, seed_path)
+            if not slice_text:
+                continue
+            return {
+                "seed_name": seed_name,
+                "seed_path": os.fspath(seed_path),
+                "slice_text": slice_text,
+            }
+        return None
+
     def _autobug_matching_seed_names(
         self,
         roadblock: dict,
@@ -2334,6 +2529,21 @@ class CoverageTracer:
             return None
         context["all_hit_seed_paths"] = [os.fspath(item["seed_path"]) for item in hit_items]
         context["all_hit_seed_names"] = [str(item["seed_name"]) for item in hit_items]
+        autobug_slice_context = self.build_autobug_slice_context(
+            roadblock,
+            [str(item["seed_name"]) for item in hit_items],
+            max_attempts=max_seeds,
+        )
+        if autobug_slice_context:
+            context["autobug_slice"] = autobug_slice_context["slice_text"]
+            context["autobug_seed_name"] = autobug_slice_context["seed_name"]
+            context["autobug_seed_path"] = autobug_slice_context["seed_path"]
+            logger.info(
+                "[AUTOBUG] Prepared fallback slice for %s:%s from %s",
+                roadblock.get("filename", ""),
+                roadblock.get("line", 0),
+                autobug_slice_context["seed_name"],
+            )
         logger.info(
             "[DYN_TRACE] Found %d target-hit seeds in top-%d candidates for %s:%s; using %d representative seed(s)",
             len(hit_items),

@@ -20,6 +20,7 @@ class FuzzerRunner:
         self.fuzzing_args = fuzzing_args
         self.fuzzer_process = None
         self.fuzzer_pid_from_stats = None  # Cached PID from fuzzer_stats
+        self._terminating = False
 
         atexit.register(self.terminate)
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -51,8 +52,11 @@ class FuzzerRunner:
         logger.info(f"fuzzer在系统中的pid：{self.fuzzer_process.pid}")
 
     def terminate(self):
+        if self._terminating:
+            return
+        self._terminating = True
         if not self.is_running():
-            logger.error("没有启动fuzzer，请先启动fuzzer！")
+            self.fuzzer_process = None
             return
         logger.info("正在停止fuzzer")
         try:
@@ -173,10 +177,12 @@ class FuzzerRunner:
         return self._is_pid_alive(self.fuzzer_pid_from_stats)
 
     def _signal_handler(self, sig, frame):
+        if self._terminating:
+            raise KeyboardInterrupt
         logger.info(f"收到信号 {sig}，正在终止 fuzzer...")
         self.terminate()
         logger.info("fuzzer 已终止")
-        exit(0)
+        raise KeyboardInterrupt
 
     def add_seed_LLM(self, output_dir, id, bid):
         LLM_TARGET_PATH = Path(output_dir) / "LLM" / "queue"
