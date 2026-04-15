@@ -148,7 +148,7 @@ LLM_LOG_FILE_NAME = _build_log_file_name("llm_interactions", PROJECT)
 # Field parsing configuration
 # 只有在此列表中的项目才会尝试执行字段解析
 # 如果能映射污点但无法解出字段可以直接尝试变污点对应位置
-ENABLE_FIELD_PARSING = ['libpng', 'lcms', "jhead", "libxml", "cjson", "jansson", "jq", "mujs", "cflow"]  # 结构化/文本格式支持语义字段解析
+ENABLE_FIELD_PARSING = ['libpng', 'lcms', "jhead", "libxml", "cjson", "jansson", "jq", "mujs", "cflow", "calc"]  # 结构化/文本格式支持语义字段解析
 
 # coverage tracer config
 # MAP_SIZE = 18
@@ -753,7 +753,7 @@ ONE_SIDED_EXHAUSTION_THRESHOLD = 0
 
 # 输入类型分类：根据目标库的输入方式选择不同的生成策略
 # 文本输入型库：LLM 直接生成文本内容，写入 seed 文件
-TEXT_INPUT_LIBS = ['mujs', 'sqlite', 'libxml', 'cjson', 'jansson', 'cflow']
+TEXT_INPUT_LIBS = ['mujs', 'sqlite', 'libxml', 'cjson', 'jansson', 'cflow', 'calc']
 # 二进制输入型库：LLM 生成 Python 脚本，执行脚本产生二进制文件
 BINARY_INPUT_LIBS = ['libpng', 'lcms', 'libtiff', 'libwebp', 'openssl']
 

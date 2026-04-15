@@ -63,6 +63,8 @@ from find_seed_root import find_seed_root
 
 # Flag to track if logger has been initialized
 _logger_initialized = False
+_logger_component_name = None
+_console_logging_mode = "full"
 NO_COVERAGE_GUIDED_RETRY_LIMIT = 1
 LLVM_PROFDATA_BIN = os.fspath(Path(config.LLVM_PROFDATA_BIN))
 LLVM_COV_BIN = os.fspath(Path(config.LLVM_COV_BIN))
@@ -85,6 +87,7 @@ XML_GRAMMAR_FUZZER = "xml_grammar"
 TAINT_MUTATION_FUZZER = "taint_mutation"
 FIELD_MUTATION_FUZZER = "field_mutation"
 STATE_DRIVEN_FUZZER = "state_driven"
+BATCH_MUTATION_FUZZER = "batch_mutation"
 
 
 @dataclass
@@ -196,7 +199,12 @@ def setup_logger():
     config.ensure_runtime_layout()
     formatter = logging.Formatter(LOGGING_FORMAT)
 
-    handler = logging.FileHandler(Path(config.LOG_PATH) / config.LOGGER_FILE_NAME)
+    if _logger_component_name:
+        log_file_name = f"{config.sanitize_fs_component(str(_logger_component_name))}.log"
+    else:
+        log_file_name = config.LOGGER_FILE_NAME
+
+    handler = logging.FileHandler(Path(config.LOG_PATH) / log_file_name)
     handler.setLevel(LOGGING_LEVEL)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -204,7 +212,42 @@ def setup_logger():
     console_handler = logging.StreamHandler()
     console_handler.setLevel(LOGGING_LEVEL)
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(_ConsoleLogFilter(_console_logging_mode))
     logger.addHandler(console_handler)
+
+
+class _ConsoleLogFilter(logging.Filter):
+    def __init__(self, mode: str):
+        super().__init__()
+        self.mode = mode or "full"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+
+        if self.mode == "full":
+            return True
+
+        message = record.getMessage()
+        lowered = message.lower()
+
+        if self.mode == "launcher":
+            return "[LAUNCHER]" in message
+
+        if self.mode == "lifecycle":
+            lifecycle_tokens = (
+                "started",
+                "starting",
+                "completed",
+                "finished",
+                "terminated",
+                "exiting",
+                "keyboard interrupt",
+                "disabled, exiting",
+            )
+            return any(token in lowered for token in lifecycle_tokens)
+
+        return True
 
 
 def setup_llm_logger():
@@ -220,16 +263,15 @@ def setup_llm_logger():
     formatter = logging.Formatter(LLM_LOGGING_FORMAT)
 
     # File handler for LLM logs
-    llm_file_handler = logging.FileHandler(Path(config.LLM_LOG_PATH) / config.LLM_LOG_FILE_NAME)
+    if _logger_component_name:
+        llm_log_file_name = f"{config.sanitize_fs_component(str(_logger_component_name))}-llm.log"
+    else:
+        llm_log_file_name = config.LLM_LOG_FILE_NAME
+
+    llm_file_handler = logging.FileHandler(Path(config.LLM_LOG_PATH) / llm_log_file_name)
     llm_file_handler.setLevel(LOGGING_LEVEL)
     llm_file_handler.setFormatter(formatter)
     llm_logger.addHandler(llm_file_handler)
-
-    # Console handler for LLM logs (optional, can be disabled)
-    llm_console_handler = logging.StreamHandler()
-    llm_console_handler.setLevel(LOGGING_LEVEL)
-    llm_console_handler.setFormatter(formatter)
-    llm_logger.addHandler(llm_console_handler)
 
     return llm_logger
 
@@ -2421,7 +2463,7 @@ def _build_seed_profdata(seed_path: str) -> Optional[Path]:
         subprocess.run(
             trace_cmd,
             input=stdin_data,
-            stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
+            stdin=subprocess.DEVNULL if stdin_data is None else None,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=env,
@@ -2892,7 +2934,7 @@ def _execute_seed_and_capture(seed_path: str, harness_code: str | None = None) -
         result = subprocess.run(
             cmd,
             input=stdin_data,
-            stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
+            stdin=subprocess.DEVNULL if stdin_data is None else None,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             timeout=TIMEOUT,
@@ -7086,6 +7128,152 @@ def run_mutate_batch_script_gen(mutator_rule: dict, seed_dir: str, out_dir: str,
     return None
 
 
+def _build_seed_payload_preview(
+    seed_name: str,
+    *,
+    harness_code: str | None = None,
+    max_text_chars: int = 1200,
+    max_binary_bytes: int = 96,
+) -> str:
+    seed_path = config.find_seed_path(seed_name)
+    if seed_path is None or not seed_path.exists():
+        return "<seed_preview>\nmissing_seed\n</seed_preview>"
+
+    payload = read_seed_payload_view(seed_path, harness_code)
+    if not payload:
+        try:
+            payload = seed_path.read_bytes()
+        except OSError:
+            return f"<seed_preview path=\"{seed_path.name}\">\nread_failed\n</seed_preview>"
+
+    preview_lines = [
+        f"path={seed_path.name}",
+        f"payload_size={len(payload)}",
+    ]
+    text_ratio = (
+        sum(1 for byte in payload if 32 <= byte <= 126 or byte in {9, 10, 13}) / max(len(payload), 1)
+    )
+    if text_ratio >= 0.80:
+        preview_lines.append("payload_kind=text")
+        preview_lines.append(payload.decode("utf-8", errors="replace")[:max_text_chars])
+    else:
+        preview_lines.append("payload_kind=binary")
+        preview_lines.append(f"hex_preview={payload[:max_binary_bytes].hex()}")
+
+    return "<seed_preview>\n" + "\n".join(preview_lines) + "\n</seed_preview>"
+
+
+def _seed_payload_looks_textual(seed_name: str, *, harness_code: str | None = None) -> bool:
+    seed_path = config.find_seed_path(seed_name)
+    if seed_path is None or not seed_path.exists():
+        return False
+
+    payload = read_seed_payload_view(seed_path, harness_code)
+    if not payload:
+        try:
+            payload = seed_path.read_bytes()
+        except OSError:
+            return False
+    if not payload:
+        return False
+
+    printable = sum(1 for byte in payload if 32 <= byte <= 126 or byte in {9, 10, 13})
+    return (printable / max(len(payload), 1)) >= 0.80
+
+
+def get_seed_targeted_mutation_script(
+    *,
+    code_slice: str,
+    constraints,
+    target_branch: str,
+    llm_util: LLMUtil,
+    seed_name: str,
+    fields=None,
+    relevant_info=None,
+    harness_code: str | None = None,
+    max_retries: int = 3,
+) -> str | None:
+    llm_log = get_llm_logger()
+    llm_log.info("[LLM_INTERACTION] get_seed_targeted_mutation_script called")
+
+    generation_mode = "text_direct" if _looks_textual_semantic_input(
+        fields=fields,
+        harness_code=harness_code or get_harness_code() or "",
+    ) else "binary_script"
+    container_context = build_input_container_profile(
+        generation_mode,
+        fields=fields,
+        harness_code=harness_code or get_harness_code() or "",
+        preferred_seed=seed_name,
+    )
+    semantic_fields_section = build_semantic_fields_prompt_section(fields) if fields else ""
+    relevant_info_section = ""
+    if relevant_info:
+        try:
+            relevant_info_section = (
+                "<taint_context>\n"
+                + json.dumps(relevant_info, ensure_ascii=False, default=str)[:2000]
+                + "\n</taint_context>\n"
+            )
+        except Exception:
+            relevant_info_section = ""
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是一位 seed 定向变异脚本生成专家。给定一个具体 reachable seed、目标分支约束、"
+                "以及可选的字段/污点上下文，输出一个最小修改的 Python 变异脚本。\n"
+                "要求：\n"
+                "- 最终只输出一个 ```python``` 代码块，不要解释。\n"
+                "- 脚本必须接受两个参数：sys.argv[1] 是原始 seed 路径，sys.argv[2] 是输出 seed 路径。\n"
+                "- 脚本必须读取原始 seed，做尽量局部、最小、同家族的修改，再写出新 seed。\n"
+                "- 如果输入是文本或带外层 wrapper 的文本载荷，优先保留整体骨架，只修改关键字段/片段。\n"
+                "- 如果输入是二进制，优先做定点、短范围修改，不要把文件整体重写成无关格式。\n"
+                "- 除非约束明确要求整体重建，否则禁止把整个文件替换成全新内容；优先保留大部分原始字节/文本。\n"
+                "- 保持文件基本可解析；如果需要长度、校验、分隔符、配对结构，请同步维护。\n"
+                "- 不要打印调试信息，不要依赖外部文件或额外环境。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"<lib_under_fuzzing>\n{PROJECT}\n</lib_under_fuzzing>\n"
+                f"<runtime_command_context>\n{build_runtime_command_context()}\n</runtime_command_context>\n"
+                f"<target_branch>\n{target_branch}\n</target_branch>\n"
+                f"<constraints>\n{constraints}\n</constraints>\n"
+                f"<code_slice>\n{code_slice}\n</code_slice>\n"
+                f"<input_container_profile>\n{container_context}\n</input_container_profile>\n"
+                f"{semantic_fields_section}"
+                f"{relevant_info_section}"
+                f"{_build_seed_payload_preview(seed_name, harness_code=harness_code)}\n"
+                f"{collect_input_examples_context(generation_mode, preferred_seed=seed_name, max_examples=1)}"
+            ),
+        },
+    ]
+
+    for attempt in range(max_retries):
+        resp = llm_util.get_response(messages)
+        try:
+            script = extract_generator(resp)
+        except ScriptNotFoundError:
+            script = None
+        if script:
+            llm_log.info(
+                f"[LLM_INTERACTION] get_seed_targeted_mutation_script result: script_length={len(script)}"
+            )
+            return script
+        if attempt < max_retries - 1:
+            append_llm_retry_feedback(
+                messages,
+                resp,
+                "请只返回一个可运行的 ```python``` 代码块，并严格使用 sys.argv[1] 读取原 seed、"
+                "使用 sys.argv[2] 写出新 seed。",
+            )
+    llm_log.error("[LLM_INTERACTION] get_seed_targeted_mutation_script failed after retries")
+    return None
+
+
 def create_batch_mutation_seed_dir(seed_dir: str, target_dir: str | Path | None = None) -> tuple[str, int]:
     filtered_dir = Path(target_dir) if target_dir is not None else Path(tempfile.mkdtemp(prefix="batch_mutate_inputs_"))
     if filtered_dir.exists():
@@ -7382,6 +7570,16 @@ def _promote_prefixed_batch_outputs(
     destination_dir = Path(queue_dir) if queue_dir is not None else Path(config.MUT_QUEUE_PATH)
     destination_dir.mkdir(parents=True, exist_ok=True)
 
+    # When batch outputs are already written into the final queue directory
+    # (e.g. out_x/<name>/queue), promotion should be a no-op. The previous
+    # logic moved files within the same directory and then removed the source
+    # directory, which deleted the final queue contents.
+    if source_dir.resolve() == destination_dir.resolve():
+        return [
+            os.fspath(path)
+            for path in sorted(p for p in destination_dir.iterdir() if p.is_file())
+        ]
+
     moved_paths: list[str] = []
     for artifact_path in sorted(p for p in source_dir.rglob("*") if p.is_file()):
         suffix = artifact_path.suffix if artifact_path.suffix else ""
@@ -7589,59 +7787,86 @@ def attempt_simplified_batch_mutation_path(ctx: SimplifiedAttemptContext) -> boo
     if not ENABLE_SIMPLIFIED_BATCH_MUTATION_PATH:
         return False
 
-    logger.info(f"[{LogOp.ROADBLOCK}] Simplified Path D: trying batch mutation process")
+    logger.info(f"[{LogOp.ROADBLOCK}] Simplified Path D: trying reachable-seed targeted mutation")
     try:
-        target_side = "true" if ctx.roadblock['status'] else "false"
-        input_source = identify_input_source(ctx.code_slice)
-        branch_analysis_result = run_branch_analysis(ctx.code_slice, ctx.bcode, input_source, ctx.llm_util)
-        if not (branch_analysis_result and branch_analysis_result.get('passable', False)):
-            return False
-        mutator_rule = run_mutator_rule_gen(branch_analysis_result, target_side, ctx.llm_util)
-        if not (mutator_rule and mutator_rule.get('edits')):
-            return False
-        seed_dir = os.path.join(output_dir, 'default', 'queue')
-        branch_id = mutator_rule.get("branch_id") or "llm_mut"
-        batch_fuzzer_name = f"batch_mutation_{config.sanitize_fs_component(str(branch_id))}"
-        branch_work_dir = config.get_branch_output_dir(branch_id)
-        batch_out_dir = config.get_named_queue_dir(batch_fuzzer_name)
-        manifest_dir = branch_work_dir
-        filtered_seed_dir = config.get_batch_mutation_filtered_seed_dir(branch_id)
-        filtered_seed_dir, _ = create_batch_mutation_seed_dir(seed_dir, filtered_seed_dir)
-        Path(batch_out_dir).mkdir(parents=True, exist_ok=True)
-        Path(manifest_dir).mkdir(parents=True, exist_ok=True)
-        batch_script = run_mutate_batch_script_gen(
-            mutator_rule,
-            filtered_seed_dir,
-            os.fspath(batch_out_dir),
-            os.fspath(manifest_dir),
-            ctx.llm_util,
+        available_seeds = ctx.tracer.get_rb_seed(ctx.roadblock)
+        ranked_seed_names = ctx.tracer.select_seed_names_for_roadblock(
+            ctx.roadblock,
+            seed_names=available_seeds,
+            max_seeds=max(1, min(4, len(available_seeds))),
         )
-        if not batch_script:
-            shutil.rmtree(filtered_seed_dir, ignore_errors=True)
+        candidate_seed_names: list[str] = []
+        for seed_name in [ctx.seed, *ranked_seed_names]:
+            if seed_name and seed_name not in candidate_seed_names:
+                candidate_seed_names.append(seed_name)
+        if not candidate_seed_names:
             return False
-        script_path = config.get_batch_mutation_script_path(branch_id)
-        script_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(script_path, 'w') as f:
-            f.write(batch_script)
-        result = subprocess.run(
-            ['python3', os.fspath(script_path), filtered_seed_dir, os.fspath(batch_out_dir), os.fspath(manifest_dir)],
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        shutil.rmtree(filtered_seed_dir, ignore_errors=True)
-        if result.returncode != 0 or not os.path.exists(batch_out_dir):
-            return False
-        moved_paths = _promote_prefixed_batch_outputs(batch_out_dir, path_prefix=batch_fuzzer_name, queue_dir=batch_out_dir)
-        if not moved_paths:
-            return False
-        logger.info(
-            f"[{LogOp.ROADBLOCK}] Simplified Path D generated {len(moved_paths)} candidate seed(s); "
-            f"deferring effectiveness judgment to the outer coverage check"
-        )
-        return True
-    except subprocess.TimeoutExpired:
-        logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path D timeout")
+
+        mut_target_path = config.get_named_queue_dir(BATCH_MUTATION_FUZZER)
+        Path(mut_target_path).mkdir(parents=True, exist_ok=True)
+
+        for seed_name in candidate_seed_names:
+            seed_fields = ctx.fields if seed_name == ctx.seed else _normalize_text_mutation_fields(
+                None,
+                seed_name=seed_name,
+                harness_code=ctx.harness_for_mode,
+            )
+            seed_relevant_info = ctx.relevant_info if seed_name == ctx.seed else None
+            if _seed_payload_looks_textual(seed_name, harness_code=ctx.harness_for_mode):
+                text_success, text_candidate = try_text_mutation(
+                    ctx.code_slice,
+                    ctx.constraints,
+                    ctx.bcode,
+                    ctx.llm_util,
+                    seed_name=seed_name,
+                    fields=seed_fields,
+                    harness_code=ctx.harness_for_mode,
+                    roadblock=ctx.roadblock,
+                    call_chain=ctx.call_chain,
+                )
+                if text_success or text_candidate:
+                    logger.info(
+                        f"[{LogOp.ROADBLOCK}] Simplified Path D generated a text mutation candidate from reachable seed {seed_name}"
+                    )
+                    return True
+
+            script = get_seed_targeted_mutation_script(
+                code_slice=ctx.code_slice,
+                constraints=ctx.constraints,
+                target_branch=ctx.bcode,
+                llm_util=ctx.llm_util,
+                seed_name=seed_name,
+                fields=seed_fields,
+                relevant_info=seed_relevant_info,
+                harness_code=ctx.harness_for_mode,
+            )
+            if not script:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Simplified Path D could not synthesize a targeted script for seed {seed_name}"
+                )
+                continue
+
+            seed_id = len(os.listdir(mut_target_path))
+            solved, _, dest_file = mutate_and_test(
+                ctx.llm_util,
+                script,
+                seed_id,
+                ctx.orig if seed_name == ctx.seed and ctx.orig else seed_name,
+                fuzzer,
+                ctx.tracer,
+                roadblock=ctx.roadblock,
+                call_chain=ctx.call_chain,
+                path_prefix="batch_mutation",
+                queue_dir=mut_target_path,
+            )
+            if solved or dest_file:
+                logger.info(
+                    f"[{LogOp.ROADBLOCK}] Simplified Path D generated a candidate seed from reachable seed {seed_name}"
+                )
+                return True
+            logger.info(
+                f"[{LogOp.ROADBLOCK}] Simplified Path D produced no candidate output for reachable seed {seed_name}"
+            )
         return False
     except Exception as e:
         logger.warning(f"[{LogOp.ROADBLOCK}] Simplified Path D error: {e}", exc_info=True)
@@ -7690,6 +7915,143 @@ def run_direct_generation(
     except Exception as e:
         logger.error(f"[{LogOp.ROADBLOCK}] {log_prefix} error: {e}", exc_info=True)
         return False
+
+
+def _filter_and_reorder_path_attempts_by_names(
+    path_attempts: list[tuple[str, bool, Any]],
+    ordered_names: list[str],
+) -> list[tuple[str, bool, Any]]:
+    attempt_map = {path_name: attempt for path_name, *rest in path_attempts for attempt in [(path_name, *rest)]}
+    selected: list[tuple[str, bool, Any]] = []
+    seen: set[str] = set()
+
+    for path_name in ordered_names:
+        if path_name in attempt_map and path_name not in seen:
+            selected.append(attempt_map[path_name])
+            seen.add(path_name)
+
+    return selected
+
+
+def plan_simplified_path_selection(
+    *,
+    llm_util: LLMUtil,
+    roadblock: dict[str, Any],
+    code_slice: str,
+    constraints,
+    summary: str,
+    target_class: str,
+    generation_mode: str,
+    available_paths: list[str],
+    enabled_paths: list[str],
+    seed_available: bool,
+    has_fields: bool,
+    has_taint_ranges: bool,
+    has_state_hints: bool,
+    has_relevant_flags: bool,
+) -> list[str]:
+    if len(enabled_paths) <= 1:
+        return enabled_paths
+
+    path_capabilities = {
+        "flag": "Best when relevant compile/runtime flag variables clearly gate the target branch.",
+        "taint_mutation": "Best when a reachable seed exists and taint ranges identify input bytes that influence the branch.",
+        "state_driven": "Best when the branch depends on parser/program state transitions and a reachable seed exists.",
+        "field_mutation": "Best when semantic fields are available and structured inputs can be edited at field level.",
+        "xml_grammar": "Best for libxml-style structured text parsing when direct text generation is appropriate.",
+        "batch_mutation": "Best as a fallback targeted mutation path over reachable seeds when other stronger signals are weak.",
+        "direct_generation": "Best when seed mutation signals are weak or when generating a fresh input is more promising than editing.",
+    }
+    available_info = []
+    for path_name in available_paths:
+        available_info.append({
+            "path_name": path_name,
+            "enabled": path_name in enabled_paths,
+            "capability": path_capabilities.get(path_name, ""),
+        })
+
+    user_content = (
+        f"<project>{PROJECT}</project>\n"
+        f"<target_class>{target_class}</target_class>\n"
+        f"<generation_mode>{generation_mode}</generation_mode>\n"
+        f"<roadblock>{json.dumps(roadblock, ensure_ascii=False, default=str)[:1600]}</roadblock>\n"
+        f"<summary>{summary[:1200]}</summary>\n"
+        f"<constraints>{json.dumps(constraints, ensure_ascii=False)[:1800] if not isinstance(constraints, str) else constraints[:1800]}</constraints>\n"
+        f"<code_slice>{code_slice[:3000]}</code_slice>\n"
+        f"<signals>\n"
+        f"seed_available={seed_available}\n"
+        f"has_fields={has_fields}\n"
+        f"has_taint_ranges={has_taint_ranges}\n"
+        f"has_state_hints={has_state_hints}\n"
+        f"has_relevant_flags={has_relevant_flags}\n"
+        f"</signals>\n"
+        f"<path_options>{json.dumps(available_info, ensure_ascii=False)}</path_options>\n"
+        "Choose only the enabled paths that are actually worth trying for this roadblock.\n"
+        "Return one JSON object with keys: selected_paths, primary_path, reason.\n"
+        "selected_paths must be an array of distinct enabled path names, sorted from most suitable to least suitable.\n"
+        "Do not include paths whose prerequisites are clearly missing or whose fit is weak."
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a path routing planner for an input-generation pipeline. "
+                "Given one target roadblock, current evidence, and candidate path capabilities, "
+                "select only the enabled paths that are actually worth trying, and rank those selected paths. "
+                "Prefer paths whose prerequisites are already satisfied, and omit weak fits. "
+                "Do not invent path names. Output JSON only."
+            ),
+        },
+        {"role": "user", "content": user_content},
+    ]
+
+    pattern_json = r"```(?:json)?\s*([\{\[].*?[\}\]])\s*```"
+    for attempt in range(3):
+        resp = llm_util.get_response(messages)
+        match = extract_json_with_fallback(resp, pattern_json)
+        if not match:
+            if attempt < 2:
+                append_llm_retry_feedback(
+                    messages,
+                    resp,
+                    "请只返回一个 JSON object，并包含 selected_paths、primary_path、reason。",
+                )
+            continue
+        try:
+            result = json.loads(match.group(1).strip())
+        except json.JSONDecodeError as exc:
+            if attempt < 2:
+                append_llm_retry_feedback(
+                    messages,
+                    resp,
+                    f"JSON 解析失败：{exc}。请只返回一个合法的 JSON object。",
+                )
+            continue
+        if not isinstance(result, dict):
+            continue
+        selected_paths = result.get("selected_paths")
+        if not isinstance(selected_paths, list):
+            continue
+        normalized = []
+        seen = set()
+        for item in selected_paths:
+            path_name = str(item).strip()
+            if path_name in enabled_paths and path_name not in seen:
+                normalized.append(path_name)
+                seen.add(path_name)
+        if normalized:
+            logger.info(
+                f"[{LogOp.ROADBLOCK}] LLM path router selected paths={normalized} "
+                f"primary={result.get('primary_path') or normalized[0]}"
+            )
+            return normalized
+        logger.info(
+            f"[{LogOp.ROADBLOCK}] LLM path router rejected all paths for this roadblock "
+            f"(reason={result.get('reason') or 'none'})"
+        )
+        return []
+
+    return enabled_paths
 
 
 def handle_roadblock_simplified(
@@ -7938,6 +8300,29 @@ def handle_roadblock_simplified(
                 ("direct_generation", ENABLE_SIMPLIFIED_DIRECT_GENERATION_PATH, lambda: run_direct_generation(attempt_ctx, log_prefix="Simplified Path C")),
             ]
 
+        if selected_paths is None:
+            enabled_path_names = [path_name for path_name, enabled, _ in path_attempts if enabled]
+            planned_paths = plan_simplified_path_selection(
+                llm_util=llm_util,
+                roadblock=roadblock,
+                code_slice=code_slice,
+                constraints=constraints,
+                summary=summary,
+                target_class=target_class,
+                generation_mode=generation_mode,
+                available_paths=[path_name for path_name, _, _ in path_attempts],
+                enabled_paths=enabled_path_names,
+                seed_available=seed is not None,
+                has_fields=fields is not None,
+                has_taint_ranges=bool(relevant_info and relevant_info.get('ranges')),
+                has_state_hints=bool(state_hints),
+                has_relevant_flags=bool(relevant_flags),
+            )
+            if not planned_paths:
+                logger.info(f"[{LogOp.ROADBLOCK}] LLM path router decided no simplified path is worth trying")
+                return False, "LLM_ROUTER_REJECTED_ALL_PATHS", -1, roadblock_id
+            path_attempts = _filter_and_reorder_path_attempts_by_names(path_attempts, planned_paths)
+
         attempt_made = False
         for path_name, enabled, path_runner in path_attempts:
             if selected_paths is not None and path_name not in selected_paths:
@@ -8123,8 +8508,10 @@ def check_fuzzer_alive():
     Raises FuzzerProcessDiedError if the fuzzer is not running.
     Skips check when config.test is True (test mode).
     """
-    # Skip fuzzer process check in test mode
-    if test:
+    # Skip fuzzer process check in test mode.
+    # Use config.test instead of the imported module-level `test` snapshot,
+    # so runner_bootstrap(test_mode=True) is honored consistently.
+    if config.test:
         return
 
     if fuzzer is None:

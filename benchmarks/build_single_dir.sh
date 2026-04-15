@@ -75,15 +75,24 @@ clean_make_src() {
   find "${SRC_DIR}" -type f \( -name '*.o' -o -name compile_commands.json \) -delete
 }
 
+clean_calc_src() {
+  pushd "${SRC_DIR}" >/dev/null
+  if [ -f Makefile ] || [ -f makefile ]; then
+    make clobber >/dev/null 2>&1 || make clean >/dev/null 2>&1 || true
+  fi
+  popd >/dev/null
+  find "${SRC_DIR}" -type f -name compile_commands.json -delete
+}
+
 prepare_targets() {
   mkdir -p "${HOME_DIR}/target/afl" "${HOME_DIR}/target/trace" "${HOME_DIR}/target/llvmcov" "${HOME_DIR}/target/ipl"
   case "${PROJECT}" in
-    cjson|cflow|cxxfilt|jhead|lcms|libpng|xmllint|mujs|pdf2text|sqlite3)
+    calc|cjson|cflow|cxxfilt|jhead|lcms|libpng|xmllint|mujs|pdf2text|sqlite3)
       mkdir -p "${HOME_DIR}/target/cmplog"
       ;;
   esac
   case "${PROJECT}" in
-    cjson|cflow|cxxfilt|mujs|xmllint|sqlite3)
+    calc|cjson|cflow|cxxfilt|mujs|xmllint|sqlite3)
     mkdir -p "${HOME_DIR}/target/autobug"
       ;;
   esac
@@ -535,9 +544,55 @@ build_sqlite3_autobug() {
   instrument_with_autobug "${SRC_DIR}/sqlite3" "sqlite3"
 }
 
+build_calc_variant() {
+  local cc="$1" cflags="$2" outbin="$3" target_dir="$4" afl_cmplog="${5:-0}"
+  clean_calc_src
+  pushd "${SRC_DIR}" >/dev/null
+  export CCC="${cc}" EXTRA_CFLAGS="${cflags}" EXTRA_LDFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
+  make -j"${JOBS}" target=Linux BLD_TYPE=calc-static-only
+  install_binary "${SRC_DIR}/calc" "${target_dir}" "${outbin}"
+  unset AFL_LLVM_CMPLOG || true
+  popd >/dev/null
+}
+
+build_calc_bear() {
+  clean_calc_src
+  pushd "${SRC_DIR}" >/dev/null
+  export CCC=clang EXTRA_CFLAGS="-g -O0" EXTRA_LDFLAGS="-g -O0" BEAR_DB="${SRC_DIR}/compile_commands.json"
+  rm -f "${SRC_DIR}/compile_commands.json"
+  bear make -j"${JOBS}" target=Linux BLD_TYPE=calc-static-only LATE_TARGETS=
+  rm -rf "${HOME_DIR}/src_bear"
+  mkdir -p "${HOME_DIR}/src_bear"
+  python "${BASE}/batch_process.py" "${PROJECT}"
+  popd >/dev/null
+}
+
+build_calc_autobug() {
+  clean_calc_src
+  pushd "${SRC_DIR}" >/dev/null
+  export CCC="gcc -O0 -g"
+  make -j"${JOBS}" target=Linux BLD_TYPE=calc-static-only
+  install_binary "${SRC_DIR}/calc" "autobug" "calc"
+  instrument_with_autobug "${SRC_DIR}/calc" "calc"
+  popd >/dev/null
+}
+
 main() {
   prepare_targets
   case "${PROJECT}" in
+    calc)
+      build_calc_variant afl-clang-fast "-g -O0" calc_fuzz afl
+      build_calc_variant afl-clang-fast "-g -O0" calc_cmplog cmplog 1
+      build_calc_variant gclang "-g -O0" calc_trace trace
+      run_trace_post calc_trace -lreadline -lhistory -lncurses
+      build_calc_variant clang-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      run_ipl_post calc_trace calc_ipl -lreadline -lhistory -lncurses
+      run_svf_static calc_trace
+      build_calc_autobug
+      build_calc_bear
+      clean_calc_src
+      ;;
     cjson)
       build_cjson_variant afl-clang-fast "-g -O0" cjson_fuzz afl
       build_cjson_variant afl-clang-fast "-g -O0" cjson_cmplog cmplog 1

@@ -465,13 +465,23 @@ class MultiStageStateAnalyzer:
         hints = []
         for mapping in mappings:
             var_name = mapping.get('state_variable', 'unknown')
-            offset = mapping.get('input_offset', '?')
-            size = mapping.get('size', '?')
+            offset = mapping.get('input_offset')
+            size = mapping.get('size')
             encoding = mapping.get('encoding', '?')
 
+            if isinstance(offset, int) and isinstance(size, int) and size > 0:
+                span_desc = f"input offset {offset}-{offset + size - 1}"
+                size_desc = f"{size} bytes"
+            elif isinstance(offset, int):
+                span_desc = f"input offset {offset}"
+                size_desc = "unknown size"
+            else:
+                span_desc = f"input offset {offset}" if offset not in {None, ""} else "input offset unknown"
+                size_desc = f"{size} bytes" if isinstance(size, int) and size > 0 else "unknown size"
+
             hint = (
-                f"[STATE] {var_name}: input offset {offset}-{offset+size-1 if offset != '?' else '?'} "
-                f"({size} bytes, {encoding})"
+                f"[STATE] {var_name}: {span_desc} "
+                f"({size_desc}, {encoding})"
             )
             hints.append(hint)
 

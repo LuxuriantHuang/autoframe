@@ -2152,7 +2152,6 @@ class CoverageTracer:
             try:
                 run_result = subprocess.run(
                     command,
-                    stdin=subprocess.PIPE if stdin_data is not None else None,
                     input=stdin_data,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -2261,7 +2260,6 @@ class CoverageTracer:
             try:
                 run_result = subprocess.run(
                     command,
-                    stdin=subprocess.PIPE if stdin_data is not None else None,
                     input=stdin_data,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,

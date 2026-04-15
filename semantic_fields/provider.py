@@ -11,7 +11,7 @@ from input_adapter import infer_input_adapter_from_harness
 JSON_PROJECTS = {"cjson", "jansson", "jq"}
 C_PROJECTS = {"cflow"}
 JS_PROJECTS = {"mujs"}
-GENERIC_TEXT_PROJECTS = {"sqlite"}
+GENERIC_TEXT_PROJECTS = {"sqlite", "calc"}
 
 
 def has_semantic_field_provider(project: str) -> bool:

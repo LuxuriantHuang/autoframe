@@ -177,6 +177,18 @@ LIBRARY_PRESETS = {
         "preprocess_note": "AFL harness 直接将 seed 作为 stdin 文本输入；程序会把字母数字和符号字符组成的 token 视为候选 mangled name，空白与其他字符更多充当分隔符。生成时优先输出短文本或多 token 文本，而不是结构化二进制。",
         "preferred_python_libraries": [],
     },
+    "calc": {
+        "format_name": "calc",
+        "type_desc": "输入是 calc 解释器脚本文本/表达式流，重点覆盖整数与分数运算、复数、内建函数、变量赋值、条件/循环、函数定义、字符串、格式配置以及轻微语法错误恢复。",
+        "signature": "int main(int argc, char **argv)",
+        "target_function": "top-level calc command parser/evaluator",
+        "call_chain": "main -> openinput/read commands -> scanner/parser -> evaluator",
+        "baseline_file": "benchmarks/calc/in/seed.cal",
+        "output_encoding": "text",
+        "generation_mode": "direct",
+        "preprocess_note": "优先生成可直接通过 stdin 喂给 calc 的短脚本或多行表达式；保持单文件文本输入，不依赖额外 include/script 文件。",
+        "preferred_python_libraries": [],
+    },
 }
 
 
@@ -203,6 +215,7 @@ TEXTUAL_FORMAT_NAMES = {
     "c_source",
     "csv",
     "txt",
+    "calc",
 }
 
 LONG_TEXT_HINT_KEYWORDS = [
@@ -675,6 +688,7 @@ def default_extension(format_name: str | None) -> str:
         "transform": ".txt",
         "c_source": ".c",
         "txt": ".txt",
+        "calc": ".cal",
         "png": ".png",
         "jpeg": ".jpg",
         "icc": ".icc",

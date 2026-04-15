@@ -522,15 +522,25 @@ class StateMachineInference:
 
         for mapping in mappings.get('mappings', []):
             var_name = mapping.get('state_variable', 'unknown')
-            offset = mapping.get('input_offset', '?')
-            size = mapping.get('size', '?')
+            offset = mapping.get('input_offset')
+            size = mapping.get('size')
             encoding = mapping.get('encoding', '?')
             target = mapping.get('target_value', 'unknown')
             byte_val = mapping.get('byte_value', target)
 
+            if isinstance(offset, int) and isinstance(size, int) and size > 0:
+                span_desc = f"input offset {offset}-{offset + size - 1}"
+                size_desc = f"{size} bytes"
+            elif isinstance(offset, int):
+                span_desc = f"input offset {offset}"
+                size_desc = "unknown size"
+            else:
+                span_desc = "input offset unknown"
+                size_desc = f"{size} bytes" if isinstance(size, int) and size > 0 else "unknown size"
+
             hint = (
-                f"[STATE] {var_name}: input offset {offset}-{offset+size-1} "
-                f"({size} bytes, {encoding}), target value {target} "
+                f"[STATE] {var_name}: {span_desc} "
+                f"({size_desc}, {encoding}), target value {target} "
                 f"(bytes: {byte_val})"
             )
             hints.append(hint)

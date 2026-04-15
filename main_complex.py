@@ -2103,7 +2103,7 @@ def _build_seed_profdata(seed_path: str) -> Optional[Path]:
         subprocess.run(
             trace_cmd,
             input=stdin_data,
-            stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
+            stdin=subprocess.DEVNULL if stdin_data is None else None,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=env,
