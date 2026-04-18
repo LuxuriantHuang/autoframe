@@ -549,23 +549,6 @@ def select_paths_by_trace(paths, trace_linenos):
 # Trace-guided 单路径截断（支持：return 终止 + 宏分支选择）
 # ============================================================
 
-# def collect_subtree_lines(node):
-#     """
-#     收集 node 子树下所有 **可能对应源码的行号**（用于 trace 相关性判断）。
-#     """
-#     if node is None:
-#         return set()
-#
-#     lines = set()
-#     ln = get_line_no(node)
-#     if ln is not None:
-#         lines.add(ln)
-#
-#     for ch in node.children:
-#         if ch.is_named:
-#             lines |= collect_subtree_lines(ch)
-#     return lines
-
 
 def collect_subtree_lines(node):
     """

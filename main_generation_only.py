@@ -29,6 +29,7 @@ class GenerationOnlyCoordinator:
         self.stop_event = threading.Event()
         self.pool_lock = threading.Lock()
         self.solve_lock = threading.Lock()
+        self.scheduler_state_lock = threading.RLock()
         self.roadblock_pool = []
         self.pool_cursor = 0
         self.last_refresh_time = 0.0
@@ -47,7 +48,9 @@ class GenerationOnlyCoordinator:
         self._logged_plateau_without_pool = False
         self.pending_plateau = threading.Event()
         self.pending_plateau_since = 0.0
+        self._reward_feed_offset = 0
         self._load_scheduler_state()
+        self._consume_reward_feed()
 
     def _load_scheduler_state(self) -> None:
         if not self.scheduler_state_path.exists():
@@ -59,29 +62,31 @@ class GenerationOnlyCoordinator:
                 f"[{core.LogOp.ROADBLOCK}] Failed to load scheduler state {self.scheduler_state_path}: {exc}"
             )
             return
-        self.interesting_scores = {
-            str(key): float(value) for key, value in (payload.get("interesting_scores") or {}).items()
-        }
-        self.failure_counts = {
-            str(key): int(value) for key, value in (payload.get("failure_counts") or {}).items()
-        }
-        self.cooldown_until = {
-            str(key): float(value) for key, value in (payload.get("cooldown_until") or {}).items()
-        }
-        self.selection_counts = {
-            str(key): int(value) for key, value in (payload.get("selection_counts") or {}).items()
-        }
-        self.last_selected_key = str(payload.get("last_selected_key") or "") or None
+        with self.scheduler_state_lock:
+            self.interesting_scores = {
+                str(key): float(value) for key, value in (payload.get("interesting_scores") or {}).items()
+            }
+            self.failure_counts = {
+                str(key): int(value) for key, value in (payload.get("failure_counts") or {}).items()
+            }
+            self.cooldown_until = {
+                str(key): float(value) for key, value in (payload.get("cooldown_until") or {}).items()
+            }
+            self.selection_counts = {
+                str(key): int(value) for key, value in (payload.get("selection_counts") or {}).items()
+            }
+            self.last_selected_key = str(payload.get("last_selected_key") or "") or None
 
     def _save_scheduler_state(self) -> None:
-        payload = {
-            "updated_at": time.time(),
-            "interesting_scores": self.interesting_scores,
-            "failure_counts": self.failure_counts,
-            "cooldown_until": self.cooldown_until,
-            "selection_counts": self.selection_counts,
-            "last_selected_key": self.last_selected_key or "",
-        }
+        with self.scheduler_state_lock:
+            payload = {
+                "updated_at": time.time(),
+                "interesting_scores": dict(self.interesting_scores),
+                "failure_counts": dict(self.failure_counts),
+                "cooldown_until": dict(self.cooldown_until),
+                "selection_counts": dict(self.selection_counts),
+                "last_selected_key": self.last_selected_key or "",
+            }
         try:
             self.scheduler_state_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
@@ -92,31 +97,76 @@ class GenerationOnlyCoordinator:
                 f"[{core.LogOp.ROADBLOCK}] Failed to save scheduler state {self.scheduler_state_path}: {exc}"
             )
 
+    def _consume_reward_feed(self) -> None:
+        """Read reward records from reward_feed.jsonl and merge into interesting_scores."""
+        reward_path = config.REWARD_FEED_PATH
+        if not reward_path.exists():
+            return
+        rewards_applied = 0
+        try:
+            with open(reward_path, "r", encoding="utf-8") as f:
+                # Seek to last consumed offset
+                with self.scheduler_state_lock:
+                    reward_feed_offset = self._reward_feed_offset
+                if reward_feed_offset > 0:
+                    f.seek(reward_feed_offset)
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    rb_key = record.get("roadblock_key")
+                    reward = float(record.get("reward", 0))
+                    if rb_key and reward != 0:
+                        with self.scheduler_state_lock:
+                            current = float(self.interesting_scores.get(rb_key, 0.0))
+                            self.interesting_scores[rb_key] = current + reward
+                        rewards_applied += 1
+                with self.scheduler_state_lock:
+                    self._reward_feed_offset = f.tell()
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            core.logger.warning(
+                f"[{core.LogOp.ROADBLOCK}] Failed to consume reward feed: {exc}"
+            )
+            return
+        if rewards_applied:
+            core.logger.info(
+                f"[{core.LogOp.ROADBLOCK}] Consumed {rewards_applied} reward(s) from feed, "
+                f"updated interesting_scores"
+            )
+            self._save_scheduler_state()
+
     def _sync_scheduler_state(self, prepared_roadblocks) -> None:
-        active_keys = set()
-        for rb in prepared_roadblocks:
-            key = rb.get("roadblock_key") or core.get_roadblock_key(rb)
-            active_keys.add(key)
-            self.interesting_scores.setdefault(key, 0.0)
-            self.failure_counts.setdefault(key, 0)
-            self.selection_counts.setdefault(key, 0)
+        with self.scheduler_state_lock:
+            active_keys = set()
+            for rb in prepared_roadblocks:
+                key = rb.get("roadblock_key") or core.get_roadblock_key(rb)
+                active_keys.add(key)
+                self.interesting_scores.setdefault(key, 0.0)
+                self.failure_counts.setdefault(key, 0)
+                self.selection_counts.setdefault(key, 0)
 
-        stale_score_keys = set(self.interesting_scores) - active_keys
-        stale_failure_keys = set(self.failure_counts) - active_keys
-        stale_cooldown_keys = set(self.cooldown_until) - active_keys
-        stale_selection_keys = set(self.selection_counts) - active_keys
+            stale_score_keys = set(self.interesting_scores) - active_keys
+            stale_failure_keys = set(self.failure_counts) - active_keys
+            stale_cooldown_keys = set(self.cooldown_until) - active_keys
+            stale_selection_keys = set(self.selection_counts) - active_keys
 
-        for key in stale_score_keys:
-            self.interesting_scores.pop(key, None)
-        for key in stale_failure_keys:
-            self.failure_counts.pop(key, None)
-        for key in stale_cooldown_keys:
-            self.cooldown_until.pop(key, None)
-        for key in stale_selection_keys:
-            self.selection_counts.pop(key, None)
+            for key in stale_score_keys:
+                self.interesting_scores.pop(key, None)
+            for key in stale_failure_keys:
+                self.failure_counts.pop(key, None)
+            for key in stale_cooldown_keys:
+                self.cooldown_until.pop(key, None)
+            for key in stale_selection_keys:
+                self.selection_counts.pop(key, None)
 
-        if self.last_selected_key and self.last_selected_key not in active_keys:
-            self.last_selected_key = None
+            if self.last_selected_key and self.last_selected_key not in active_keys:
+                self.last_selected_key = None
         self._save_scheduler_state()
 
     def _cooldown_seconds_for_failures(self, failure_count: int) -> float:
@@ -133,24 +183,25 @@ class GenerationOnlyCoordinator:
     ) -> None:
         roadblock_key = roadblock.get("roadblock_key") or core.get_roadblock_key(roadblock)
         now = time.time()
-        score = float(self.interesting_scores.get(roadblock_key, 0.0))
-        failures = int(self.failure_counts.get(roadblock_key, 0))
+        with self.scheduler_state_lock:
+            score = float(self.interesting_scores.get(roadblock_key, 0.0))
+            failures = int(self.failure_counts.get(roadblock_key, 0))
 
-        if coverage_breakthrough:
-            score -= 3.0
-            failures = 0
-            self.cooldown_until[roadblock_key] = now + 600.0
-        elif attempted:
-            score -= 1.5
-            failures += 1
-            self.cooldown_until[roadblock_key] = now + self._cooldown_seconds_for_failures(failures)
-        else:
-            score -= 2.5
-            failures += 1
-            self.cooldown_until[roadblock_key] = now + self._cooldown_seconds_for_failures(failures + 1)
+            if coverage_breakthrough:
+                score -= 3.0
+                failures = 0
+                self.cooldown_until[roadblock_key] = now + 600.0
+            elif attempted:
+                score -= 1.5
+                failures += 1
+                self.cooldown_until[roadblock_key] = now + self._cooldown_seconds_for_failures(failures)
+            else:
+                score -= 2.5
+                failures += 1
+                self.cooldown_until[roadblock_key] = now + self._cooldown_seconds_for_failures(failures + 1)
 
-        self.interesting_scores[roadblock_key] = score
-        self.failure_counts[roadblock_key] = failures
+            self.interesting_scores[roadblock_key] = score
+            self.failure_counts[roadblock_key] = failures
         self._save_scheduler_state()
         core.logger.info(
             f"[{core.LogOp.ROADBLOCK}] Scheduler updated for {roadblock_key}: "
@@ -222,37 +273,38 @@ class GenerationOnlyCoordinator:
         with self.pool_lock:
             if not self.roadblock_pool:
                 return None
-            now = time.time()
-            eligible = []
-            for rb in self.roadblock_pool:
-                key = rb.get("roadblock_key") or core.get_roadblock_key(rb)
-                if now < float(self.cooldown_until.get(key, 0.0)):
-                    continue
-                eligible.append(rb)
+            with self.scheduler_state_lock:
+                now = time.time()
+                eligible = []
+                for rb in self.roadblock_pool:
+                    key = rb.get("roadblock_key") or core.get_roadblock_key(rb)
+                    if now < float(self.cooldown_until.get(key, 0.0)):
+                        continue
+                    eligible.append(rb)
 
-            candidates = eligible if eligible else list(self.roadblock_pool)
-            if self.last_selected_key and len(candidates) > 1:
-                non_repeated = [
-                    rb for rb in candidates
-                    if (rb.get("roadblock_key") or core.get_roadblock_key(rb)) != self.last_selected_key
-                ]
-                if non_repeated:
-                    candidates = non_repeated
+                candidates = eligible if eligible else list(self.roadblock_pool)
+                if self.last_selected_key and len(candidates) > 1:
+                    non_repeated = [
+                        rb for rb in candidates
+                        if (rb.get("roadblock_key") or core.get_roadblock_key(rb)) != self.last_selected_key
+                    ]
+                    if non_repeated:
+                        candidates = non_repeated
 
-            def candidate_rank(rb):
-                key = rb.get("roadblock_key") or core.get_roadblock_key(rb)
-                return (
-                    float(self.interesting_scores.get(key, 0.0)),
-                    -int(self.failure_counts.get(key, 0)),
-                    -int(self.selection_counts.get(key, 0)),
-                )
+                def candidate_rank(rb):
+                    key = rb.get("roadblock_key") or core.get_roadblock_key(rb)
+                    return (
+                        float(self.interesting_scores.get(key, 0.0)),
+                        -int(self.failure_counts.get(key, 0)),
+                        -int(self.selection_counts.get(key, 0)),
+                    )
 
-            best_rank = max(candidate_rank(rb) for rb in candidates)
-            best_candidates = [rb for rb in candidates if candidate_rank(rb) == best_rank]
-            roadblock = random.choice(best_candidates)
-            roadblock_key = roadblock.get("roadblock_key") or core.get_roadblock_key(roadblock)
-            self.selection_counts[roadblock_key] = int(self.selection_counts.get(roadblock_key, 0)) + 1
-            self.last_selected_key = roadblock_key
+                best_rank = max(candidate_rank(rb) for rb in candidates)
+                best_candidates = [rb for rb in candidates if candidate_rank(rb) == best_rank]
+                roadblock = random.choice(best_candidates)
+                roadblock_key = roadblock.get("roadblock_key") or core.get_roadblock_key(roadblock)
+                self.selection_counts[roadblock_key] = int(self.selection_counts.get(roadblock_key, 0)) + 1
+                self.last_selected_key = roadblock_key
             self._save_scheduler_state()
             core.logger.info(
                 f"[{core.LogOp.ROADBLOCK}] Scheduler selected {roadblock_key} "
@@ -284,6 +336,7 @@ class GenerationOnlyCoordinator:
         while not self.stop_event.is_set():
             self.tracer.poll_autobug_seed_queue()
             self.tracer.kick_autobug_prime_async()
+            self._consume_reward_feed()
             cur_time = time.time()
             if cur_time - self.last_solve_check_time < every_n_seconds:
                 time.sleep(1)
@@ -649,6 +702,10 @@ def handle_roadblock_generation_only(roadblock, tracer: CoverageTracer, llm_util
         )
         path_attempted = generation_result.attempted
         if path_attempted:
+            # Register seed origin for reward feedback
+            if hasattr(generation_result, 'candidate_path') and generation_result.candidate_path:
+                seed_name = os.path.basename(generation_result.candidate_path)
+                tracer.register_generated_seed(seed_name, roadblock_key, queue_name="LLM")
             core.logger.info(
                 f"[{core.LogOp.ROADBLOCK}] Generation-only direct generation produced candidate output"
             )

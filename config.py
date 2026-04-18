@@ -46,9 +46,7 @@ ROOT_DIR = Path(os.getenv("AF_HOME", Path(__file__).resolve().parent)).resolve()
 load_dotenv(ROOT_DIR / ".env")
 
 test = os.getenv("AF_TEST_MODE", "0").lower() in {"1", "true", "yes", "on"}
-DEFAULT_DELETE_OUT = True
 HOUR = 3600
-MAX_DURATION = 3 * HOUR
 MAX_TIME = 3
 # Fuzzing config
 PWD = ROOT_DIR.as_posix()
@@ -110,15 +108,6 @@ LLVM_PROFDATA_BIN = _resolve_tool_path(
     [],
     ["llvm-profdata-14", "llvm-profdata", "llvm-profdata-10", "llvm-profdata-11", "llvm-profdata-18"],
 )
-LLVM_OPT_BIN = _resolve_tool_path(
-    "AF_LLVM_OPT_BIN",
-    [LLVM_BIN_PATH / "opt"],
-    ["opt"],
-)
-SLICE_PLUGIN_PATH = _resolve_existing_path(
-    SVF_SLICE_PATH / "libBranchConditionSlicer.so",
-    SVF_SLICE_PATH / "libBranchConditionSlicer_v2.so",
-)
 FUZZER_NAME = "default"
 PROJECT = os.getenv("AF_PROJECT", "mujs")
 OUTPUT_DIR_NAME = os.getenv("AF_OUTPUT_DIR", "out")  # 输出目录名，可通过命令行 -o 参数修改
@@ -163,8 +152,19 @@ else:
 # 旧逻辑保留：
 CHECK_INTERVAL = 10  # 每 10 秒检查一次
 TIMEOUT = 30
+SEED_COVERAGE_DIAG_TIMEOUT = int(os.getenv("AF_SEED_COVERAGE_DIAG_TIMEOUT", str(TIMEOUT)))
+SEED_GATE_DISABLE_REJECT = os.getenv("AF_SEED_GATE_DISABLE_REJECT", "1").lower() in {"1", "true", "yes", "on"}
 AUTOBUG_SCAN_INTERVAL = 180
 AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND = int(os.getenv("AF_AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND", "32"))
+AUTOBUG_TRACE_SIZE_LIMIT = int(os.getenv("AF_AUTOBUG_TRACE_SIZE_LIMIT", str(50 * 1024 * 1024)))  # 50MB
+AUTOBUG_GET_BRANCH_TIMEOUT = int(os.getenv("AF_AUTOBUG_GET_BRANCH_TIMEOUT", "60"))  # seconds
+AUTOBUG_FLIP_BRANCH_TIMEOUT = int(os.getenv("AF_AUTOBUG_FLIP_BRANCH_TIMEOUT", "120"))  # seconds
+AUTOBUG_COND_MAX_SELECTION_TRIES = int(os.getenv("AF_AUTOBUG_COND_MAX_SELECTION_TRIES", "2"))
+
+# Trace模块开关：控制是否在停滞后运行完整的trace分析
+# 设置为True时，在停滞后运行完整的llvm-cov trace分析
+ENABLE_STAGNATION_TRACE = os.getenv("AF_ENABLE_STAGNATION_TRACE", "true").lower() in {"1", "true", "yes", "on"}
+
 PROJECT_HOME = ROOT_DIR / "benchmarks" / PROJECT
 STATIC_PATH = Path(PROJECT_HOME) / "static"
 OUTPUT_PATH = PROJECT_HOME / OUTPUT_DIR_NAME
@@ -180,6 +180,7 @@ RUN_TRACE_PATH = RUN_RUNTIME_PATH / "trace"
 RUN_TAINT_PATH = RUN_RUNTIME_PATH / "taint"
 RUN_SEMANTIC_FIELDS_PATH = RUN_RUNTIME_PATH / "semantic_fields"
 RUN_SYMBOLIC_PATH = RUN_RUNTIME_PATH / "symbolic"
+REWARD_FEED_PATH = RUN_RUNTIME_PATH / "reward_feed.jsonl"
 PLOT_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "plot_data"
 SEED_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "queue"
 FUZZER_STATS_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "fuzzer_stats"
@@ -333,7 +334,6 @@ EXEC_ARGS = ""
 COV_TARGET_PATH = PROJECT_HOME / "target" / "llvmcov" / "target"
 
 # DSE config
-DSE_SEEDS_NUM = 3
 DSE_DOCKER_TMP_PATH = Path("/root/Project") / OUTPUT_DIR_NAME / "runtime" / "symbolic" / "tmp"
 DSE_TMP_PATH = RUN_SYMBOLIC_PATH / "tmp"
 DSE_TARGET_PATH = PROJECT_HOME / OUTPUT_DIR_NAME / "symbolic" / "queue"
@@ -440,8 +440,6 @@ MUT_TMP_PATH = RUN_MUT_PATH / "tmp"
 # Flagrec tool configuration
 FLAGREC_BITCODE = bcfile_path  # Reuse existing trace bitcode
 FLAGREC_CACHE = STATIC_PATH / "flagrec_cache.json"
-FLAGREC_MIN_CONFIDENCE = 0.5
-
 
 @dataclass(frozen=True)
 class ExperimentPaths:
@@ -717,8 +715,6 @@ ENABLE_V2_PRE_JUDGE = False
 ENABLE_FORMAT_SPEC_ENHANCEMENT = True
 
 # 状态驱动映射超时 (秒)
-# 防止 LLM 分析时间过长
-STATE_DRIVEN_TIMEOUT = 30
 
 # 映射结果缓存
 # 缓存已学习的映射以避免重复分析
@@ -859,6 +855,7 @@ def set_project(project_name: str, output_dir_name: str = "out"):
     global PROJECT, OUTPUT_DIR_NAME, PROJECT_HOME, STATIC_PATH, PLOT_PATH, SEED_PATH, FUZZER_STATS_PATH
     global RUN_ROOT, RUN_LOG_PATH, RUN_RUNTIME_PATH, RUN_LLM_PATH, RUN_MUT_PATH
     global RUN_SLICE_PATH, RUN_TRACE_PATH, RUN_TAINT_PATH, RUN_SEMANTIC_FIELDS_PATH, RUN_SYMBOLIC_PATH
+    global REWARD_FEED_PATH
     global LLM_TMP_PATH, MUT_TMP_PATH, bcfile_path, COV_TARGET_PATH
     global IPL_TARGET_PATH, bbs, funcs, slice_out
     global DSE_TMP_PATH, DSE_TARGET_PATH, DSE_PROGRAM, DSE_DOCKER_TMP_PATH
@@ -893,6 +890,7 @@ def set_project(project_name: str, output_dir_name: str = "out"):
     RUN_TAINT_PATH = RUN_RUNTIME_PATH / "taint"
     RUN_SEMANTIC_FIELDS_PATH = RUN_RUNTIME_PATH / "semantic_fields"
     RUN_SYMBOLIC_PATH = RUN_RUNTIME_PATH / "symbolic"
+    REWARD_FEED_PATH = RUN_RUNTIME_PATH / "reward_feed.jsonl"
     PLOT_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "plot_data"
     SEED_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "queue"
     FUZZER_STATS_PATH = Path(PROJECT_HOME) / OUTPUT_DIR_NAME / FUZZER_NAME / "fuzzer_stats"
@@ -975,6 +973,7 @@ def set_project(project_name: str, output_dir_name: str = "out"):
                 module.RUN_TAINT_PATH = RUN_TAINT_PATH
                 module.RUN_SEMANTIC_FIELDS_PATH = RUN_SEMANTIC_FIELDS_PATH
                 module.RUN_SYMBOLIC_PATH = RUN_SYMBOLIC_PATH
+                module.REWARD_FEED_PATH = REWARD_FEED_PATH
                 module.PLOT_PATH = PLOT_PATH
                 module.SEED_PATH = SEED_PATH
                 module.FUZZER_STATS_PATH = FUZZER_STATS_PATH

@@ -548,7 +548,7 @@ build_calc_variant() {
   local cc="$1" cflags="$2" outbin="$3" target_dir="$4" afl_cmplog="${5:-0}"
   clean_calc_src
   pushd "${SRC_DIR}" >/dev/null
-  export CCC="${cc}" EXTRA_CFLAGS="${cflags}" EXTRA_LDFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CCC="${cc} ${cflags}" EXTRA_CFLAGS="" EXTRA_LDFLAGS="" AFL_CC=clang-18 AFL_CXX=clang++-18
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   make -j"${JOBS}" target=Linux BLD_TYPE=calc-static-only
   install_binary "${SRC_DIR}/calc" "${target_dir}" "${outbin}"
@@ -559,7 +559,7 @@ build_calc_variant() {
 build_calc_bear() {
   clean_calc_src
   pushd "${SRC_DIR}" >/dev/null
-  export CCC=clang EXTRA_CFLAGS="-g -O0" EXTRA_LDFLAGS="-g -O0" BEAR_DB="${SRC_DIR}/compile_commands.json"
+  export CCC="clang -g -O0" EXTRA_CFLAGS="" EXTRA_LDFLAGS="" BEAR_DB="${SRC_DIR}/compile_commands.json"
   rm -f "${SRC_DIR}/compile_commands.json"
   bear make -j"${JOBS}" target=Linux BLD_TYPE=calc-static-only LATE_TARGETS=
   rm -rf "${HOME_DIR}/src_bear"

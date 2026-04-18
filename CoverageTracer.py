@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -93,110 +94,6 @@ def collect_identifiers(node, source_bytes, acc):
     for ch in node.children:
         collect_identifiers(ch, source_bytes, acc)
 
-
-def find_calls_with_args(func_src: str, callee_name: str):
-    """
-    在 func_src 中查找对 callee_name 的所有调用。
-    对每次调用，返回：
-      - 调用代码片段
-      - 行列位置
-      - 每个实参的原始表达式
-      - 每个实参中出现的变量名列表
-    """
-    source_bytes = func_src.encode('utf8')
-    tree = parser.parse(source_bytes)
-    root = tree.root_node
-
-    results = []
-
-    def dfs(node):
-        if node.type == "call_expression":
-            func_node = node.child_by_field_name("function")
-            if func_node is not None:
-                name = get_text(source_bytes, func_node)
-                if name == callee_name:
-                    # 取参数
-                    args_node = node.child_by_field_name("arguments")
-                    arg_exprs = []  # 每个参数的源码
-                    arg_ident_lists = []  # 每个参数里的变量名列表
-
-                    if args_node is not None:
-                        for child in args_node.children:
-                            # 跳过标点
-                            if child.type in ("(", ")", ","):
-                                continue
-                            # 这是一个完整的参数表达式
-                            arg_src = get_text(source_bytes, child)
-                            arg_exprs.append(arg_src)
-
-                            ids = []
-                            collect_identifiers(child, source_bytes, ids)
-                            arg_ident_lists.append(ids)
-
-                    sr, sc = node.start_point
-                    er, ec = node.end_point
-                    results.append({
-                        "call_snippet": get_text(source_bytes, node),
-                        "start_point": (sr, sc),
-                        "end_point": (er, ec),
-                        "arg_exprs": arg_exprs,
-                        "arg_identifiers": arg_ident_lists,
-                    })
-
-        for ch in node.children:
-            dfs(ch)
-
-    dfs(root)
-    return results
-
-
-def find_indirect_call_sites(func_src: str, direct_callee_names: set[str] | None = None):
-    """
-    在 func_src 中查找疑似间接调用点。
-    优先保留不属于已知 direct callee 集合的调用表达式，避免把普通 direct call 误判成 indirect。
-    """
-    source_bytes = func_src.encode('utf8')
-    tree = parser.parse(source_bytes)
-    root = tree.root_node
-    direct_callee_names = direct_callee_names or set()
-
-    results = []
-
-    def dfs(node):
-        if node.type == "call_expression":
-            func_node = node.child_by_field_name("function")
-            if func_node is not None:
-                func_text = get_text(source_bytes, func_node)
-                is_indirect = func_node.type != "identifier" or func_text not in direct_callee_names
-                if is_indirect:
-                    args_node = node.child_by_field_name("arguments")
-                    arg_exprs = []
-                    arg_ident_lists = []
-                    if args_node is not None:
-                        for child in args_node.children:
-                            if child.type in ("(", ")", ","):
-                                continue
-                            arg_src = get_text(source_bytes, child)
-                            arg_exprs.append(arg_src)
-                            ids = []
-                            collect_identifiers(child, source_bytes, ids)
-                            arg_ident_lists.append(ids)
-
-                    sr, sc = node.start_point
-                    er, ec = node.end_point
-                    results.append({
-                        "call_snippet": get_text(source_bytes, node),
-                        "start_point": (sr, sc),
-                        "end_point": (er, ec),
-                        "arg_exprs": arg_exprs,
-                        "arg_identifiers": arg_ident_lists,
-                        "callee_expr": func_text,
-                    })
-        for ch in node.children:
-            dfs(ch)
-
-    dfs(root)
-    return results
 
 
 def find_if_at_line(root, line):
@@ -369,7 +266,7 @@ def analyze_low_value_guard_roadblock(roadblock: dict) -> dict[str, object]:
     if roadblock.get("group_type") == "switch":
         return {"should_skip": False}
 
-    status = str(roadblock.get("status") or "").strip()
+    status = _canonicalize_roadblock_status(roadblock)
     if status not in {"only_true", "only_false"}:
         return {"should_skip": False}
 
@@ -981,6 +878,21 @@ def _branch_cover_mode_from_only_side(only_side) -> str:
     return "auto"
 
 
+def _canonicalize_roadblock_status(roadblock: dict) -> str:
+    status = str(roadblock.get("status") or "").strip()
+    if status in {"only_true", "only_false"}:
+        return status
+
+    side = str(roadblock.get("side") or "").strip().lower()
+    if status in {"zero_covered", "one_covered"}:
+        if side == "false":
+            return "only_true"
+        if side == "true":
+            return "only_false"
+
+    return status
+
+
 def _try_trace_driven_slice(context: dict, file_name: str, line: int, only_side) -> str:
     seed_path = context.get("representative_seed_path")
     preferred_path = context.get("representative_call_path") or []
@@ -1316,161 +1228,6 @@ def get_harness_code():
         return None
 
 
-def process_profdata(profdata, cov_target_path, roadblock):
-    """
-    处理单个 profdata 文件，返回 stem（文件名不含扩展名）如果满足条件，否则返回 None
-
-    只有直接覆盖目标行的种子才会被选中
-    """
-    single_export_cmd = (
-        f"{LLVM_COV_BIN} show "
-        f"{cov_target_path} -format=text -instr-profile={profdata.resolve().as_posix()} "
-        f"{roadblock['filename']}"
-    )
-    p = subprocess.Popen(
-        split(single_export_cmd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=profdata.parent  # 注意：cwd 应该是 profdata 的父目录
-    )
-    cov, err = p.communicate()
-
-    if p.returncode != 0:
-        # 可选：记录错误或抛出异常
-        print(f"Error processing {profdata}: {err.decode('utf-8')}")
-        return None
-
-    cov = cov.decode("utf-8").split("\n")
-    if roadblock['line'] - 1 >= len(cov):
-        print(f"Line {roadblock['line']} out of range in {profdata}")
-        return None
-
-    cov_line = cov[roadblock["case_body_line"] - 1] if roadblock.get('group_type', None) == "switch" \
-          else cov[roadblock['line'] - 1]
-
-    def parse_human_readable_number(s):
-        try:
-            s = s.strip().lower()
-            if s.endswith('k'):
-                return int(float(s[:-1]) * 1000)
-            elif s.endswith('m'):
-                return int(float(s[:-1]) * 1000000)
-            elif s.endswith('g'):
-                return int(float(s[:-1]) * 1000000000)
-            else:
-                return int(float(s))
-        except (ValueError, TypeError):
-            return 0  # 或者抛出异常，根据你的需求
-
-    try:
-        target_line_cov = parse_human_readable_number(cov_line.split('|')[1])
-    except Exception as e:
-        print(f"Parse error in {profdata}, line {roadblock['line'] - 1}: {cov_line}")
-        return None
-
-    if target_line_cov > 0:
-        return profdata.stem
-    return None
-
-
-def export_one_sided_branches(profdata: Path, cov_target_path) -> list[dict]:
-    cmd = [
-        LLVM_COV_BIN,
-        "export",
-        os.fspath(cov_target_path),
-        "-format=text",
-        f"-instr-profile={profdata.resolve()}",
-        "--json-only-one-sided-branches",
-        "--json-skip-low-value-guards",
-    ]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        check=False,
-        cwd=profdata.parent,
-    )
-    if result.returncode != 0:
-        logger.warning(
-            "[COVERAGE] Failed to export one-sided branches for %s: %s",
-            profdata,
-            (result.stderr or "").strip()[:300],
-        )
-        return []
-
-    try:
-        payload = json.loads(result.stdout)
-    except Exception as exc:
-        logger.warning("[COVERAGE] Failed to parse llvm-cov export for %s: %s", profdata, exc)
-        return []
-
-    # llvm-cov puts one-sided branches under a synthetic files[0] entry whose
-    # filename is often "all_files"; the real source location lives on each
-    # branch item itself.
-    branch_entries = payload.get("data", [{}])[0].get("files", [])
-    branches: list[dict] = []
-    seen: set[tuple] = set()
-    for file_entry in branch_entries:
-        for branch in file_entry.get("one_sided_branches", []):
-            if int(branch.get("true_count", 0) or 0) == 0 and int(branch.get("false_count", 0) or 0) == 0:
-                continue
-            key = (
-                branch.get("filename"),
-                int(branch.get("line", 0) or 0),
-                branch.get("side"),
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            item = branch.copy()
-            item.pop("false_count", None)
-            item.pop("true_count", None)
-            item.pop("col", None)
-            branches.append(item)
-    return branches
-
-
-def export_switch_coverage_summary(profdata: Path, cov_target_path) -> list[dict]:
-    cmd = [
-        LLVM_COV_BIN,
-        "export",
-        os.fspath(cov_target_path),
-        "-format=text",
-        f"-instr-profile={profdata.resolve()}",
-        "--json-switch-coverage-summary",
-    ]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        check=False,
-        cwd=profdata.parent,
-    )
-    if result.returncode != 0:
-        logger.warning(
-            "[COVERAGE] Failed to export switch coverage summary for %s: %s",
-            profdata,
-            (result.stderr or "").strip()[:300],
-        )
-        return []
-
-    try:
-        payload = json.loads(result.stdout)
-    except Exception as exc:
-        logger.warning("[COVERAGE] Failed to parse switch coverage export for %s: %s", profdata, exc)
-        return []
-
-    summaries: list[dict] = []
-    for file_entry in payload.get("data", [{}])[0].get("files", []):
-        for summary in file_entry.get("switch_coverage_summary", []):
-            summaries.append(summary)
-    return summaries
-
-
 class CoverageTracer:
     def __init__(self, input_dir, output_dir, fuzzing_args, target_prog, trace_prog, bb, func, input_adapter_spec=None):
         self.last_coverage = 0
@@ -1490,8 +1247,6 @@ class CoverageTracer:
         self.call_edge = CallEdge()
         self.trace_dir = RUN_TRACE_PATH
         self.trace_dir.mkdir(parents=True, exist_ok=True)
-        self.prof_dir = self.trace_dir / "prof"
-        self.main_profdata_path = self.trace_dir / "main.profdata"
         self.trace_progress_path = self.trace_dir / TRACE_PROGRESS_FILE
         self.last_trace_timestamp_ns = self._load_trace_progress()
 
@@ -1504,21 +1259,36 @@ class CoverageTracer:
             "functions": set(),
         }
         self.dynamic_trace_cache = DynamicTraceCache(self.trace_dir / "cache")
-        self._rb_seed_index: dict[tuple[str, int, object], list[str]] = {}
-        self._rb_seed_index_signature: tuple | None = None
         self._autobug_seed_branch_cache: dict[str, dict[str, object] | None] = {}
+        self._autobug_seed_branch_cache_lock = threading.Lock()
         self._autobug_cache_dir = self.trace_dir / "autobug"
         self._autobug_cache_dir.mkdir(parents=True, exist_ok=True)
         self._autobug_branch_cache_path = self._autobug_cache_dir / "seed_branches.json"
         self._autobug_pending_seed_names: deque[str] = deque()
         self._autobug_pending_seed_name_set: set[str] = set()
         self._autobug_prime_lock = threading.Lock()
-        self._autobug_prime_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="autobug-prime")
-        self._autobug_prime_future = None
+        self._autobug_queue_lock = threading.Lock()
+        self._autobug_prime_thread = None  # 改用普通线程，不用 ThreadPoolExecutor
+        self._autobug_prime_stop_event = threading.Event()
         self._autobug_queue_read_files: set[Path] = set()
         self._autobug_queue_last_scan_time_ns = 0
         self._autobug_last_queue_poll_at = 0.0
+        # cond_status system (ported from hyllfuzz)
+        self._cond_status_lock = threading.Lock()
+        self._cond_status: dict[str, dict[str, set[str]]] = {}  # cond_key → {branch_key → {seed_names}}
+        self._interest_lock = threading.Lock()
+        self._interesting_conds: dict[str, float] = {}  # cond_key → score
+        self._never_interest_lock = threading.Lock()
+        self._never_interesting_conds: set[str] = set()
+        self._agent_seed_registry_lock = threading.Lock()
+        self._agent_seed_registry: dict[str, str] = {}  # seed_name → cond_key
+        # Reward feedback: seed origin tracking (queue:seed_id → roadblock_key)
+        self._seed_origin_lock = threading.Lock()
+        self._seed_origin_map: dict[str, str] = {}  # "LLM:000003" → roadblock_key
+        self._reward_state_path = self._autobug_cache_dir / "seed_reward_state.json"
+        self._rewarded_sync_ids: set[str] = set()
         self._load_persisted_autobug_branch_cache()
+        self._load_seed_origin_map()
         stats = self._read_fuzzer_stats_summary()
         if stats.get("edges_found") is not None:
             self.last_coverage = int(stats["edges_found"])
@@ -1590,15 +1360,18 @@ class CoverageTracer:
             return
 
         seeds = payload.get("seeds", {})
-        for seed_name, seed_payload in seeds.items():
-            self._autobug_seed_branch_cache[str(seed_name)] = self._deserialize_autobug_branch_payload(seed_payload)
+        with self._autobug_seed_branch_cache_lock:
+            for seed_name, seed_payload in seeds.items():
+                self._autobug_seed_branch_cache[str(seed_name)] = self._deserialize_autobug_branch_payload(seed_payload)
 
     def _save_persisted_autobug_branch_cache(self) -> None:
+        with self._autobug_seed_branch_cache_lock:
+            cached_items = list(self._autobug_seed_branch_cache.items())
         payload = {
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "seeds": {
                 seed_name: self._serialize_autobug_branch_payload(seed_payload)
-                for seed_name, seed_payload in sorted(self._autobug_seed_branch_cache.items())
+                for seed_name, seed_payload in sorted(cached_items)
             },
         }
         try:
@@ -1609,6 +1382,132 @@ class CoverageTracer:
         except Exception as exc:
             logger.warning("[AUTOBUG] Failed to save branch cache %s: %s", self._autobug_branch_cache_path, exc)
 
+    # ── Reward feedback: seed origin tracking ──────────────────────────
+
+    def _load_seed_origin_map(self) -> None:
+        if not self._reward_state_path.exists():
+            return
+        try:
+            payload = json.loads(self._reward_state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("[REWARD] Failed to load seed origin state %s: %s", self._reward_state_path, exc)
+            return
+        origins = payload.get("origins", {})
+        with self._seed_origin_lock:
+            self._seed_origin_map.update(origins)
+        rewarded = payload.get("rewarded_sync_ids", [])
+        self._rewarded_sync_ids.update(rewarded)
+        logger.info(
+            "[REWARD] Loaded seed origin state: %d origins, %d already rewarded",
+            len(self._seed_origin_map),
+            len(self._rewarded_sync_ids),
+        )
+
+    def _save_seed_origin_map(self) -> None:
+        with self._seed_origin_lock:
+            origins = dict(self._seed_origin_map)
+        rewarded = list(self._rewarded_sync_ids)
+        payload = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "version": 1,
+            "origins": origins,
+            "rewarded_sync_ids": rewarded,
+        }
+        try:
+            self._reward_state_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning("[REWARD] Failed to save seed origin state %s: %s", self._reward_state_path, exc)
+
+    @staticmethod
+    def _extract_seed_field(seed_name: str, field: str) -> str | None:
+        """Extract a named field from an AFL seed filename (e.g. 'src' from 'id:001,sync:LLM,src:003,+cov')."""
+        for part in seed_name.split(","):
+            if part.startswith(f"{field}:"):
+                return part[len(field) + 1:]
+        return None
+
+    def register_generated_seed(self, seed_name: str, roadblock_key: str, queue_name: str) -> None:
+        """Record that a seed was generated targeting a specific roadblock.
+
+        Args:
+            seed_name: The seed filename (e.g. 'id:000003,path:direct_generation,bid:000042').
+            roadblock_key: The roadblock_key this seed targets.
+            queue_name: Which queue the seed is placed in ('LLM', 'mut', etc.).
+        """
+        seed_id = self._extract_seed_field(seed_name, "id")
+        if not seed_id:
+            logger.warning("[REWARD] Cannot extract seed id from '%s', skipping registration", seed_name)
+            return
+        lookup_key = f"{queue_name}:{seed_id}"
+        with self._seed_origin_lock:
+            self._seed_origin_map[lookup_key] = roadblock_key
+        with self._agent_seed_registry_lock:
+            self._agent_seed_registry[seed_name] = roadblock_key
+        self._save_seed_origin_map()
+        logger.info("[REWARD] Registered seed %s → %s (key=%s)", seed_name, roadblock_key, lookup_key)
+
+    def _detect_and_apply_rewards(self, discovered_seed_names: list[str]) -> int:
+        """Scan discovered seeds for sync:+cov entries and apply rewards to originating roadblocks.
+
+        Returns the number of rewards applied.
+        """
+        rewards_applied = 0
+        for seed_name in discovered_seed_names:
+            if "sync:" not in seed_name or "+cov" not in seed_name:
+                continue
+            if seed_name in self._rewarded_sync_ids:
+                continue
+
+            sync_source = self._extract_seed_field(seed_name, "sync")
+            src_id = self._extract_seed_field(seed_name, "src")
+            if not sync_source or src_id is None:
+                continue
+
+            lookup_key = f"{sync_source}:{src_id}"
+            with self._seed_origin_lock:
+                rb_key = self._seed_origin_map.get(lookup_key)
+            if not rb_key:
+                continue
+
+            self._rewarded_sync_ids.add(seed_name)
+            self._apply_seed_reward(rb_key, seed_name)
+            rewards_applied += 1
+
+        if rewards_applied:
+            self._save_seed_origin_map()
+        return rewards_applied
+
+    def _apply_seed_reward(self, roadblock_key: str, seed_name: str) -> None:
+        """Write a reward record for a successful seed to the reward feed."""
+        reward_delta = 5.0
+        cond_key = roadblock_key  # For logging
+        with self._interest_lock:
+            self._interesting_conds[cond_key] = self._interesting_conds.get(cond_key, 0.0) + reward_delta
+
+        # Append to reward feed (cross-process communication)
+        reward_path = config.REWARD_FEED_PATH
+        record = {
+            "roadblock_key": roadblock_key,
+            "reward": reward_delta,
+            "seed_name": seed_name,
+            "ts": time.time(),
+        }
+        try:
+            reward_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(reward_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            logger.info(
+                "[REWARD] +%.1f for roadblock %s (seed %s produced new coverage via AFL sync)",
+                reward_delta,
+                roadblock_key,
+                seed_name,
+            )
+        except Exception as exc:
+            logger.warning("[REWARD] Failed to write reward feed: %s", exc)
+
     def enqueue_autobug_seed_names(self, seed_names: list[str]) -> None:
         if not seed_names:
             return
@@ -1616,7 +1515,9 @@ class CoverageTracer:
         with self._autobug_prime_lock:
             enqueued = 0
             for seed_name in seed_names:
-                if seed_name in self._autobug_seed_branch_cache:
+                with self._autobug_seed_branch_cache_lock:
+                    already_cached = seed_name in self._autobug_seed_branch_cache
+                if already_cached:
                     continue
                 if seed_name in self._autobug_pending_seed_name_set:
                     continue
@@ -1632,59 +1533,60 @@ class CoverageTracer:
             )
 
     def poll_autobug_seed_queue(self) -> int:
-        now = time.time()
-        if self._autobug_last_queue_poll_at > 0 and now - self._autobug_last_queue_poll_at < AUTOBUG_SCAN_INTERVAL:
-            return 0
-        self._autobug_last_queue_poll_at = now
-        discovered_seed_names: list[str] = []
-        latest_scan = int(self._autobug_queue_last_scan_time_ns or 0)
-        queue_dir = SEED_PATH
-        if queue_dir.exists() and queue_dir.is_dir():
-            try:
-                files_to_run, _, latest_scan = get_new_seeds(
+        with self._autobug_queue_lock:
+            now = time.time()
+            if self._autobug_last_queue_poll_at > 0 and now - self._autobug_last_queue_poll_at < AUTOBUG_SCAN_INTERVAL:
+                return 0
+            self._autobug_last_queue_poll_at = now
+            discovered_seed_names: list[str] = []
+            latest_scan = int(self._autobug_queue_last_scan_time_ns or 0)
+            queue_dir = SEED_PATH
+            if queue_dir.exists() and queue_dir.is_dir():
+                try:
+                    files_to_run, _, latest_scan = get_new_seeds(
+                        queue_dir,
+                        self._autobug_queue_read_files,
+                        latest_scan,
+                        prof_dir=None,
+                    )
+                    discovered_seed_names.extend(path.name for path in files_to_run)
+                except FileNotFoundError:
+                    pass
+            self._autobug_queue_last_scan_time_ns = latest_scan
+            if discovered_seed_names:
+                logger.info(
+                    "[AUTOBUG] Queue scan discovered %d new seed(s) from %s for branch-cache backlog",
+                    len(discovered_seed_names),
                     queue_dir,
-                    self._autobug_queue_read_files,
-                    latest_scan,
-                    prof_dir=None,
                 )
-                discovered_seed_names.extend(path.name for path in files_to_run)
-            except FileNotFoundError:
-                pass
-        self._autobug_queue_last_scan_time_ns = latest_scan
-        if discovered_seed_names:
-            logger.info(
-                "[AUTOBUG] Queue scan discovered %d new seed(s) from %s for branch-cache backlog",
-                len(discovered_seed_names),
-                queue_dir,
-            )
-            self.enqueue_autobug_seed_names(discovered_seed_names)
-        else:
-            logger.info(
-                "[AUTOBUG] Queue scan found no new seed in %s (interval=%ss)",
-                queue_dir,
-                AUTOBUG_SCAN_INTERVAL,
-            )
-        return len(discovered_seed_names)
+                self.enqueue_autobug_seed_names(discovered_seed_names)
+                # Reward feedback: detect sync:+cov seeds from our generation
+                rewards = self._detect_and_apply_rewards(discovered_seed_names)
+                if rewards:
+                    logger.info("[REWARD] Applied %d reward(s) from AFL sync seeds", rewards)
+            else:
+                logger.info(
+                    "[AUTOBUG] Queue scan found no new seed in %s (interval=%ss)",
+                    queue_dir,
+                    AUTOBUG_SCAN_INTERVAL,
+                )
+            return len(discovered_seed_names)
 
     def kick_autobug_prime_async(self) -> bool:
         with self._autobug_prime_lock:
-            if self._autobug_prime_future is not None and not self._autobug_prime_future.done():
+            if self._autobug_prime_thread is not None and self._autobug_prime_thread.is_alive():
                 logger.info(
                     "[AUTOBUG] Async branch-cache priming already running (pending=%d)",
                     len(self._autobug_pending_seed_names),
                 )
                 return False
-            if self._autobug_prime_future is not None and self._autobug_prime_future.done():
-                try:
-                    self._autobug_prime_future.result()
-                except Exception as exc:
-                    logger.warning("[AUTOBUG] Async priming task failed: %s", exc)
-                self._autobug_prime_future = None
 
             pending_seed_names = list(self._autobug_pending_seed_names)
+            with self._autobug_seed_branch_cache_lock:
+                cached_seed_names = set(self._autobug_seed_branch_cache)
             pending_cov = [
                 seed_name for seed_name in pending_seed_names
-                if seed_name not in self._autobug_seed_branch_cache and self._seed_has_cov(seed_name)
+                if seed_name not in cached_seed_names and self._seed_has_cov(seed_name)
             ]
             if pending_cov:
                 selected = set(pending_cov)
@@ -1693,7 +1595,7 @@ class CoverageTracer:
             else:
                 non_cov_pending = [
                     seed_name for seed_name in pending_seed_names
-                    if seed_name not in self._autobug_seed_branch_cache
+                    if seed_name not in cached_seed_names
                 ]
                 batch = non_cov_pending[:max(1, int(AUTOBUG_PRIME_MAX_SEEDS_PER_ROUND))]
                 mode = "non_cov_batch"
@@ -1715,19 +1617,26 @@ class CoverageTracer:
             len(batch),
             mode,
         )
-        self._autobug_prime_future = self._autobug_prime_executor.submit(self._run_autobug_prime_batch, batch)
+        # 使用普通线程而不是 ThreadPoolExecutor
+        self._autobug_prime_stop_event.clear()
+        self._autobug_prime_thread = threading.Thread(
+            target=self._run_autobug_prime_batch,
+            args=(batch,),
+            name="autobug-prime",
+            daemon=True
+        )
+        self._autobug_prime_thread.start()
         return True
 
     def shutdown_background_workers(self, wait: bool = False) -> None:
         with self._autobug_prime_lock:
-            future = self._autobug_prime_future
-            self._autobug_prime_future = None
-        if future is not None and future.done():
-            try:
-                future.result()
-            except Exception as exc:
-                logger.warning("[AUTOBUG] Async priming task failed during shutdown: %s", exc)
-        self._autobug_prime_executor.shutdown(wait=wait, cancel_futures=True)
+            thread = self._autobug_prime_thread
+            self._autobug_prime_thread = None
+        if thread is not None and thread.is_alive():
+            self._autobug_prime_stop_event.set()
+            if wait:
+                thread.join(timeout=5)
+        # 不再需要 shutdown executor
 
     def _run_autobug_prime_batch(self, seed_names: list[str]) -> None:
         start_time = time.time()
@@ -1750,9 +1659,11 @@ class CoverageTracer:
         if analyzer is None or subject is None:
             return
 
+        with self._autobug_seed_branch_cache_lock:
+            cached_seed_names = set(self._autobug_seed_branch_cache)
         pending_seed_names = [
             seed_name for seed_name in seed_names
-            if seed_name not in self._autobug_seed_branch_cache
+            if seed_name not in cached_seed_names
         ]
         if not pending_seed_names:
             logger.info("[AUTOBUG] Branch cache already warm for %d seed(s)", len(seed_names))
@@ -1770,12 +1681,14 @@ class CoverageTracer:
             len(pending_seed_names),
         )
         updated = False
-        progress_interval = 25
         start_time = time.time()
         total = len(pending_seed_names)
+        progress_interval = 50  # 每 50 个 seed 打印一次进度
         for index, seed_name in enumerate(pending_seed_names, start=1):
             self._load_autobug_seed_branches(seed_name)
             updated = True
+
+            # 每 50 个 seed 或最后一个打印进度
             should_log_progress = (
                 index == 1
                 or index == total
@@ -2077,6 +1990,88 @@ class CoverageTracer:
 
         return sorted(candidates, key=score, reverse=True)[0]
 
+    def _populate_cond_status_from_branches(self, seed_name: str, parsed: dict[str, dict[str, object]]) -> None:
+        """Populate cond_status/interesting_conds from parsed BRANCH.dump data (ported from hyllfuzz globals.py)."""
+        for cond_key, payload in parsed.items():
+            branches = payload.get("branches", set())
+            total = int(payload.get("total", 0))
+
+            with self._never_interest_lock:
+                if cond_key in self._never_interesting_conds:
+                    continue
+
+            # Fully covered → never_interesting
+            if len(branches) >= total:
+                with self._never_interest_lock:
+                    self._never_interesting_conds.add(cond_key)
+                with self._interest_lock:
+                    self._interesting_conds.pop(cond_key, None)
+                with self._cond_status_lock:
+                    self._cond_status.pop(cond_key, None)
+                continue
+
+            with self._cond_status_lock:
+                if cond_key not in self._cond_status:
+                    self._cond_status[cond_key] = {}
+                    with self._interest_lock:
+                        self._interesting_conds[cond_key] = 0.0
+
+                for branch_id in branches:
+                    branch_key = str(branch_id)
+                    if branch_key not in self._cond_status[cond_key]:
+                        self._cond_status[cond_key][branch_key] = set()
+                    self._cond_status[cond_key][branch_key].add(seed_name)
+
+    def _shrink_cond_status(self, cond_key: str, total: int) -> None:
+        """Remove fully covered cond from cond_status (ported from hyllfuzz globals.py)."""
+        with self._never_interest_lock:
+            if cond_key in self._never_interesting_conds:
+                return
+
+        with self._cond_status_lock:
+            if cond_key in self._cond_status and len(self._cond_status[cond_key]) >= total:
+                del self._cond_status[cond_key]
+                with self._never_interest_lock:
+                    self._never_interesting_conds.add(cond_key)
+                with self._interest_lock:
+                    self._interesting_conds.pop(cond_key, None)
+
+    def _log_cond_status_summary(self) -> None:
+        """Log a brief summary of cond_status for debugging."""
+        with self._cond_status_lock:
+            n_conds = len(self._cond_status)
+        with self._interest_lock:
+            n_interesting = len(self._interesting_conds)
+        with self._never_interest_lock:
+            n_never = len(self._never_interesting_conds)
+        logger.info(
+            "[COND_STATUS] conds=%d interesting=%d never_interesting=%d",
+            n_conds, n_interesting, n_never,
+        )
+
+    def get_uncovered_branches(self, roadblock: dict) -> list[int]:
+        """Get uncovered branch IDs for a roadblock from cond_status."""
+        cond_key = self._roadblock_cond_key(roadblock)
+        if not cond_key:
+            return []
+        with self._cond_status_lock:
+            cond_data = self._cond_status.get(cond_key)
+        if not cond_data:
+            return []
+        covered = {int(bk) for bk in cond_data if bk.isdigit()}
+        # Branch IDs are 1..total; uncovered = all known branches minus covered
+        # We also need total — get it from _autobug_seed_branch_cache
+        total = None
+        with self._autobug_seed_branch_cache_lock:
+            seed_branch_payloads = list(self._autobug_seed_branch_cache.values())
+        for seed_data in seed_branch_payloads:
+            if seed_data and cond_key in seed_data:
+                total = seed_data[cond_key].get("total")
+                break
+        if total is None:
+            return []
+        return [b for b in range(1, total + 1) if b not in covered]
+
     @staticmethod
     def _parse_autobug_branch_dump(dump_text: str) -> dict[str, dict[str, object]]:
         result: dict[str, dict[str, object]] = {}
@@ -2106,10 +2101,14 @@ class CoverageTracer:
 
     @staticmethod
     def _roadblock_expected_branch_id(roadblock: dict) -> int | None:
-        status = str(roadblock.get("status") or "").strip()
-        if status == "only_true":
-            return 1
+        branch_id = int(roadblock.get("branch_id", 0) or 0)
+        if branch_id > 0:
+            return branch_id
+
+        status = _canonicalize_roadblock_status(roadblock)
         if status == "only_false":
+            return 1
+        if status == "only_true":
             return 2
         return None
 
@@ -2128,51 +2127,112 @@ class CoverageTracer:
             return False
         return file_name == rb_file or Path(file_name).name == Path(rb_file).name
 
+    @staticmethod
+    def _roadblock_cond_key(roadblock: dict) -> str | None:
+        """Build a cond_key from a roadblock dict for cond_status lookup."""
+        rb_file = str(roadblock.get("filename", "") or "")
+        rb_line = int(roadblock.get("line", 0) or 0)
+        if not rb_file or not rb_line:
+            return None
+        return f"{rb_file}:{rb_line}"
+
     def _load_autobug_seed_branches(self, seed_name: str) -> dict[str, dict[str, object]] | None:
-        if seed_name in self._autobug_seed_branch_cache:
-            return self._autobug_seed_branch_cache[seed_name]
+        with self._autobug_seed_branch_cache_lock:
+            if seed_name in self._autobug_seed_branch_cache:
+                return self._autobug_seed_branch_cache[seed_name]
 
         analyzer = self._autobug_analyzer_path()
         subject = self._autobug_subject_path()
         seed_path = self._resolve_seed_candidate_path(seed_name)
         if analyzer is None or subject is None or seed_path is None:
-            self._autobug_seed_branch_cache[seed_name] = None
+            with self._autobug_seed_branch_cache_lock:
+                self._autobug_seed_branch_cache[seed_name] = None
             return None
 
         with tempfile.TemporaryDirectory(prefix="autobug-branch-", dir=self._autobug_cache_dir) as tmpdir:
             tmpdir_path = Path(tmpdir)
             trace_path = tmpdir_path / "TRACE.dump"
 
-            command, stdin_data = build_seed_invocation(
-                os.fspath(subject),
-                self.fuzzing_args,
-                seed_path,
-                self.input_adapter_spec,
-            )
+            # 照搬调试脚本的 build_seed_invocation 逻辑
+            command = [os.fspath(subject)]
+            has_atat = "@@" in self.fuzzing_args
+
+            if has_atat:
+                # 有 @@ 占位符，通过命令行传递
+                for arg in self.fuzzing_args:
+                    if arg == "@@":
+                        command.append(os.fspath(seed_path))
+                    else:
+                        command.append(arg)
+                stdin_data = None
+            else:
+                # 没有 @@ 占位符，通过 stdin 传递（calc 的情况）
+                command.extend(self.fuzzing_args)
+                stdin_data = seed_path.read_bytes()
+
+            if stdin_data is not None:
+                logger.debug("[AUTOBUG] Running target: %s (via stdin, %d bytes)",
+                            " ".join(command), len(stdin_data))
+            else:
+                logger.debug("[AUTOBUG] Running target: %s", " ".join(command))
+
             try:
-                run_result = subprocess.run(
+                # 使用 Popen 而不是 run，以便在超时时能够杀死进程
+                # 使用 start_new_session=True 创建新的进程组，便于 Ctrl+C 时清理
+                process = subprocess.Popen(
                     command,
-                    input=stdin_data,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env={**os.environ, "TRACE_DUMP": os.fspath(trace_path)},
-                    check=False,
-                    timeout=TIMEOUT,
+                    start_new_session=True,  # 创建新的进程组
                 )
-            except subprocess.TimeoutExpired:
-                logger.warning("[AUTOBUG] Trace replay timed out for seed %s", seed_name)
-                self._autobug_seed_branch_cache[seed_name] = None
+                try:
+                    stdout, stderr = process.communicate(input=stdin_data, timeout=30)
+                except subprocess.TimeoutExpired:
+                    # 超时时杀死整个进程组
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass  # 进程已经结束
+                    process.kill()
+                    try:
+                        stdout, stderr = process.communicate(timeout=1)
+                    except:
+                        pass
+                    logger.warning("[AUTOBUG] Trace replay timed out for seed %s, process group killed", seed_name)
+                    with self._autobug_seed_branch_cache_lock:
+                        self._autobug_seed_branch_cache[seed_name] = None
+                    return None
+            except Exception as e:
+                logger.warning("[AUTOBUG] Failed to run target for seed %s: %s", seed_name, e)
+                with self._autobug_seed_branch_cache_lock:
+                    self._autobug_seed_branch_cache[seed_name] = None
                 return None
 
-            if run_result.returncode != 0 and not trace_path.exists():
-                stderr = (run_result.stderr or b"").decode("utf-8", errors="replace").strip()[:400]
+            if process.returncode != 0 and not trace_path.exists():
+                stderr = (stderr or b"").decode("utf-8", errors="replace").strip()[:400]
                 logger.warning("[AUTOBUG] Trace replay failed for %s: %s", seed_name, stderr)
-                self._autobug_seed_branch_cache[seed_name] = None
+                with self._autobug_seed_branch_cache_lock:
+                    self._autobug_seed_branch_cache[seed_name] = None
                 return None
             if not trace_path.exists():
                 logger.warning("[AUTOBUG] TRACE_DUMP not created for seed %s", seed_name)
-                self._autobug_seed_branch_cache[seed_name] = None
+                with self._autobug_seed_branch_cache_lock:
+                    self._autobug_seed_branch_cache[seed_name] = None
                 return None
+
+            trace_size = trace_path.stat().st_size
+            # 移除 TRACE 大小限制，不再跳过大的 seed
+            # if trace_size > config.AUTOBUG_TRACE_SIZE_LIMIT:
+            #     logger.warning(
+            #         "[AUTOBUG] TRACE too large for seed %s (%.1fMB > %dMB limit), skipping get-branch",
+            #         seed_name,
+            #         trace_size / (1024 * 1024),
+            #         config.AUTOBUG_TRACE_SIZE_LIMIT // (1024 * 1024),
+            #     )
+            #     self._autobug_seed_branch_cache[seed_name] = None
+            #     return None
 
             branch_cmd = [
                 os.fspath(analyzer),
@@ -2182,24 +2242,29 @@ class CoverageTracer:
                 "--output",
                 "/dev/null",
             ]
-            branch_result = subprocess.run(
+            # 使用 Popen 创建进程组，便于 Ctrl+C 时清理
+            branch_process = subprocess.Popen(
                 branch_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
-                check=False,
+                start_new_session=True,  # 创建新的进程组
                 cwd=tmpdir,
             )
+            branch_result = branch_process.communicate()
             dump_path = tmpdir_path / "BRANCH.dump"
-            if branch_result.returncode != 0 or not dump_path.exists():
-                stderr = (branch_result.stderr or branch_result.stdout or "").strip()[:400]
+            if branch_process.returncode != 0 or not dump_path.exists():
+                stderr = (branch_result[1] or "").strip()[:400]
                 logger.warning("[AUTOBUG] get-branch failed for %s: %s", seed_name, stderr)
-                self._autobug_seed_branch_cache[seed_name] = None
+                with self._autobug_seed_branch_cache_lock:
+                    self._autobug_seed_branch_cache[seed_name] = None
                 return None
 
             parsed = self._parse_autobug_branch_dump(dump_path.read_text(encoding="utf-8", errors="replace"))
-            self._autobug_seed_branch_cache[seed_name] = parsed
+            with self._autobug_seed_branch_cache_lock:
+                self._autobug_seed_branch_cache[seed_name] = parsed
+            self._populate_cond_status_from_branches(seed_name, parsed)
             return parsed
 
     def _autobug_slice_cache_path(self, roadblock: dict, seed_name: str) -> Path:
@@ -2213,9 +2278,23 @@ class CoverageTracer:
         return slice_cache_dir / f"{stem}.c"
 
     def _autobug_branch_coverage_arg(self, roadblock: dict, seed_name: str) -> str | None:
+        # Fast path: use cond_status
+        cond_key = self._roadblock_cond_key(roadblock)
+        if cond_key:
+            with self._cond_status_lock:
+                cond_data = self._cond_status.get(cond_key)
+            if cond_data:
+                # Get branches covered by this specific seed
+                covered = sorted(
+                    int(bk) for bk, seeds in cond_data.items() if bk.isdigit() and seed_name in seeds
+                )
+                if covered:
+                    return ",".join(str(b) for b in covered)
+
+        # Fallback: iterate seed branch cache
         branches_by_cond = self._load_autobug_seed_branches(seed_name) or {}
-        for cond_key, payload in branches_by_cond.items():
-            if not self._autobug_cond_matches_roadblock(cond_key, roadblock):
+        for ck, payload in branches_by_cond.items():
+            if not self._autobug_cond_matches_roadblock(ck, roadblock):
                 continue
             branches = sorted(int(branch_id) for branch_id in payload.get("branches", set()))
             if branches:
@@ -2279,6 +2358,17 @@ class CoverageTracer:
                 logger.warning("[AUTOBUG] TRACE_DUMP not created for autobug slice seed %s", seed_name)
                 return None
 
+            trace_size = trace_path.stat().st_size
+            # 移除 TRACE 大小限制
+            # if trace_size > config.AUTOBUG_TRACE_SIZE_LIMIT:
+            #     logger.warning(
+            #         "[AUTOBUG] TRACE too large for slice seed %s (%.1fMB > %dMB limit), skipping flip-branch",
+            #         seed_name,
+            #         trace_size / (1024 * 1024),
+            #         config.AUTOBUG_TRACE_SIZE_LIMIT // (1024 * 1024),
+            #     )
+            #     return None
+
             target_loc = f"{roadblock.get('filename', '')}:{int(roadblock.get('line', 0) or 0)}"
             slice_cmd = [
                 os.fspath(analyzer),
@@ -2295,15 +2385,26 @@ class CoverageTracer:
                 "--window",
                 "10",
             ]
-            slice_result = subprocess.run(
-                slice_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                check=False,
-                cwd=tmpdir,
-            )
+            try:
+                slice_result = subprocess.run(
+                    slice_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                    cwd=tmpdir,
+                    timeout=config.AUTOBUG_FLIP_BRANCH_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                logger.warning(
+                    "[AUTOBUG] flip-branch timed out (%ds) for seed %s at %s (trace %.1fMB)",
+                    config.AUTOBUG_FLIP_BRANCH_TIMEOUT,
+                    seed_name,
+                    target_loc,
+                    trace_size / (1024 * 1024),
+                )
+                return None
             if slice_result.returncode != 0 or not sliced_path.exists():
                 stderr = (slice_result.stderr or slice_result.stdout or "").strip()[:400]
                 logger.warning("[AUTOBUG] flip-branch failed for %s: %s", seed_name, stderr)
@@ -2363,13 +2464,27 @@ class CoverageTracer:
         if expected_branch is None:
             return []
 
+        # Fast path: use cond_status for O(1) lookup
+        cond_key = self._roadblock_cond_key(roadblock)
+        if cond_key:
+            with self._cond_status_lock:
+                cond_data = self._cond_status.get(cond_key)
+            if cond_data:
+                branch_key = str(expected_branch)
+                if branch_key in cond_data:
+                    seeds = cond_data[branch_key] & set(candidate_names)
+                    if seeds:
+                        return list(seeds)[:limit]
+
+        # Fallback: iterate seed branch cache
         matches: list[str] = []
         for seed_name in candidate_names:
-            branches_by_cond = self._autobug_seed_branch_cache.get(seed_name)
+            with self._autobug_seed_branch_cache_lock:
+                branches_by_cond = self._autobug_seed_branch_cache.get(seed_name)
             if not branches_by_cond:
                 continue
-            for cond_key, payload in branches_by_cond.items():
-                if not self._autobug_cond_matches_roadblock(cond_key, roadblock):
+            for ck, payload in branches_by_cond.items():
+                if not self._autobug_cond_matches_roadblock(ck, roadblock):
                     continue
                 if expected_branch in payload.get("branches", set()):
                     matches.append(seed_name)
@@ -2377,23 +2492,6 @@ class CoverageTracer:
             if len(matches) >= limit:
                 break
         return matches
-
-    def _profdata_confirmed_seed_names(
-        self,
-        roadblock: dict,
-        candidate_names: list[str],
-        *,
-        limit: int,
-    ) -> list[str]:
-        exact_key = self._roadblock_seed_key(roadblock)
-        confirmed: list[str] = []
-        for seed_name in candidate_names:
-            profdata = self._seed_profdata_path(seed_name)
-            if self._profdata_matches_roadblock(profdata, exact_key):
-                confirmed.append(seed_name)
-                if len(confirmed) >= limit:
-                    break
-        return confirmed
 
     def select_seed_names_for_roadblock(self, roadblock, seed_names=None, max_seeds: int = 3) -> list[str]:
         candidate_names = list(seed_names) if seed_names is not None else self._recent_seed_candidates(limit=max(max_seeds * 4, 24))
@@ -2417,9 +2515,12 @@ class CoverageTracer:
             )
             return autobug_matches
 
-        confirmed = self._profdata_confirmed_seed_names(roadblock, candidate_names, limit=max_seeds)
-        if confirmed:
-            return confirmed
+        # 不再有profdata fallback，直接返回候选seeds
+        logger.info(
+            "[AUTOBUG] No AutoBug-confirmed seeds, using top candidate seeds for %s:%s",
+            roadblock.get("filename", ""),
+            roadblock.get("line", 0),
+        )
         return candidate_names[:max_seeds]
 
     def _dynamic_trace_fingerprint(self) -> str:
@@ -2589,219 +2690,64 @@ class CoverageTracer:
         )
         return stagnation_time
 
-    def get_trace(self, read_files: set, last_scan_time: int):  # 后续修改为多进程
-        new_call_edge = CallEdge()
-        st = time.time()
-        recent_files = set()
-        recent_functions = set()
+    def get_trace(self, read_files: set, last_scan_time: int):
+        """
+        获取trace信息（完全使用autobug驱动）
+
+        新逻辑：
+        1. 轮询autobug队列获取新seed
+        2. 触发autobug prime异步任务
+        3. 从autobug缓存中获取roadblocks
+
+        不再使用：
+        - profraw生成
+        - profdata merge
+        - llvm-cov export
+
+        Returns:
+            tuple: (success: bool, last_scan_time: int, error_info: str, roadblocks: list[dict])
+        """
+        logger.debug("[TRACE] Starting autobug-driven trace extraction")
+
+        # 获取新的seeds
         seed_dir = Path.joinpath(Path(self.output_dir), FUZZER_NAME, "queue")
-        profdir = self.prof_dir
-        profdir.mkdir(parents=True, exist_ok=True)
-        if self.last_trace_timestamp_ns > int(last_scan_time or 0):
-            logger.debug(
-                "[TRACE] Resuming trace checkpoint at timestamp_ns=%d",
-                self.last_trace_timestamp_ns,
-            )
-            last_scan_time = self.last_trace_timestamp_ns
         seed_lst_to_run, resume_data_to_load, last_scan_time = get_new_seeds(
             seed_dir,
             read_files,
             last_scan_time,
-            prof_dir=profdir,
+            prof_dir=None,  # 不再使用profdir
         )
+
         if len(seed_lst_to_run) == 0:
-            logging.info("没有新的seed需要追踪，等待AFL生成新seed...")
-            # 返回空roadblocks而不是False，让主循环继续运行
-            return True, last_scan_time, "没有新的seed", []
-        self._reset_rb_seed_index()
-        for stale_profraw in profdir.glob("*.profraw"):
-            try:
-                stale_profraw.unlink()
-            except FileNotFoundError:
-                continue
-        total_seed_count = len(seed_lst_to_run)
-        progress_interval = 100
-        trace_loop_start = time.time()
-        logger.info(f"trace extract begin (seed_count={total_seed_count})")
-        new_profraw_files: list[Path] = []
+            logging.info("[TRACE] 没有新的seed需要追踪，等待AFL生成新seed...")
+            # 即使没有新seeds，也尝试从autobug缓存获取已有roadblocks
+            roadblocks = self.get_current_one_sided_branches()
+            return True, last_scan_time, "没有新的seed", roadblocks
 
-        # 初始化时间记录文件（整个运行周期只创建一次）
-        if not self.timing_log_initialized:
-            with open(self.timing_log_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['seed_index', 'seed_name', 'profraw_time', 'tracer_time', 'total_time', "size"])
-            self.timing_log_initialized = True
+        # 将新发现的seeds加入autobug处理队列
+        seed_names = [seed_path.name for seed_path in seed_lst_to_run]
+        self.enqueue_autobug_seed_names(seed_names)
 
-        for i, seed_path in enumerate(seed_lst_to_run):
-            seed_start = time.time()
+        # 触发异步autobug prime
+        self.kick_autobug_prime_async()
 
-            # 记录 profraw 生成时间
-            profraw_start = time.time()
-            profraw_cmd, stdin_data = build_seed_invocation(
-                os.fspath(COV_TARGET_PATH),
-                self.fuzzing_args,
-                seed_path,
-                self.input_adapter_spec,
-            )
-            p = subprocess.Popen(
-                profraw_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-                env={"LLVM_PROFILE_FILE": seed_path.name + ".profraw"},
-                cwd=profdir,
-            )
-            try:
-                if stdin_data is not None:
-                    p.communicate(stdin_data, timeout=TIMEOUT)
-                else:
-                    p.communicate(timeout=TIMEOUT)
-            except subprocess.TimeoutExpired:
-                logger.warning(
-                    f"[TRACE] Seed replay timed out after {TIMEOUT}s, skipping seed: {seed_path.name}"
-                )
-                p.kill()
-                p.communicate()
-                continue
-            profraw_time = time.time() - profraw_start
+        # 从autobug缓存获取roadblocks
+        roadblocks = self.get_current_one_sided_branches()
 
-            profraw_file = profdir / f"{seed_path.name}.profraw"
-            if not profraw_file.exists():
-                logger.warning(f"[TRACE] Profraw not generated, skipping seed: {seed_path.name}")
-                continue
-            new_profraw_files.append(profraw_file)
+        logger.info(
+            f"[TRACE] Autobug-driven trace完成: "
+            f"new_seeds={len(seed_lst_to_run)}, "
+            f"roadblocks={len(roadblocks)}, "
+            f"autobug_cache_size={self._get_autobug_seed_branch_cache_size()}"
+        )
 
-            single_prof_data_cmd = f"{LLVM_PROFDATA_BIN} merge -sparse -o {profdir.resolve().as_posix()}/{seed_path.name}.profdata {profdir.resolve().as_posix()}/{seed_path.name}.profraw"
-            p = subprocess.Popen(split(single_prof_data_cmd), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 cwd=profdir)
-            _, __ = p.communicate()
-            if i % 1000 == 0: logger.debug(f"single_profraw {i} gened")
-
-            # 记录 tracer 运行时间
-            # tracer_start = time.time()
-            # info, _ = self.seed_tracer.trace_seed(seed_path, 60)
-            # tracer_time = time.time() - tracer_start
-
-            total_time = time.time() - seed_start
-            # new_call_edge.merge(info)
-            if i % 1000 == 0: logger.debug(f"single_trace {i} got")
-
-            def format_size(size):
-                for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-                    if size < 1024:
-                        return f"{size:.2f} {unit}"
-                    size /= 1024
-                return size
-
-            # 写入时间记录
-            with open(self.timing_log_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                # writer.writerow([self.total_seed_index, seed_path.name, f"{profraw_time:.4f}", f"{tracer_time:.4f}",
-                #                  f"{total_time:.4f}",
-                #                  f"{format_size(os.path.getsize(seed_path))}"])
-                writer.writerow([self.total_seed_index, seed_path.name, f"{profraw_time:.4f}", "0.0000",
-                                 f"{total_time:.4f}",
-                                 f"{format_size(os.path.getsize(seed_path))}"])
-                self.total_seed_index += 1
-
-            processed = i + 1
-            self.last_trace_timestamp_ns = max(self.last_trace_timestamp_ns, int(last_scan_time or 0))
-            should_log_progress = (
-                processed == 1
-                or processed == total_seed_count
-                or processed % progress_interval == 0
-            )
-            if should_log_progress:
-                self._save_trace_progress(self.last_trace_timestamp_ns, seed_path.name)
-                elapsed = max(time.time() - trace_loop_start, 1e-6)
-                seeds_per_sec = processed / elapsed
-                remaining = max(total_seed_count - processed, 0)
-                eta_seconds = remaining / seeds_per_sec if seeds_per_sec > 0 else 0.0
-                logger.info(
-                    "[TRACE] replay progress %d/%d (%.1f%%), elapsed=%.1fs, rate=%.2f seeds/s, eta=%.1fs, current=%s",
-                    processed,
-                    total_seed_count,
-                    (processed / total_seed_count) * 100.0,
-                    elapsed,
-                    seeds_per_sec,
-                    eta_seconds,
-                    seed_path.name,
-                )
-
-        self.last_trace_timestamp_ns = max(self.last_trace_timestamp_ns, int(last_scan_time or 0))
-        self._save_trace_progress(self.last_trace_timestamp_ns, seed_lst_to_run[-1].name if seed_lst_to_run else None)
-        self.enqueue_autobug_seed_names([seed_path.name for seed_path in seed_lst_to_run])
-        logger.debug("llvmcov merge end, indirect calls update begin")
-        # update_indirect_calls(funcs, new_call_edge.call_edges)
-        logger.debug("indirect calls updated")
-        if not new_profraw_files:
-            logger.warning("[TRACE] No profraw files generated in this pass")
-            profdata_files = list(profdir.glob("*.profdata"))
-            self._rb_seed_index_signature = self._profdata_signature(profdata_files)
-            return True, last_scan_time, "没有生成新的profraw", []
-        ok, merge_error = self._merge_main_profdata(new_profraw_files)
-        if not ok:
-            logger.error(
-                "[TRACE] llvm-profdata merge failed (bin=%s, rc=%s): %s",
-                LLVM_PROFDATA_BIN,
-                "batched",
-                merge_error[:800],
-            )
-            return False, last_scan_time, "llvm-profdata merge failed", []
-        export_cmd = f"{LLVM_COV_BIN} export {COV_TARGET_PATH} -format=text -instr-profile={self.main_profdata_path.as_posix()} --json-only-one-sided-branches --json-skip-low-value-guards"
-        p = subprocess.Popen(split(export_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.trace_dir)
-        stdout, stderr = p.communicate()
-        if p.returncode != 0:
-            logger.error(
-                "[TRACE] llvm-cov export failed (bin=%s, rc=%s): %s",
-                LLVM_COV_BIN,
-                p.returncode,
-                stderr.decode("utf-8", errors="ignore").strip()[:800],
-            )
-            return False, last_scan_time, "llvm-cov export failed", []
-
-        try:
-            payload = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            logger.error(
-                "[TRACE] Failed to parse llvm-cov export JSON (bin=%s): %s; stdout=%r; stderr=%r",
-                LLVM_COV_BIN,
-                exc,
-                stdout[:400],
-                stderr[:400],
-            )
-            return False, last_scan_time, "llvm-cov export returned invalid json", []
-        branch_entries = payload.get('data', [{}])[0].get('files', [])
-        result_sided_branch = []
-        seen_branch_keys: set[tuple[str, int, object]] = set()
-        for file_entry in branch_entries:
-            for d in file_entry.get('one_sided_branches', []):
-                new_branch = d.copy()
-                new_branch.pop('false_count', None)
-                new_branch.pop('true_count', None)
-                new_branch.pop('col', None)
-                branch_key = self._roadblock_seed_key(new_branch)
-                if branch_key in seen_branch_keys:
-                    continue
-                seen_branch_keys.add(branch_key)
-                filename = new_branch.get('filename')
-                if filename:
-                    recent_files.add(filename)
-                    matching_func = self._find_function_for_location(filename, new_branch.get('line', 0))
-                    if matching_func and matching_func.get('name'):
-                        recent_functions.add(matching_func['name'])
-                result_sided_branch.append(new_branch)
-
-        profdata_files = list(profdir.glob("*.profdata"))
-        self._rb_seed_index_signature = self._profdata_signature(profdata_files)
-
+        # 更新最近追踪的前沿
         self._recent_trace_frontier = {
-            "files": recent_files,
-            "functions": recent_functions,
+            "files": set(),  # 可以从autobug数据中提取
+            "functions": set(),
         }
 
-        return True, last_scan_time, "", result_sided_branch
-
+        return True, last_scan_time, "", roadblocks
     def get_recent_trace_frontier(self) -> dict:
         return {
             "files": set(self._recent_trace_frontier.get("files", set())),
@@ -2842,23 +2788,6 @@ class CoverageTracer:
             status,
         )
 
-    def _profdata_signature(self, profdata_files: list[Path]) -> tuple:
-        return tuple(
-            sorted(
-                (
-                    path.name,
-                    int(path.stat().st_mtime_ns),
-                    int(path.stat().st_size),
-                )
-                for path in profdata_files
-                if path.exists()
-            )
-        )
-
-    def _reset_rb_seed_index(self) -> None:
-        self._rb_seed_index = {}
-        self._rb_seed_index_signature = None
-
     def _load_trace_progress(self) -> int:
         if not self.trace_progress_path.exists():
             return 0
@@ -2880,74 +2809,6 @@ class CoverageTracer:
         except Exception as exc:
             logger.warning("[TRACE] Failed to save trace progress checkpoint %s: %s", self.trace_progress_path, exc)
 
-    def _merge_main_profdata(self, new_profraw_files: list[Path]) -> tuple[bool, str]:
-        if not new_profraw_files:
-            return False, "no profraw files"
-        input_list_path = self.trace_dir / "merge_inputs.txt"
-        merge_inputs = [path.resolve().as_posix() for path in new_profraw_files]
-        if self.main_profdata_path.exists():
-            merge_inputs.insert(0, self.main_profdata_path.resolve().as_posix())
-        input_list_path.write_text("\n".join(merge_inputs) + "\n", encoding="utf-8")
-
-        merged_output = self.trace_dir / "main.profdata.tmp"
-        cmd = [
-            LLVM_PROFDATA_BIN,
-            "merge",
-            "-sparse",
-            "-o",
-            merged_output.resolve().as_posix(),
-            f"@{input_list_path.resolve().as_posix()}",
-        ]
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=self.trace_dir,
-        )
-        _, stderr = p.communicate()
-        if p.returncode != 0:
-            return False, stderr.decode("utf-8", errors="ignore").strip()
-
-        merged_output.replace(self.main_profdata_path)
-        try:
-            input_list_path.unlink()
-        except FileNotFoundError:
-            pass
-
-        return True, ""
-
-    def _index_profdata_file(self, profdata: Path) -> None:
-        if not profdata.exists():
-            return
-        seed_name = profdata.stem
-        for branch in export_one_sided_branches(profdata, COV_TARGET_PATH):
-            key = self._roadblock_seed_key(branch)
-            bucket = self._rb_seed_index.setdefault(key, [])
-            if seed_name not in bucket:
-                bucket.append(seed_name)
-
-    def _rebuild_rb_seed_index(self, profdata_files: list[Path]) -> None:
-        self._rb_seed_index = {}
-        for profdata in profdata_files:
-            self._index_profdata_file(profdata)
-        self._rb_seed_index_signature = self._profdata_signature(profdata_files)
-        logger.info(
-            "[COVERAGE] Rebuilt roadblock seed index from %d profdata files (%d branch keys)",
-            len(profdata_files),
-            len(self._rb_seed_index),
-        )
-
-    def _seed_profdata_path(self, seed_name: str) -> Path:
-        return self.prof_dir / f"{seed_name}.profdata"
-
-    def _profdata_matches_roadblock(self, profdata: Path, roadblock_key: tuple) -> bool:
-        if not profdata.exists():
-            return False
-        for branch in export_one_sided_branches(profdata, COV_TARGET_PATH):
-            if self._roadblock_seed_key(branch) == roadblock_key:
-                return True
-        return False
-
     def get_rb_seed(self, roadblock, *, top_k_confirm: int = 10, coarse_limit: int = 48):
         coarse_candidates = self._recent_seed_candidates(limit=max(coarse_limit, 48))
         if not coarse_candidates:
@@ -2963,34 +2824,20 @@ class CoverageTracer:
             )
             return autobug_matches
 
-        confirmed = self._profdata_confirmed_seed_names(roadblock, coarse_candidates, limit=min(top_k_confirm, 3))
-        if confirmed:
-            logger.info(
-                "[COVERAGE] Confirmed %d seed(s) for %s:%s via llvmcov/profdata fallback",
-                len(confirmed),
-                roadblock.get("filename", ""),
-                roadblock.get("line", 0),
-            )
-            return confirmed
-
         fallback = coarse_candidates[: min(3, len(coarse_candidates))]
         if fallback:
+            expected_branch = self._roadblock_expected_branch_id(roadblock)
             logger.info(
-                "[COVERAGE] No AutoBug/profdata-confirmed seed for %s:%s, falling back to recent seeds: %s",
+                "[AUTOBUG] No AutoBug-confirmed seed for %s:%s (expected_branch=%s, status=%s, side=%s), "
+                "falling back to recent seeds: %s",
                 roadblock.get("filename", ""),
                 roadblock.get("line", 0),
+                expected_branch if expected_branch is not None else "?",
+                roadblock.get("status", ""),
+                roadblock.get("side", ""),
                 ", ".join(fallback),
             )
         return fallback
-
-    # def get_slice(self, rb_fname, rb_line, only_side):
-    # 使用treesitter切出源语言相关代码切片(目前为单纯的调用链提取)
-    # call_chain = get_call_chain(rb_fname)
-    # if call_chain is None or len(call_chain) == 0:
-    #     return [], ""
-    # code_snippet = get_code_snippet(call_chain)
-    # code_snippet = get_function_slice(call_chain, rb_line, only_side)
-    # return call_chain, code_snippet
 
     def get_rb_file_and_line(self, roadblock):
         rb_bb = self.bb[roadblock]
@@ -2998,48 +2845,6 @@ class CoverageTracer:
         rb_fname = self.func[rb_bb["function"]]['name']
         rb_file = self.func[rb_bb["function"]]['file_name']
         return rb_file, int(rb_line), rb_fname
-
-    def get_uncovered_targets(self, target_type: str = 'all') -> dict:
-        """
-        获取所有类型的未覆盖代码目标。
-
-        Args:
-            target_type: 目标类型 ('zero_branches', 'uncalled_funcs', 'unexecuted_blocks', 'all')
-
-        Returns:
-            包含各类未覆盖目标的字典：
-            {
-                'zero_covered_branches': [...],
-                'uncalled_functions': [...],
-                'unexecuted_blocks': [...]
-            }
-        """
-        from UncoveredAnalyzer import UncoveredAnalyzer
-
-        analyzer = UncoveredAnalyzer(STATIC_PATH, self.bb, self.func, self.info.bitmap)
-
-        results = {}
-
-        if target_type in ('zero_branches', 'all'):
-            results['zero_covered_branches'] = analyzer.get_zero_covered_branches()
-
-        if target_type in ('uncalled_funcs', 'all'):
-            results['uncalled_functions'] = analyzer.get_uncalled_functions()
-
-        if target_type in ('unexecuted_blocks', 'all'):
-            results['unexecuted_blocks'] = analyzer.get_unexecuted_blocks()
-
-        # 应用优先级排序
-        for key in results:
-            if results[key]:
-                results[key] = analyzer.prioritize_targets(results[key], strategy='balanced')
-
-        logger.info(f"[CoverageTracer] 未覆盖目标分析完成: "
-                   f"{len(results.get('zero_covered_branches', []))} 零覆盖分支, "
-                   f"{len(results.get('uncalled_functions', []))} 未调用函数, "
-                   f"{len(results.get('unexecuted_blocks', []))} 未执行基本块")
-
-        return results
 
     def _find_function_for_location(self, filename: str, line: int):
         for func in self.func:
@@ -3059,87 +2864,222 @@ class CoverageTracer:
                 return bb.get('id')
         return None
 
-    def get_zero_branch_targets_from_llvm_cov(self) -> list[dict]:
-        """
-        使用自定义 llvm-cov 的 --json-zero-covered-branches 输出 zero-branch 目标。
-        """
-        main_profdata = self.main_profdata_path
-        if not main_profdata.exists():
-            logger.warning("[CoverageTracer] main.profdata 不存在，无法获取 zero-covered branches")
-            return []
-
-        export_cmd = (
-            f"{LLVM_COV_BIN} export "
-            f"{COV_TARGET_PATH} -format=text "
-            f"-instr-profile={main_profdata.as_posix()} --json-zero-covered-branches"
-        )
-        p = subprocess.Popen(split(export_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.trace_dir)
-        stdout, stderr = p.communicate()
-        if p.returncode != 0:
-            logger.error(f"[CoverageTracer] llvm-cov zero-covered export failed: {stderr.decode('utf-8', errors='ignore')}")
-            return []
-
-        try:
-            files = json.loads(stdout)['data'][0]['files']
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            logger.error(f"[CoverageTracer] Failed to parse zero-covered branch JSON: {e}")
-            return []
-
-        normalized_targets = []
-        seen_keys = set()
-        for file_entry in files:
-            for branch in file_entry.get('zero_covered_branches', []):
-                filename = branch.get('filename') or file_entry.get('filename')
-                line = branch.get('line')
-                if not filename or not line:
-                    continue
-
-                func = self._find_function_for_location(filename, line)
-                if func is None:
-                    logger.debug(f"[CoverageTracer] Skip zero-covered branch without function mapping: {filename}:{line}")
-                    continue
-
-                func_id = func.get('id')
-                bb_id = self._find_basic_block_id_for_location(func_id, line)
-                target_key = (filename, line, branch.get('status', 'zero_covered'))
-                if target_key in seen_keys:
-                    continue
-                seen_keys.add(target_key)
-
-                normalized_targets.append({
-                    'id': bb_id if bb_id is not None else line,
-                    'function': func.get('name'),
-                    'file': filename,
-                    'line': line,
-                    'code': branch.get('code', ''),
-                    'status': branch.get('status', 'zero_covered'),
-                })
-
-        logger.info(f"[CoverageTracer] llvm-cov zero-covered branch analysis completed: {len(normalized_targets)} targets")
-        return normalized_targets
-
     def get_current_one_sided_branches(self) -> list[dict]:
-        if not self.main_profdata_path.exists():
-            logger.warning("[CoverageTracer] main.profdata 不存在，无法获取 one-sided branches")
-            return []
+        """
+        获取当前的单向分支（瓶颈分支）列表
 
-        export_cmd = (
-            f"{LLVM_COV_BIN} export "
-            f"{COV_TARGET_PATH} -format=text "
-            f"-instr-profile={self.main_profdata_path.as_posix()} "
-            f"--json-only-one-sided-branches --json-skip-low-value-guards"
-        )
-        p = subprocess.Popen(split(export_cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.trace_dir)
-        stdout, stderr = p.communicate()
-        if p.returncode != 0:
-            logger.error(f"[CoverageTracer] llvm-cov one-sided export failed: {stderr.decode('utf-8', errors='ignore')}")
-            return []
+        优先级（已切换为完全autobug驱动）：
+        1. 从AutoBug缓存构建（主要数据源）
+        2. 如果没有autobug数据，返回空列表
 
+        Returns:
+            list[dict]: 瓶颈分支列表，每个元素包含 {id, function, file, line, code, status}
+        """
+        # 完全使用AutoBug缓存作为主要数据源
+        logger.info("[CoverageTracer] 从AutoBug缓存获取瓶颈分支")
+        roadblocks = self._get_one_sided_branches_from_autobug_cache()
+
+        if not roadblocks:
+            logger.warning("[CoverageTracer] AutoBug缓存为空，可能需要先运行autobug prime")
+        else:
+            logger.info(f"[CoverageTracer] 从AutoBug获取到 {len(roadblocks)} 个瓶颈分支")
+
+        return roadblocks
+
+    def _get_one_sided_branches_from_autobug_cache(self) -> list[dict]:
+        """
+        从AutoBug缓存构建单向分支列表
+
+        使用 _autobug_seed_branch_cache 和 cond_status 来识别瓶颈分支：
+        - 遍历所有有分支信息的seed
+        - 对每个条件，找出部分覆盖的分支
+        - 这些部分覆盖的分支就是单向分支（瓶颈分支）
+
+        Returns:
+            list[dict]: 瓶颈分支列表
+        """
+        result = []
+        seen_conditions = set()
+
+        # 遍历AutoBug缓存
+        with self._autobug_seed_branch_cache_lock:
+            cached_seed_items = list(self._autobug_seed_branch_cache.items())
+        for seed_name, seed_data in cached_seed_items:
+            if seed_data is None:
+                continue
+
+            for cond_key, branch_info in seed_data.items():
+                if cond_key in seen_conditions:
+                    continue
+
+                seen_conditions.add(cond_key)
+
+                # 解析条件键获取位置信息
+                # 格式类似 "file:line:condition_type"
+                try:
+                    parts = cond_key.split(':')
+                    if len(parts) >= 2:
+                        filename = parts[0]
+                        line = int(parts[1])
+
+                        # 检查是否有部分覆盖的分支
+                        branches = branch_info.get('branches', set())
+                        total = branch_info.get('total', 0)
+
+                        if total > 1 and len(branches) < total:
+                            # 这是一个有部分覆盖的条件，可能存在瓶颈分支
+                            # 找到函数信息
+                            func = self._find_function_for_location(filename, line)
+                            if func is None:
+                                continue
+
+                            func_id = func.get('id')
+                            bb_id = self._find_basic_block_id_for_location(func_id, line)
+
+                            # 获取未覆盖的分支ID
+                            covered_branches = branches
+                            uncovered_branch_ids = [b for b in range(1, total + 1) if b not in covered_branches]
+
+                            for branch_id in uncovered_branch_ids:
+                                # 从源码提取代码片段
+                                code = self._extract_source_code(filename, line)
+
+                                # 映射branch_id到side（true/false）
+                                # AutoBug使用1-based branch ID，llvm-cov使用true/false
+                                # 假设：branch_id=1 对应 false，branch_id=2 对应 true
+                                side = 'false' if branch_id == 1 else 'true'
+                                status = 'only_true' if branch_id == 1 else 'only_false'
+
+                                # 检查是否是switch类型
+                                # switch类型的条件通常包含多个分支，group_type=switch
+                                group_type = 'switch' if total > 2 else 'if'
+                                case_body_line = line  # 默认使用条件行作为case body行
+                                switch_statement_line = None
+
+                                # 如果是switch类型，尝试获取switch语句行
+                                if group_type == 'switch':
+                                    # 可以从cond_key解析switch信息
+                                    # cond_key格式: file:line:condition_type
+                                    # 需要向前查找switch语句
+                                    switch_statement_line = self._find_switch_statement_before_line(filename, line)
+
+                                # 统一数据结构：与 llvm-cov 输出完全一致
+                                result.append({
+                                    'id': bb_id if bb_id is not None else line,
+                                    'function': func.get('name', ''),
+                                    'filename': filename,
+                                    'file': filename,
+                                    'line': line,
+                                    'code': code,  # 从源码提取代码片段
+                                    'status': status,
+                                    'side': side,  # 映射branch_id到side
+                                    'group_type': group_type,  # switch/if类型标识
+                                    'case_body_line': case_body_line,  # case体行
+                                    'switch_statement_line': switch_statement_line,  # switch语句行
+                                    'condition_key': cond_key,
+                                    'branch_id': branch_id,
+                                    'total_branches': total,
+                                })
+
+                except (ValueError, IndexError) as e:
+                    logger.debug(f"[CoverageTracer] Failed to parse cond_key '{cond_key}': {e}")
+                    continue
+
+        logger.info(f"[CoverageTracer] 从AutoBug缓存构建了 {len(result)} 个瓶颈分支")
+        return result
+
+    def _get_autobug_seed_branch_cache_size(self) -> int:
+        with self._autobug_seed_branch_cache_lock:
+            return len(self._autobug_seed_branch_cache)
+
+    def _extract_source_code(self, filename: str, line: int) -> str:
+        """
+        从源文件中提取指定行的代码片段
+
+        Args:
+            filename: 源文件路径
+            line: 行号
+
+        Returns:
+            str: 代码片段，如果无法提取返回空字符串
+        """
         try:
-            files = json.loads(stdout)['data'][0]['files']
-        except (KeyError, IndexError, json.JSONDecodeError) as e:
-            logger.error(f"[CoverageTracer] Failed to parse one-sided branch JSON: {e}")
-            return []
+            # 解析完整文件路径
+            if not filename.startswith('/'):
+                # 相对路径，需要转换为绝对路径
+                for path in [SRC_PATH, SRC_BEAR_PATH]:
+                    candidate = path / filename
+                    if candidate.exists():
+                        src_file = candidate
+                        break
+                else:
+                    logger.debug(f"[CoverageTracer] Source file not found: {filename}")
+                    return ""
+            else:
+                src_file = Path(filename)
+
+            if not src_file.exists():
+                logger.debug(f"[CoverageTracer] Source file not found: {filename}")
+                return ""
+
+            # 读取指定行
+            with open(src_file, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+                if 1 <= line <= len(lines):
+                    code_line = lines[line - 1].strip()
+                    # 去除行号前缀（如果有的话）
+                    # 常见格式: "123:    code" 或 "code"
+                    code_line = code_line.split(max(1, code_line.find(')') + 1))[-1].strip()
+                    return code_line
+
+        except Exception as e:
+            logger.debug(f"[CoverageTracer] Failed to extract source code from {filename}:{line}: {e}")
+
+        return ""
+
+    def _find_switch_statement_before_line(self, filename: str, line: int) -> int | None:
+        """
+        在源文件中查找指定行之前的switch语句
+
+        Args:
+            filename: 源文件路径
+            line: 起始行号
+
+        Returns:
+            int | None: switch语句的行号，如果找不到返回None
+        """
+        try:
+            # 解析完整文件路径
+            if not filename.startswith('/'):
+                for path in [SRC_PATH, SRC_BEAR_PATH]:
+                    candidate = path / filename
+                    if candidate.exists():
+                        src_file = candidate
+                        break
+                else:
+                    return None
+            else:
+                src_file = Path(filename)
+
+            if not src_file.exists():
+                return None
+
+            # 读取源文件
+            with open(src_file, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+
+            # 向前查找switch语句（从指定行开始）
+            for i in range(min(line - 1, len(lines)), 0, -1):
+                line_text = lines[i].strip()
+                # 查找switch关键字
+                if re.match(r'switch\s*\(', line_text):
+                    # 计算实际行号
+                    return i + 1  # 1-based line number
+
+        except Exception as e:
+            logger.debug(f"[CoverageTracer] Failed to find switch statement before {filename}:{line}: {e}")
+
+        return None
 
         result = []
         seen_keys = set()
@@ -3166,10 +3106,17 @@ def get_new_seeds(directory, read_files, last_scan_time, prof_dir: Path | None =
     files_to_run = []
     files_to_load = []
     latest_seen_timestamp_ns = int(last_scan_time or 0)
-    sorted_pathdir = sorted(Path(directory).iterdir())
+    # 按创建时间排序，先处理老的 seed（先落盘的）
+    all_files = []
+    for p in Path(directory).iterdir():
+        if p.is_file():
+            try:
+                stat = p.stat()
+                all_files.append((p, stat.st_ctime_ns))
+            except OSError:
+                pass
+    sorted_pathdir = [p for p, _ in sorted(all_files, key=lambda x: x[1])]
     for file_path in sorted_pathdir:
-        if not file_path.is_file():
-            continue
         stat = file_path.stat()
         file_timestamp_ns = max(int(stat.st_ctime_ns), int(stat.st_mtime_ns))
         latest_seen_timestamp_ns = max(latest_seen_timestamp_ns, file_timestamp_ns)

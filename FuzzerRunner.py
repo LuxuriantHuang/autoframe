@@ -26,13 +26,6 @@ class FuzzerRunner:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
-    # def __enter__(self):
-    #     self.run()
-    #     return self
-    #
-    # def __exit__(self, exc_type, exc_val, exc_tb):
-    #     self.terminate()
-
     def run(self):
         cmd = [
             os.fspath(AFL_PATH / "afl-fuzz"),
@@ -47,8 +40,13 @@ class FuzzerRunner:
         env['AFL_QUIET'] = '1'
         env['AFL_FUZZER_STATS_UPDATE_INTERVAL'] = '5'  # 每5秒更新一次 stats 文件
         logger.info(f"Fuzzer执行命令：{' '.join(cmd)}")
-        self.fuzzer_process = subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL,
-                                               stderr=subprocess.DEVNULL)
+        self.fuzzer_process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # 创建新的进程组，便于清理AFL子进程
+        )
         logger.info(f"fuzzer在系统中的pid：{self.fuzzer_process.pid}")
 
     def terminate(self):
@@ -60,12 +58,29 @@ class FuzzerRunner:
             return
         logger.info("正在停止fuzzer")
         try:
-            self.fuzzer_process.terminate()
-            self.fuzzer_process.wait(timeout=3)
+            # 尝试优雅关闭整个进程组
+            try:
+                pgid = os.getpgid(self.fuzzer_process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+                logger.info(f"发送SIGTERM到fuzzer进程组 {pgid}")
+                self.fuzzer_process.wait(timeout=3)
+            except (ProcessLookupError, OSError):
+                # 进程组可能已不存在，尝试直接关闭进程
+                self.fuzzer_process.terminate()
+                self.fuzzer_process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            logger.warning("terminate时间过长，正在直接kill")
-            self.fuzzer_process.kill()
-            self.fuzzer_process.wait()
+            logger.warning("terminate时间过长，正在强制kill进程组")
+            try:
+                pgid = os.getpgid(self.fuzzer_process.pid)
+                os.killpg(pgid, signal.SIGKILL)
+                logger.info(f"发送SIGKILL到fuzzer进程组 {pgid}")
+            except (ProcessLookupError, OSError):
+                # 进程组可能已不存在，尝试直接kill
+                self.fuzzer_process.kill()
+            try:
+                self.fuzzer_process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass  # 进程已被强制终止
         finally:
             logger.info("fuzzer成功终止")
             self.fuzzer_process = None
