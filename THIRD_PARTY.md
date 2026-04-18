@@ -1,45 +1,45 @@
 # Third-Party Components
 
-This repository is published as the AutoFrame core workspace. Large third-party
-source trees and local experiment data are intentionally excluded from the main
-Git history.
+This repository is published as the AutoFrame core workspace. Third-party
+source trees are tracked as Git submodules so new machines can rehydrate the
+same layout without manual cloning.
 
-## Excluded third-party repositories
+## Tracked third-party repositories
 
 ### `AFLplusplus/`
 
 - Type: upstream dependency with local tuning
-- Handling: excluded from the top-level Git history
-- Recommended sync model: standalone checkout or submodule
+- Handling: mirrored to `LuxuriantHuang/AFLplusplus` and tracked as a submodule
 - Local changes tracked here: [`patches/AFLplusplus-config.patch`](patches/AFLplusplus-config.patch)
 
 ### `llvm-project/`
 
 - Type: large upstream fork with local `llvm-cov` changes
-- Handling: excluded from the top-level Git history
-- Recommended sync model: fork plus patch application
+- Handling: mirrored to `LuxuriantHuang/llvm-project` and tracked as a submodule
 - Local base commit recorded from the local checkout: `c987950fa`
 - Local changes tracked here: [`patches/llvm-project-llvm-cov.patch`](patches/llvm-project-llvm-cov.patch)
 
 ### `svf/third_party/SVF/`
 
 - Type: upstream SVF checkout used by the local slicer build
-- Handling: excluded from the top-level Git history
-- Recommended sync model: standalone checkout or submodule
+- Handling: mirrored to `LuxuriantHuang/SVF` and tracked as a submodule
 - Local changes tracked here: [`patches/svf-third-party-SVF.patch`](patches/svf-third-party-SVF.patch)
 
 ### `tracer/`
 
 - Type: standalone tracing/instrumentation repository
-- Handling: excluded from the top-level Git history
-- Recommended sync model: standalone checkout or submodule
+- Handling: mirrored to `LuxuriantHuang/tracer` and tracked as a submodule
 - Local changes tracked here: [`patches/tracer.patch`](patches/tracer.patch)
 
 ### `ipl-modeling/`
 
 - Type: separate project with its own repository lifecycle
-- Handling: excluded from the top-level Git history
-- Recommended sync model: clone separately when the workflow needs it
+- Handling: tracked as a submodule
+
+### `AutoBug/`
+
+- Type: standalone repository used by the tracing pipeline
+- Handling: tracked as a submodule
 
 ## Excluded generated data
 
@@ -55,14 +55,20 @@ too large for a source repository:
 
 ## Rehydration notes
 
-To recreate a full local environment, prepare the external dependencies beside
-this repository:
+To recreate a full local environment:
 
-- place or clone `AFLplusplus/`
-- place or clone `llvm-project/` and rebuild the custom `llvm-cov` if needed
-- place or clone `svf/third_party/SVF/`
-- place or clone `tracer/`
-- place or clone `ipl-modeling/` when the IPL workflow is required
+```bash
+git submodule update --init --recursive
+./scripts/bootstrap-third-party.sh --sync-urls --init --apply-patches
+./scripts/bootstrap-third-party.sh --build
+```
+
+The bootstrap script reads [`third_party/repos.tsv`](third_party/repos.tsv) and
+can also target a different GitHub account mirror:
+
+```bash
+GITHUB_USER=<your-account> PROTOCOL=https ./scripts/bootstrap-third-party.sh --sync-urls --init
+```
 
 The patch files under `patches/` capture the local modifications that were
 present in those third-party trees at publish time.

@@ -16,12 +16,9 @@
 
 ## 未迁移内容
 
-- `AFLplusplus/`
 - 大体积 benchmark 结果、日志、实验目录
 - `src_new/` 这条新的 workflow 主线
-- 完整 `llvm-project/` 源码树与其他未被 v2 直接引用的大型工具目录
-- `tracer/`、`ipl-modeling/` 等独立仓库
-- `svf/third_party/SVF/` 上游源码树
+- 各 benchmark 的输入、编译产物和实验输出
 
 ## 目录约定
 
@@ -47,15 +44,30 @@ benchmarks/<project>/
 
 ## 第三方依赖处理
 
-为了把当前目录作为一个可发布的 GitHub 仓库，顶层仓库只保留 AutoFrame 核心代码，不直接纳入以下第三方源码树：
+顶层仓库通过 submodule 管理第三方源码树，默认指向 `LuxuriantHuang` 账号下的镜像仓库：
 
 - `AFLplusplus/`
 - `llvm-project/`
 - `svf/third_party/SVF/`
 - `tracer/`
 - `ipl-modeling/`
+- `AutoBug/`
 
-这些目录的本地改动已经导出到 `patches/`，来源和处理方式记录在 [`THIRD_PARTY.md`](THIRD_PARTY.md)。
+第三方来源、镜像仓库、补丁文件和构建约定记录在 [`THIRD_PARTY.md`](THIRD_PARTY.md) 和 [`third_party/repos.tsv`](third_party/repos.tsv)。
+
+新机器建议使用下面的流程初始化：
+
+```bash
+git submodule update --init --recursive
+./scripts/bootstrap-third-party.sh --sync-urls --init --apply-patches
+./scripts/bootstrap-third-party.sh --build
+```
+
+如果目标机器只配置了 HTTPS 凭证，可以改成：
+
+```bash
+PROTOCOL=https ./scripts/bootstrap-third-party.sh --sync-urls --init --apply-patches
+```
 
 发布后的默认路径解析规则如下：
 
@@ -71,6 +83,22 @@ benchmarks/<project>/
 batch_process.py
 svf/build/ir_graph_extractor
 svf/build/BranchConditionSlicer
+```
+
+统一构建第三方依赖时，默认脚本会按顺序构建：
+
+- `AFLplusplus`
+- `llvm-project` 中的 `llvm-cov`、`llvm-profdata`、`opt`
+- `tracer`
+- `svf/third_party/SVF`
+- 本地 `svf/` 包装工具
+- `AutoBug`
+- `ipl-modeling`
+
+你也可以按组件执行，例如：
+
+```bash
+./scripts/bootstrap-third-party.sh --build --component llvm-project --component svf/third_party/SVF
 ```
 
 ## 常用环境变量

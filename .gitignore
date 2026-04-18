@@ -22,11 +22,6 @@ benchmarks/*
 !benchmarks/build_single_dir.sh
 !benchmarks/queue_region_cov.sh
 
-AFLplusplus/
-llvm-project/
-tracer/
-svf/third_party/SVF/
-
 *.log
 *.db
 *.sqlite

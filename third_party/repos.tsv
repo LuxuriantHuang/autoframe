@@ -1,0 +1,7 @@
+path	submodule_name	repo_name	default_url	upstream_url	patch_file	role
+AFLplusplus	AFLplusplus	AFLplusplus	git@github.com:LuxuriantHuang/AFLplusplus.git	https://github.com/AFLplusplus/AFLplusplus	patches/AFLplusplus-config.patch	fuzzer-toolchain
+llvm-project	llvm-project	llvm-project	git@github.com:LuxuriantHuang/llvm-project.git	https://github.com/llvm/llvm-project	patches/llvm-project-llvm-cov.patch	llvm-toolchain
+tracer	tracer	tracer	git@github.com:LuxuriantHuang/tracer.git	https://gitlab.com/adhoprsy/tracer.git	patches/tracer.patch	trace-instrumentation
+svf/third_party/SVF	svf/third_party/SVF	SVF	git@github.com:LuxuriantHuang/SVF.git	https://github.com/SVF-tools/SVF	patches/svf-third-party-SVF.patch	svf-upstream
+AutoBug	AutoBug	AutoBug	git@github.com:LuxuriantHuang/AutoBug.git	https://github.com/LuxuriantHuang/AutoBug		auto-bug
+ipl-modeling	ipl-modeling	ipl-modeling	git@github.com:LuxuriantHuang/ipl-modeling.git	https://github.com/LuxuriantHuang/ipl-modeling		ipl-runtime

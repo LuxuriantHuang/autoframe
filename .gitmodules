@@ -1,6 +1,22 @@
+[submodule "AFLplusplus"]
+	path = AFLplusplus
+	url = git@github.com:LuxuriantHuang/AFLplusplus.git
+	branch = modified
 [submodule "ipl-modeling"]
 	path = ipl-modeling
 	url = git@github.com:LuxuriantHuang/ipl-modeling.git
+[submodule "llvm-project"]
+	path = llvm-project
+	url = git@github.com:LuxuriantHuang/llvm-project.git
+	branch = autoframe-llvm-22.0.0
 [submodule "AutoBug"]
 	path = AutoBug
 	url = git@github.com:LuxuriantHuang/AutoBug
+[submodule "tracer"]
+	path = tracer
+	url = git@github.com:LuxuriantHuang/tracer.git
+	branch = autoframe
+[submodule "svf/third_party/SVF"]
+	path = svf/third_party/SVF
+	url = git@github.com:LuxuriantHuang/SVF.git
+	branch = autoframe
