@@ -50,8 +50,15 @@ build_aflplusplus() {
         # 先清理
         make clean >/dev/null 2>&1 || true
 
+        # AFL++ 使用 clang-14（如果有），其他组件用 clang-10
+        local afl_llvm_config="llvm-config-14"
+        if ! command -v llvm-config-14 >/dev/null 2>&1; then
+            warn "llvm-config-14 not found, falling back to llvm-config-10"
+            afl_llvm_config="$LLVM_CONFIG"
+        fi
+
         # 构建，只构建 LLVM 模式（不需要 gcc_plugin）
-        make LLVM_CONFIG="$LLVM_CONFIG" -j"$JOBS" \
+        make LLVM_CONFIG="$afl_llvm_config" -j"$JOBS" \
             || die "AFLplusplus build failed"
     fi
 
