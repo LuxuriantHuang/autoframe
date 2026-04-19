@@ -71,18 +71,11 @@ build_tracer() {
 
     pushd "$ROOT_DIR/tracer" >/dev/null
 
-    if [ -f "build/libLLVMTracerPass.so" ] && [ -n "${SKIP_REBUILD:-}" ]; then
+    if [ -f "build/trace-id" ] && [ -n "${SKIP_REBUILD:-}" ]; then
         log "tracer already built, skipping"
     else
-        rm -rf build
-        mkdir -p build
-        cd build
-
-        cmake -DCMAKE_BUILD_TYPE=Release \
-              -DLLVM_DIR="$("$LLVM_CONFIG" --prefix)/lib/cmake/llvm" \
-              ..
-
-        cmake --build . -j"$JOBS" \
+        make clean >/dev/null 2>&1 || true
+        make LLVM_CONFIG="$LLVM_CONFIG" -j"$JOBS" \
             || die "tracer build failed"
     fi
 
