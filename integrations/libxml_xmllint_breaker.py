@@ -35,7 +35,7 @@ def main() -> int:
 
     target_command = args.target_command
     if not target_command:
-        target_command = shlex.join([str(config.COV_TARGET_PATH), "--recover", "@@"])
+        target_command = shlex.join([str(config.TRACE_TARGET_PATH), "--recover", "@@"])
 
     result = run_breaker_loop(
         BreakerConfig(
@@ -78,4 +78,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

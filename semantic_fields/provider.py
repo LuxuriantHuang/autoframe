@@ -6,6 +6,7 @@ from typing import Any
 
 import ujson
 
+from config import ROOT_DIR
 from input_adapter import infer_input_adapter_from_harness
 
 JSON_PROJECTS = {"cjson", "jansson", "jq"}
@@ -17,7 +18,7 @@ GENERIC_TEXT_PROJECTS = {"sqlite", "calc"}
 def has_semantic_field_provider(project: str) -> bool:
     if project == "libxml" or project in JSON_PROJECTS or project in C_PROJECTS or project in JS_PROJECTS or project in GENERIC_TEXT_PROJECTS:
         return True
-    parse_script = Path("/home/lab420/Desktop/autoframe/kaitai") / project / "parse.py"
+    parse_script = ROOT_DIR / "kaitai" / project / "parse.py"
     return parse_script.exists()
 
 
@@ -51,7 +52,7 @@ def build_semantic_fields(
 
         return build_generic_text_semantic_fields(seed_path, out_path=out_path)
 
-    parse_script = Path("/home/lab420/Desktop/autoframe/kaitai") / project / "parse.py"
+    parse_script = ROOT_DIR / "kaitai" / project / "parse.py"
     if not parse_script.exists():
         return None
 

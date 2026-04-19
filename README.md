@@ -10,7 +10,6 @@
 - `semantic_fields/` 语义字段推断模块
 - `Excep/`、`pyTracer/`、`parse.py`、`slice.py` 等分析辅助模块
 - `batch_process.py`（处理 `compile_commands.json` 到 `src_bear`）
-- `tools/bin/llvm-cov`、`tools/bin/llvm-profdata`
 - `svf/build/BranchConditionSlicer`
 - `svf/build/ir_graph_extractor`
 
@@ -47,7 +46,6 @@ benchmarks/<project>/
 顶层仓库通过 submodule 管理第三方源码树，默认指向 `LuxuriantHuang` 账号下的镜像仓库：
 
 - `AFLplusplus/`
-- `llvm-project/`
 - `svf/third_party/SVF/`
 - `tracer/`
 - `ipl-modeling/`
@@ -71,9 +69,6 @@ PROTOCOL=https ./scripts/bootstrap-third-party.sh --sync-urls --init --apply-pat
 
 发布后的默认路径解析规则如下：
 
-- `llvm-cov` 优先使用 `tools/bin/llvm-cov`，其次尝试 `AF_LLVM_COV_BIN` 或系统安装
-- `llvm-profdata` 优先使用 `tools/bin/llvm-profdata`，其次尝试 `AF_LLVM_PROFDATA_BIN` 或系统安装
-- `opt` 不再随仓库发布；请通过 `AF_LLVM_OPT_BIN` 或系统安装提供
 - `afl-showmap` 可通过 `AF_SHOWMAP_BIN` 或 `AF_AFL_PATH` 指定
 - SVF slicer 默认尝试 `svf/build/`，也可通过 `AF_SVF_SLICE_PATH` 指定
 
@@ -88,7 +83,6 @@ svf/build/BranchConditionSlicer
 统一构建第三方依赖时，默认脚本会按顺序构建：
 
 - `AFLplusplus`
-- `llvm-project` 中的 `llvm-cov`、`llvm-profdata`、`opt`
 - `tracer`
 - `svf/third_party/SVF`
 - 本地 `svf/` 包装工具
@@ -98,7 +92,7 @@ svf/build/BranchConditionSlicer
 你也可以按组件执行，例如：
 
 ```bash
-./scripts/bootstrap-third-party.sh --build --component llvm-project --component svf/third_party/SVF
+./scripts/bootstrap-third-party.sh --build --component tracer --component svf/third_party/SVF
 ```
 
 ## 常用环境变量

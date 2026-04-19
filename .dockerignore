@@ -12,3 +12,5 @@ benchmarks/*/llm_tmp/
 benchmarks/*/mut_tmp/
 benchmarks/*/sym_tmp/
 *.log
+llvm-project/
+benchmarks/*/target/llvmcov/

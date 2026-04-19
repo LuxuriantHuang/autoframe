@@ -69,8 +69,6 @@ _logger_initialized = False
 _logger_component_name = None
 _console_logging_mode = "full"
 NO_COVERAGE_GUIDED_RETRY_LIMIT = 1
-LLVM_PROFDATA_BIN = os.fspath(Path(config.LLVM_PROFDATA_BIN))
-LLVM_COV_BIN = os.fspath(Path(config.LLVM_COV_BIN))
 SEED_COVERAGE_DIAG_TIMEOUT = int(config.SEED_COVERAGE_DIAG_TIMEOUT)
 ROADBLOCK_STAGE_BUDGET = 3
 ROADBLOCK_FAMILY_COOLDOWN_THRESHOLD = 3
@@ -2992,169 +2990,6 @@ def _score_input_driven_call_chain(chain) -> tuple[int, int, int]:
     return (-cli_penalty, parser_bonus + harness_bonus, len(chain))
 
 
-def _build_seed_profdata(seed_path: str) -> Optional[Path]:
-    target_key = os.fspath(Path(COV_TARGET_PATH).resolve()) if COV_TARGET_PATH else ""
-    if target_key and target_key in _disabled_seed_coverage_diag_targets:
-        return None
-
-    diag_dir = RUN_TRACE_PATH / "coverage_diag"
-    diag_dir.mkdir(parents=True, exist_ok=True)
-
-    seed_tag = Path(seed_path).name.replace(":", "_").replace(",", "_")
-    profraw_path = diag_dir / f"{seed_tag}.profraw"
-    profdata_path = diag_dir / f"{seed_tag}.profdata"
-
-    for artifact in (profraw_path, profdata_path):
-        if artifact.exists():
-            artifact.unlink()
-
-    trace_cmd, stdin_data = build_seed_execution(COV_TARGET_PATH, seed_path)
-    env = os.environ.copy()
-    env["LLVM_PROFILE_FILE"] = os.fspath(profraw_path)
-
-    try:
-        subprocess.run(
-            trace_cmd,
-            input=stdin_data,
-            stdin=subprocess.DEVNULL if stdin_data is None else None,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            cwd=os.fspath(diag_dir),
-            timeout=SEED_COVERAGE_DIAG_TIMEOUT,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        if target_key:
-            _disabled_seed_coverage_diag_targets.add(target_key)
-        for artifact in (profraw_path, profdata_path):
-            if artifact.exists():
-                artifact.unlink()
-        logger.warning(
-            f"[{LogOp.TEST}] Coverage diagnosis timed out after {SEED_COVERAGE_DIAG_TIMEOUT}s "
-            f"for {COV_TARGET_PATH}; disabling diagnosis for this target for the rest of the run"
-        )
-        return None
-    except Exception as e:
-        logger.warning(f"[{LogOp.TEST}] Failed to execute seed for coverage diagnosis: {e}")
-        return None
-
-    if not profraw_path.exists():
-        logger.warning(f"[{LogOp.TEST}] Coverage diagnosis profraw not generated for seed: {seed_path}")
-        return None
-
-    merge_cmd = [
-        LLVM_PROFDATA_BIN,
-        "merge",
-        "-sparse",
-        "-o",
-        os.fspath(profdata_path),
-        os.fspath(profraw_path),
-    ]
-    result = subprocess.run(
-        merge_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        cwd=os.fspath(diag_dir),
-        check=False,
-    )
-    if result.returncode != 0 or not profdata_path.exists():
-        logger.warning(
-            f"[{LogOp.TEST}] Failed to merge profdata for coverage diagnosis: "
-            f"{result.stderr[:300] if result.stderr else '(empty)'}"
-        )
-        return None
-
-    return profdata_path
-
-
-def _llvm_cov_show_file(file_name: str, profdata_path: Path) -> Optional[str]:
-    cmd = [
-        LLVM_COV_BIN,
-        "show",
-        os.fspath(COV_TARGET_PATH),
-        "-format=text",
-        f"-instr-profile={profdata_path.as_posix()}",
-        file_name,
-    ]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        cwd=os.fspath(profdata_path.parent),
-        check=False,
-    )
-    if result.returncode != 0:
-        logger.warning(
-            f"[{LogOp.TEST}] llvm-cov show failed for {file_name}: "
-            f"{result.stderr[:300] if result.stderr else '(empty)'}"
-        )
-        return None
-    return result.stdout
-
-
-def _extract_line_window(report_text: str, target_line: int, window: int = 12) -> str:
-    lines = report_text.splitlines()
-    if not lines:
-        return ""
-    start = max(0, target_line - window - 1)
-    end = min(len(lines), target_line + window)
-    return "\n".join(lines[start:end])
-
-
-def build_seed_coverage_diagnosis_context(seed_path: str, roadblock: dict, call_chain) -> Optional[str]:
-    profdata_path = _build_seed_profdata(seed_path)
-    if not profdata_path:
-        return None
-
-    function_names = _extract_call_chain_function_names(call_chain)
-    target_func = roadblock.get("function")
-    if target_func and target_func not in function_names:
-        function_names.append(target_func)
-
-    file_cache = {}
-    sections = [
-        f"<seed_path>\n{seed_path}\n</seed_path>",
-        f"<target_function>\n{target_func or 'unknown'}\n</target_function>",
-        f"<target_location>\n{roadblock.get('filename', 'unknown')}:{roadblock.get('line', 0)}\n</target_location>",
-        f"<call_chain>\n{' -> '.join(function_names) if function_names else 'N/A'}\n</call_chain>",
-    ]
-
-    for func_name in function_names:
-        meta = _get_function_meta(func_name)
-        if not meta or not meta.get("file_name"):
-            continue
-        file_name = meta["file_name"]
-        if file_name not in file_cache:
-            file_cache[file_name] = _llvm_cov_show_file(file_name, profdata_path)
-        report_text = file_cache[file_name]
-        if not report_text:
-            continue
-        block = extract_function_block(report_text, func_name)
-        if block:
-            sections.append(
-                f"<function_coverage name=\"{func_name}\">\n{block[:5000]}\n</function_coverage>"
-            )
-
-    target_file = roadblock.get("filename")
-    if target_file:
-        if target_file not in file_cache:
-            file_cache[target_file] = _llvm_cov_show_file(target_file, profdata_path)
-        target_report = file_cache[target_file]
-        if target_report:
-            line_window = _extract_line_window(target_report, roadblock.get("line", 0))
-            if line_window:
-                sections.append(
-                    f"<target_line_window>\n{line_window[:3000]}\n</target_line_window>"
-                )
-
-    return "\n".join(sections)
-
-
 def _compute_percentile(values: list[int], q: float) -> float:
     if not values:
         return 0.0
@@ -3403,94 +3238,6 @@ def _mark_stderr_cluster_seen(cluster: str, target_context: Optional[dict[str, A
     return True
 
 
-def _export_one_sided_branch_features(profdata_path: Path) -> set[tuple[str, int, str]]:
-    cmd = [
-        LLVM_COV_BIN,
-        "export",
-        os.fspath(COV_TARGET_PATH),
-        "-format=text",
-        f"-instr-profile={profdata_path.resolve()}",
-        "--json-only-one-sided-branches",
-        "--json-skip-low-value-guards",
-    ]
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        check=False,
-        cwd=os.fspath(profdata_path.parent),
-    )
-    if result.returncode != 0:
-        logger.warning(
-            f"[{LogOp.TEST}] llvm-cov export(one-sided branches) failed for {profdata_path}: "
-            f"{(result.stderr or '').strip()[:300]}"
-        )
-        return set()
-
-    try:
-        payload = json.loads(result.stdout)
-    except Exception as exc:
-        logger.warning(f"[{LogOp.TEST}] Failed to parse llvm-cov export for {profdata_path}: {exc}")
-        return set()
-
-    features: set[tuple[str, int, str]] = set()
-    file_entries = payload.get("data", [{}])[0].get("files", [])
-    for file_entry in file_entries:
-        for branch in file_entry.get("one_sided_branches", []):
-            true_count = int(branch.get("true_count", 0) or 0)
-            false_count = int(branch.get("false_count", 0) or 0)
-            if true_count == 0 and false_count == 0:
-                continue
-            filename = branch.get("filename")
-            line = int(branch.get("line", 0) or 0)
-            side = str(branch.get("side") or "")
-            if not filename or line <= 0:
-                continue
-            features.add((filename, line, side))
-    return features
-
-
-def _compute_new_coverage_features(
-    profdata_path: Optional[Path],
-    target_context: Optional[dict[str, Any]],
-) -> int:
-    if not profdata_path:
-        return 0
-    features = _export_one_sided_branch_features(profdata_path)
-    if not features:
-        return 0
-    history_key = _seed_history_key(target_context)
-    seen = _seed_coverage_feature_history[history_key]
-    new_features = features - seen
-    seen.update(features)
-    return len(new_features)
-
-
-def _extract_hit_lines(report_text: str) -> list[int]:
-    if not report_text:
-        return []
-    pattern = re.compile(r"^\s*(\d+)\|\s*([0-9][0-9A-Za-z\.\-]*)\|", re.MULTILINE)
-    hit_lines: list[int] = []
-    for match in pattern.finditer(report_text):
-        line_no = int(match.group(1))
-        count_token = match.group(2).strip().lower()
-        if count_token in {"0", "0.0"}:
-            continue
-        hit_lines.append(line_no)
-    return hit_lines
-
-
-def _closest_hit_line_distance(report_text: str, target_line: int | None) -> int | None:
-    if target_line is None:
-        return None
-    hit_lines = _extract_hit_lines(report_text)
-    if not hit_lines:
-        return None
-    return min(abs(line_no - target_line) for line_no in hit_lines)
-
-
 def _mark_frontier_advance(
     *,
     target_context: Optional[dict[str, Any]],
@@ -3532,7 +3279,7 @@ def _mark_frontier_advance(
 
 
 def _execute_seed_and_capture(seed_path: str, harness_code: str | None = None) -> tuple[bool, str]:
-    program_path = trace_prog or target_prog or COV_TARGET_PATH
+    program_path = trace_prog or target_prog
     if not program_path:
         return False, ""
 
@@ -3621,7 +3368,6 @@ def evaluate_seed(seed_path: str, target_context: Optional[dict[str, Any]] = Non
     stderr_novel = _mark_stderr_cluster_seen(stderr_cluster, target_context)
     parser_depth_score = score_parser_depth(stderr_text)
 
-    profdata_path = _build_seed_profdata(seed_path) if COV_TARGET_PATH else None
     roadblock = target_context.get("roadblock") or {}
     call_chain = target_context.get("call_chain")
 
@@ -3634,25 +3380,9 @@ def evaluate_seed(seed_path: str, target_context: Optional[dict[str, Any]] = Non
     frontier_advance = False
     coverage_gain_class = "seed_generated"
 
-    if profdata_path:
-        new_edges = _compute_new_coverage_features(profdata_path, target_context)
-        target_file = roadblock.get("filename")
-        target_line = roadblock.get("line")
-        if target_file:
-            target_report = _llvm_cov_show_file(target_file, profdata_path)
-            target_file_hit, target_line_window_hit = _llvm_cov_report_has_hits(target_report or "", target_line)
-            closest_hit_line_distance = _closest_hit_line_distance(target_report or "", target_line)
-
-        for idx, file_name in enumerate(_call_chain_file_candidates(call_chain)):
-            report_text = _llvm_cov_show_file(file_name, profdata_path)
-            any_hit, _ = _llvm_cov_report_has_hits(report_text or "")
-            if any_hit:
-                parse_family_hit = True
-                deepest_call_chain_hit_index = max(deepest_call_chain_hit_index, idx)
-
     frontier_advance = _mark_frontier_advance(
         target_context=target_context,
-        closest_hit_line_distance=closest_hit_line_distance,
+        closest_hit_line_distance=None,
         deepest_call_chain_hit_index=deepest_call_chain_hit_index,
         parser_depth_score=parser_depth_score,
     )
@@ -4937,7 +4667,7 @@ def get_switch_statement_line(roadblock):
         switch 语句的行号，如果找不到则返回 None
     """
     # 如果 roadblock 中已经包含 switch_statement 字段，尝试从中提取行号
-    # 但 llvm-cov export 的 switch_statement 字段只包含语句内容，不包含行号
+    # 当前导出的 switch_statement 字段只包含语句内容，不包含行号
     # 所以我们需要通过查找源文件来确定
 
     rb_file = roadblock['filename']
@@ -6367,11 +6097,11 @@ _shutdown_requested = False
 def cleanup_child_processes():
     """清理所有相关的子进程"""
     # 查找并清理所有相关的子进程
-    # 包括: calc.autotrace, llvmcov/target, 以及autobug相关的进程
+    # 包括: calc.autotrace 以及 autobug 相关的进程
     try:
         # 使用pgrep查找相关进程
         result = subprocess.run(
-            ["pgrep", "-f", "calc.autotrace|llvmcov/target|autobug"],
+            ["pgrep", "-f", "calc.autotrace|autobug"],
             capture_output=True,
             text=True,
             timeout=5
@@ -6412,7 +6142,7 @@ def cleanup_child_processes():
             if result.returncode == 0:
                 cleaned = 0
                 for line in result.stdout.split('\n'):
-                    if 'calc.autotrace' in line or 'llvmcov/target' in line:
+                    if 'calc.autotrace' in line or 'autobug' in line:
                         parts = line.split()
                         if len(parts) >= 2:
                             try:

@@ -12,13 +12,6 @@ same layout without manual cloning.
 - Handling: mirrored to `LuxuriantHuang/AFLplusplus` and tracked as a submodule
 - Local changes tracked here: [`patches/AFLplusplus-config.patch`](patches/AFLplusplus-config.patch)
 
-### `llvm-project/`
-
-- Type: large upstream fork with local `llvm-cov` changes
-- Handling: mirrored to `LuxuriantHuang/llvm-project` and tracked as a submodule
-- Local base commit recorded from the local checkout: `c987950fa`
-- Local changes tracked here: [`patches/llvm-project-llvm-cov.patch`](patches/llvm-project-llvm-cov.patch)
-
 ### `svf/third_party/SVF/`
 
 - Type: upstream SVF checkout used by the local slicer build

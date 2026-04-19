@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+BASE="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd -P)"
+
 PROJECT="${1:?usage: build_single_dir.sh <project>}"
 shift || true
 
-BASE=/home/lab420/Desktop/autoframe
 HOME_DIR="${BASE}/benchmarks/${PROJECT}"
 SRC_DIR="${HOME_DIR}/src"
 BUILD_ROOT="${HOME_DIR}/build"
 JOBS="${JOBS:-4}"
+AFL_LLVM_VERSION="${AFL_LLVM_VERSION:-10}"
+COV_LLVM_VERSION="${COV_LLVM_VERSION:-18}"
+
+AFL_CC_BIN="${AFL_CC_BIN:-clang-${AFL_LLVM_VERSION}}"
+AFL_CXX_BIN="${AFL_CXX_BIN:-clang++-${AFL_LLVM_VERSION}}"
+COV_CC_BIN="${COV_CC_BIN:-clang-${COV_LLVM_VERSION}}"
+COV_CXX_BIN="${COV_CXX_BIN:-clang++-${COV_LLVM_VERSION}}"
+COV_CFLAGS="${COV_CFLAGS:--fprofile-instr-generate -fcoverage-mapping -g -O0}"
 
 install_binary() {
   local source_path="$1"
@@ -104,7 +114,7 @@ build_cjson_variant() {
   rm -rf "${build_dir}"
   mkdir -p "${build_dir}"
   pushd "${HOME_DIR}" >/dev/null
-  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18 LLVM_COMPILER=clang
+  export CC="${cc}" CFLAGS="${cflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}" LLVM_COMPILER=clang
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   cmake -S "${SRC_DIR}" -B "${build_dir}" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -146,7 +156,7 @@ build_cflow_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" configure_opts="${7:-}" afl_cmplog="${8:-}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   autoreconf -fi
   ./configure --enable-debug ${configure_opts}
@@ -172,7 +182,7 @@ build_cxxfilt_variant() {
   local support_src="${HOME_DIR}/cxxfilt_support.c"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   LDFLAGS="-no-pie" ./configure --disable-shared --disable-gdb
   make configure-bfd
@@ -204,7 +214,7 @@ build_jhead_variant() {
   local cc="$1" cflags="$2" outbin="$3" target_dir="$4" afl_cmplog="${5:-0}"
   clean_make_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CFLAGS="${cflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   make -j"${JOBS}"
   install_binary "${SRC_DIR}/jhead" "${target_dir}" "${outbin}"
@@ -225,7 +235,7 @@ build_lcms_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" extra_link_flags="${7:-}" afl_cmplog="${8:-}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   ./autogen.sh
   ./configure --disable-shared
@@ -253,7 +263,7 @@ build_libpng_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" extra_link_flags="${7:-}" afl_cmplog="${8:-}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   ./configure --disable-shared
   make -j"${JOBS}"
@@ -279,7 +289,7 @@ build_xmllint_variant() {
   local cc="$1" cxx="$2" cflags="$3" cxxflags="$4" outbin="$5" target_dir="$6" _extra_link_flags="${7:-}" afl_cmplog="${8:-0}"
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags}" CXXFLAGS="${cxxflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   sh ./autogen.sh
   CCLD="${CXX} ${CXXFLAGS}" CC="${CC}" CFLAGS="${CFLAGS}" ./configure --disable-shared
@@ -304,7 +314,7 @@ build_mujs_variant() {
   local cc="$1" _cxx="$2" cflags="$3" _cxxflags="$4" outbin="$5" target_dir="$6" _extra="${7:-}" afl_cmplog="${8:-}"
   clean_make_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CFLAGS="${cflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   "${CC}" ${CFLAGS} -o "${outbin}" one.c main.c -lm
   install_binary "${SRC_DIR}/${outbin}" "${target_dir}" "${outbin}"
@@ -421,7 +431,7 @@ build_sqlite3_variant() {
   local sqlite_core_src="sqlite3-all.c"
   clean_make_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags} ${sqlite_limits}" CXXFLAGS="${cflags}" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC="${cc}" CXX="${cxx}" CFLAGS="${cflags} ${sqlite_limits}" CXXFLAGS="${cflags}" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   if [ ! -f "${sqlite_core_src}" ]; then
     sqlite_core_src="sqlite3.c"
@@ -475,7 +485,7 @@ build_cjson_autobug() {
   rm -rf "${build_dir}"
   mkdir -p "${build_dir}"
   pushd "${HOME_DIR}" >/dev/null
-  export CC=clang CFLAGS="-O0 -g" AFL_CC=clang-18 AFL_CXX=clang++-18 LLVM_COMPILER=clang
+  export CC=clang CFLAGS="-O0 -g" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}" LLVM_COMPILER=clang
   cmake -S "${SRC_DIR}" -B "${build_dir}" \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DCMAKE_C_COMPILER="${CC}" \
@@ -493,7 +503,7 @@ build_cjson_autobug() {
 build_cflow_autobug() {
   clean_autotools_src
   pushd "${SRC_DIR}" >/dev/null
-  export CC=gcc CXX=g++ CFLAGS="-O0 -g" CXXFLAGS="-O0 -g" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CC=gcc CXX=g++ CFLAGS="-O0 -g" CXXFLAGS="-O0 -g" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   autoreconf -fi
   ./configure --enable-debug
   make -j"${JOBS}"
@@ -548,7 +558,7 @@ build_calc_variant() {
   local cc="$1" cflags="$2" outbin="$3" target_dir="$4" afl_cmplog="${5:-0}"
   clean_calc_src
   pushd "${SRC_DIR}" >/dev/null
-  export CCC="${cc} ${cflags}" EXTRA_CFLAGS="" EXTRA_LDFLAGS="" AFL_CC=clang-18 AFL_CXX=clang++-18
+  export CCC="${cc} ${cflags}" EXTRA_CFLAGS="" EXTRA_LDFLAGS="" AFL_CC="${AFL_CC_BIN}" AFL_CXX="${AFL_CXX_BIN}"
   if [ "${afl_cmplog}" = "1" ]; then export AFL_LLVM_CMPLOG=1; fi
   make -j"${JOBS}" target=Linux BLD_TYPE=calc-static-only
   install_binary "${SRC_DIR}/calc" "${target_dir}" "${outbin}"
@@ -586,7 +596,7 @@ main() {
       build_calc_variant afl-clang-fast "-g -O0" calc_cmplog cmplog 1
       build_calc_variant gclang "-g -O0" calc_trace trace
       run_trace_post calc_trace -lreadline -lhistory -lncurses
-      build_calc_variant clang-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_calc_variant "${COV_CC_BIN}" "${COV_CFLAGS}" target llvmcov
       run_ipl_post calc_trace calc_ipl -lreadline -lhistory -lncurses
       run_svf_static calc_trace
       build_calc_autobug
@@ -598,7 +608,7 @@ main() {
       build_cjson_variant afl-clang-fast "-g -O0" cjson_cmplog cmplog 1
       build_cjson_variant gclang "-g -O0" cjson_trace trace
       run_trace_post cjson_trace
-      build_cjson_variant clang-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_cjson_variant "${COV_CC_BIN}" "${COV_CFLAGS}" target llvmcov
       run_ipl_post cjson_trace cjson_ipl
       run_svf_static cjson_trace
       build_cjson_autobug
@@ -610,7 +620,7 @@ main() {
       build_cflow_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" cflow_cmplog cmplog "" 1
       build_cflow_variant gclang gclang++ "-g -O0" "-g -O0" cflow_trace trace
       run_trace_post cflow_trace
-      build_cflow_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_cflow_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov
       run_ipl_post cflow_trace cflow_ipl
       run_svf_static cflow_trace
       build_cflow_autobug
@@ -622,7 +632,7 @@ main() {
       build_cxxfilt_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" cxxfilt_cmplog cmplog 1
       build_cxxfilt_variant gclang gclang++ "-g -O0" "-g -O0" cxxfilt_trace trace
       run_trace_post cxxfilt_trace
-      build_cxxfilt_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_cxxfilt_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov
       run_ipl_post cxxfilt_trace cxxfilt_ipl
       run_svf_static cxxfilt_trace
       build_cxxfilt_autobug
@@ -633,7 +643,7 @@ main() {
       build_jhead_variant afl-clang-fast "-O2 -fno-omit-frame-pointer" jhead_cmplog cmplog 1
       build_jhead_variant gclang "-g -O0" jhead_trace trace
       run_trace_post jhead_trace
-      build_jhead_variant clang-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_jhead_variant "${COV_CC_BIN}" "${COV_CFLAGS}" target llvmcov
       run_ipl_post jhead_trace jhead_ipl
       run_svf_static jhead_trace
       build_jhead_bear
@@ -644,7 +654,7 @@ main() {
       build_lcms_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" lcms_cmplog cmplog "-std=c++11" 1
       build_lcms_variant gclang gclang++ "-g -O0" "-g -O0" lcms_trace trace
       run_trace_post lcms_trace
-      build_lcms_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov "-std=c++11"
+      build_lcms_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov "-std=c++11"
       run_ipl_post lcms_trace lcms_ipl
       run_svf_static lcms_trace
       build_lcms_bear
@@ -655,7 +665,7 @@ main() {
       build_libpng_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" libpng_cmplog cmplog "-std=c++11" 1
       build_libpng_variant gclang gclang++ "-g -O0" "-g -O0" libpng_trace trace
       run_trace_post libpng_trace -lz
-      build_libpng_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov "-std=c++11"
+      build_libpng_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov "-std=c++11"
       run_ipl_post libpng_trace libpng_ipl
       run_svf_static libpng_trace
       build_libpng_bear
@@ -666,7 +676,7 @@ main() {
       build_xmllint_variant afl-clang-fast afl-clang-fast++ "-O0 -g" "-O0 -g" xmllint_cmplog cmplog "-std=c++11" 1
       build_xmllint_variant gclang gclang++ "-g -O0" "-g -O0" xmllint_trace trace
       run_trace_post xmllint_trace -lz
-      build_xmllint_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov "-std=c++11" 0
+      build_xmllint_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov "-std=c++11" 0
       run_ipl_post xmllint_trace xmllint_ipl
       build_xmllint_bear
       run_svf_static xmllint_trace
@@ -678,7 +688,7 @@ main() {
       build_mujs_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" mujs_cmplog cmplog "-std=c++11" 1
       build_mujs_variant gclang gclang++ "-g -O0" "-g -O0" mujs_trace trace
       run_trace_post mujs_trace -lm
-      build_mujs_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov "-std=c++11"
+      build_mujs_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov "-std=c++11"
       run_ipl_post mujs_trace mujs_ipl -lm
       run_svf_static mujs_trace
       build_mujs_autobug
@@ -689,7 +699,7 @@ main() {
       build_pcre2_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" pcre2_fuzz afl
       build_pcre2_variant gclang gclang++ "-g -O0" "-g -O0" pcre2_trace trace
       run_trace_post pcre2_trace
-      build_pcre2_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_pcre2_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov
       run_ipl_post pcre2_trace pcre2_ipl
       run_svf_static pcre2_trace
       build_pcre2_bear
@@ -700,7 +710,7 @@ main() {
       build_pdf2text_variant afl-clang-fast afl-clang-fast++ "-O2 -fno-omit-frame-pointer" "-O2 -fno-omit-frame-pointer" pdf2text_cmplog cmplog 1
       build_pdf2text_variant gclang gclang++ "-g -O0" "-g -O0" pdf2text_trace trace
       run_trace_post pdf2text_trace
-      build_pdf2text_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_pdf2text_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov
       run_ipl_post pdf2text_trace pdf2text_ipl
       run_svf_static pdf2text_trace
       build_pdf2text_bear
@@ -710,7 +720,7 @@ main() {
       build_proj4_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" proj4_fuzz afl
       build_proj4_variant gclang gclang++ "-g -O0" "-g -O0" proj4_trace trace
       run_trace_post proj4_trace -lpthread
-      build_proj4_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_proj4_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov
       run_svf_static proj4_trace
       clean_autotools_src
       ;;
@@ -718,7 +728,7 @@ main() {
       build_transform_variant afl-clang-fast afl-clang-fast++ "-g -O0" "-g -O0" transform_fuzz afl
       build_transform_variant gclang gclang++ "-g -O0" "-g -O0" transform_trace trace
       run_trace_post transform_trace
-      build_transform_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_transform_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" "${COV_CFLAGS}" target llvmcov
       run_svf_static transform_trace
       clean_make_src
       ;;
@@ -727,7 +737,7 @@ main() {
       build_sqlite3_variant afl-clang-fast afl-clang-fast++ "-g -O0" sqlite3_cmplog cmplog 1
       build_sqlite3_variant gclang gclang++ "-g -O0" sqlite3_trace trace
       run_trace_post sqlite3_trace -ldl -pthread
-      build_sqlite3_variant clang-14 clang++-14 "-fprofile-instr-generate -fcoverage-mapping -g -O0" target llvmcov
+      build_sqlite3_variant "${COV_CC_BIN}" "${COV_CXX_BIN}" "${COV_CFLAGS}" target llvmcov
       run_sqlite3_ipl_post sqlite3_trace sqlite3_ipl -ldl -pthread
       run_svf_static sqlite3_trace
       build_sqlite3_autobug

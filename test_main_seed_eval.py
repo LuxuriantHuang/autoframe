@@ -130,11 +130,10 @@ def test_code_like_progress_accepts_file_or_parser_hits(monkeypatch):
     assert main._seed_eval_indicates_local_progress(_base_eval(exec_ok=True, frontier_advance=True))
 
 
-def test_evaluate_seed_uses_runtime_and_coverage_feedback(monkeypatch, tmp_path):
+def test_evaluate_seed_uses_runtime_feedback_without_coverage(monkeypatch, tmp_path):
     seed_path = tmp_path / "seed.xml"
     seed_path.write_text("<a></b>", encoding="utf-8")
 
-    monkeypatch.setattr(main, "COV_TARGET_PATH", "/bin/true")
     monkeypatch.setattr(main, "PROJECT", "xmllint")
     monkeypatch.setattr(
         main,
@@ -142,18 +141,8 @@ def test_evaluate_seed_uses_runtime_and_coverage_feedback(monkeypatch, tmp_path)
         {"format_name": "xml", "format_description": "xml parser"},
     )
     monkeypatch.setattr(main, "_execute_seed_and_capture", lambda seed_path, harness_code=None: (True, "Opening and ending tag mismatch at line 1"))
-    monkeypatch.setattr(main, "_build_seed_profdata", lambda seed_path: Path("/tmp/fake.profdata"))
-    monkeypatch.setattr(main, "_call_chain_file_candidates", lambda call_chain: ["parser.c"])
-
-    def fake_cov_show(file_name, profdata_path):
-        if file_name == "target.c":
-            return "  42|  3| hit line\n"
-        if file_name == "parser.c":
-            return "  10|  1| parser hit\n"
-        return ""
-
-    monkeypatch.setattr(main, "_llvm_cov_show_file", fake_cov_show)
     monkeypatch.setattr(main, "_seed_stderr_cluster_history", defaultdict(set))
+    monkeypatch.setattr(main, "_seed_frontier_history", defaultdict(dict))
 
     result = main.evaluate_seed(
         str(seed_path),
@@ -166,58 +155,28 @@ def test_evaluate_seed_uses_runtime_and_coverage_feedback(monkeypatch, tmp_path)
 
     assert result.exec_ok is True
     assert result.parse_family_hit is True
-    assert result.target_file_hit is True
-    assert result.target_line_window_hit is True
+    assert result.target_file_hit is False
+    assert result.target_line_window_hit is False
     assert result.stderr_cluster == "xml_mismatched_tag"
     assert result.stderr_novel is True
-    assert result.coverage_gain_class == "target_line_window_hit"
+    assert result.parser_depth_score > 0
+    assert result.frontier_advance is True
+    assert result.coverage_gain_class == "frontier_advance"
 
 
-def test_compute_new_coverage_features_tracks_incremental_branch_hits(monkeypatch):
-    monkeypatch.setattr(main, "_seed_coverage_feature_history", defaultdict(set))
-    profdata_path = Path("/tmp/fake.profdata")
-    target_context = {"roadblock": {"filename": "target.c", "line": 10, "function": "parse_target"}}
-
-    monkeypatch.setattr(
-        main,
-        "_export_one_sided_branch_features",
-        lambda profdata: {
-            ("a.c", 10, "true"),
-            ("b.c", 20, "false"),
-        },
-    )
-    assert main._compute_new_coverage_features(profdata_path, target_context) == 2
-    assert main._compute_new_coverage_features(profdata_path, target_context) == 0
-
-    monkeypatch.setattr(
-        main,
-        "_export_one_sided_branch_features",
-        lambda profdata: {
-            ("a.c", 10, "true"),
-            ("b.c", 20, "false"),
-            ("c.c", 30, "true"),
-        },
-    )
-    assert main._compute_new_coverage_features(profdata_path, target_context) == 1
-
-
-def test_evaluate_seed_reports_new_edges_from_coverage_export(monkeypatch, tmp_path):
+def test_evaluate_seed_reports_parser_progress_without_coverage(monkeypatch, tmp_path):
     seed_path = tmp_path / "seed.json"
     seed_path.write_text('{"a":1}', encoding="utf-8")
 
-    monkeypatch.setattr(main, "COV_TARGET_PATH", "/bin/true")
     monkeypatch.setattr(main, "PROJECT", "demo")
     monkeypatch.setattr(
         main,
         "cached_format_info",
         {"format_name": "source", "format_description": "code-like text input"},
     )
-    monkeypatch.setattr(main, "_execute_seed_and_capture", lambda seed_path, harness_code=None: (True, ""))
-    monkeypatch.setattr(main, "_build_seed_profdata", lambda seed_path: Path("/tmp/fake.profdata"))
-    monkeypatch.setattr(main, "_call_chain_file_candidates", lambda call_chain: [])
-    monkeypatch.setattr(main, "_llvm_cov_show_file", lambda file_name, profdata_path: "")
-    monkeypatch.setattr(main, "_compute_new_coverage_features", lambda profdata_path, target_context: 3)
+    monkeypatch.setattr(main, "_execute_seed_and_capture", lambda seed_path, harness_code=None: (True, "syntax error at line 1"))
     monkeypatch.setattr(main, "_seed_stderr_cluster_history", defaultdict(set))
+    monkeypatch.setattr(main, "_seed_frontier_history", defaultdict(dict))
 
     result = main.evaluate_seed(
         str(seed_path),
@@ -228,8 +187,9 @@ def test_evaluate_seed_reports_new_edges_from_coverage_export(monkeypatch, tmp_p
         },
     )
 
-    assert result.new_edges == 3
-    assert result.coverage_gain_class == "new_edges"
+    assert result.new_edges == 0
+    assert result.parser_depth_score > 0
+    assert result.coverage_gain_class == "frontier_advance"
 
 
 def test_mark_frontier_advance_when_closest_hit_moves_forward(monkeypatch):
@@ -260,25 +220,14 @@ def test_mark_frontier_advance_when_closest_hit_moves_forward(monkeypatch):
     assert advanced3 is False
 
 
-def test_evaluate_seed_marks_frontier_advance_when_target_distance_improves(monkeypatch, tmp_path):
+def test_evaluate_seed_marks_frontier_advance_from_parser_depth(monkeypatch, tmp_path):
     seed_path = tmp_path / "seed.xml"
     seed_path.write_text("<a></b>", encoding="utf-8")
 
-    monkeypatch.setattr(main, "COV_TARGET_PATH", "/bin/true")
     monkeypatch.setattr(main, "PROJECT", "xmllint")
     monkeypatch.setattr(main, "cached_format_info", {"format_name": "xml", "format_description": "xml parser"})
-    monkeypatch.setattr(main, "_execute_seed_and_capture", lambda seed_path, harness_code=None: (True, ""))
-    monkeypatch.setattr(main, "_build_seed_profdata", lambda seed_path: Path("/tmp/fake.profdata"))
-    monkeypatch.setattr(main, "_compute_new_coverage_features", lambda profdata_path, target_context: 0)
     monkeypatch.setattr(main, "_seed_stderr_cluster_history", defaultdict(set))
     monkeypatch.setattr(main, "_seed_frontier_history", defaultdict(dict))
-    monkeypatch.setattr(main, "_call_chain_file_candidates", lambda call_chain: ["pre.c", "target.c"])
-
-    reports = {
-        "target.c": "  88|  1| pre-hit\n",
-        "pre.c": "  10|  1| parser hit\n",
-    }
-    monkeypatch.setattr(main, "_llvm_cov_show_file", lambda file_name, profdata_path: reports.get(file_name, ""))
 
     target_context = {
         "roadblock": {"filename": "target.c", "line": 140, "function": "parse_target"},
@@ -286,13 +235,18 @@ def test_evaluate_seed_marks_frontier_advance_when_target_distance_improves(monk
         "harness_code": "xmlReadMemory(buf, len, NULL, NULL, 0)",
     }
 
+    monkeypatch.setattr(
+        main,
+        "_execute_seed_and_capture",
+        lambda seed_path, harness_code=None: (True, "Opening and ending tag mismatch at line 1"),
+    )
     first = main.evaluate_seed(str(seed_path), target_context)
     assert first.frontier_advance is True
-    assert first.closest_hit_line_distance == 52
-    assert first.coverage_gain_class == "target_file_hit"
+    assert first.closest_hit_line_distance is None
+    assert first.coverage_gain_class == "frontier_advance"
 
-    reports["target.c"] = "  95|  1| deeper hit\n"
+    monkeypatch.setattr(main, "_execute_seed_and_capture", lambda seed_path, harness_code=None: (True, ""))
     second = main.evaluate_seed(str(seed_path), target_context)
-    assert second.frontier_advance is True
-    assert second.closest_hit_line_distance == 45
-    assert second.coverage_gain_class == "target_file_hit"
+    assert second.frontier_advance is False
+    assert second.closest_hit_line_distance is None
+    assert second.coverage_gain_class == "seed_generated"

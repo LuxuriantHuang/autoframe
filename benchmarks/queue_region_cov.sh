@@ -184,12 +184,12 @@ if [[ ! -x "${target_bin}" ]]; then
   exit 1
 fi
 
-llvm_cov_bin="$(find_llvm_tool "${LLVM_COV_BIN:-}" llvm-cov-14 llvm-cov)" || {
+llvm_cov_bin="$(find_llvm_tool "${LLVM_COV_BIN:-}" llvm-cov-18 llvm-cov-14 llvm-cov)" || {
   echo "错误: 找不到 llvm-cov。" >&2
   exit 1
 }
 
-llvm_profdata_bin="$(find_llvm_tool "${LLVM_PROFDATA_BIN:-}" llvm-profdata-14 llvm-profdata)" || {
+llvm_profdata_bin="$(find_llvm_tool "${LLVM_PROFDATA_BIN:-}" llvm-profdata-18 llvm-profdata-14 llvm-profdata)" || {
   echo "错误: 找不到 llvm-profdata。" >&2
   exit 1
 }

@@ -2702,7 +2702,7 @@ class CoverageTracer:
         不再使用：
         - profraw生成
         - profdata merge
-        - llvm-cov export
+        - 旧的覆盖率导出路径
 
         Returns:
             tuple: (success: bool, last_scan_time: int, error_info: str, roadblocks: list[dict])
@@ -2945,7 +2945,7 @@ class CoverageTracer:
                                 code = self._extract_source_code(filename, line)
 
                                 # 映射branch_id到side（true/false）
-                                # AutoBug使用1-based branch ID，llvm-cov使用true/false
+                                # AutoBug使用1-based branch ID，这里统一映射到 true/false 侧
                                 # 假设：branch_id=1 对应 false，branch_id=2 对应 true
                                 side = 'false' if branch_id == 1 else 'true'
                                 status = 'only_true' if branch_id == 1 else 'only_false'
@@ -2963,7 +2963,7 @@ class CoverageTracer:
                                     # 需要向前查找switch语句
                                     switch_statement_line = self._find_switch_statement_before_line(filename, line)
 
-                                # 统一数据结构：与 llvm-cov 输出完全一致
+                                # 统一数据结构：保持与现有 roadblock 消费侧兼容
                                 result.append({
                                     'id': bb_id if bb_id is not None else line,
                                     'function': func.get('name', ''),
@@ -3080,26 +3080,6 @@ class CoverageTracer:
             logger.debug(f"[CoverageTracer] Failed to find switch statement before {filename}:{line}: {e}")
 
         return None
-
-        result = []
-        seen_keys = set()
-        for file_entry in files:
-            for branch in file_entry.get('one_sided_branches', []):
-                if int(branch.get('true_count', 0) or 0) == 0 and int(branch.get('false_count', 0) or 0) == 0:
-                    continue
-                item = branch.copy()
-                item.pop('false_count', None)
-                item.pop('true_count', None)
-                item.pop('col', None)
-                item.setdefault('filename', file_entry.get('filename'))
-                key = (item.get('filename'), item.get('line'), item.get('side'), item.get('status'))
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                result.append(item)
-
-        logger.info(f"[CoverageTracer] llvm-cov one-sided branch export completed: {len(result)} targets")
-        return result
 
 
 def get_new_seeds(directory, read_files, last_scan_time, prof_dir: Path | None = None):  # 添加去数据库找的功能

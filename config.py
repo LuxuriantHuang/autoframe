@@ -92,22 +92,6 @@ SVF_SLICE_PATH = _resolve_existing_path(
     ROOT_DIR / "svf" / "build",
 )
 
-# Keep the old workflow for coverage tools:
-# - prefer the in-repo llvm-project build for llvm-cov
-# - prefer system llvm-profdata (older versions may be required by gclang traces)
-LLVM_COV_BIN = _resolve_tool_path(
-    "AF_LLVM_COV_BIN",
-    [
-        ROOT_DIR / "llvm-project" / "build" / "bin" / "llvm-cov",
-        LLVM_BIN_PATH / "llvm-cov",
-    ],
-    ["llvm-cov-10", "llvm-cov", "llvm-cov-14"],
-)
-LLVM_PROFDATA_BIN = _resolve_tool_path(
-    "AF_LLVM_PROFDATA_BIN",
-    [],
-    ["llvm-profdata-14", "llvm-profdata", "llvm-profdata-10", "llvm-profdata-11", "llvm-profdata-18"],
-)
 FUZZER_NAME = "default"
 PROJECT = os.getenv("AF_PROJECT", "mujs")
 OUTPUT_DIR_NAME = os.getenv("AF_OUTPUT_DIR", "out")  # 输出目录名，可通过命令行 -o 参数修改
@@ -161,8 +145,7 @@ AUTOBUG_GET_BRANCH_TIMEOUT = int(os.getenv("AF_AUTOBUG_GET_BRANCH_TIMEOUT", "60"
 AUTOBUG_FLIP_BRANCH_TIMEOUT = int(os.getenv("AF_AUTOBUG_FLIP_BRANCH_TIMEOUT", "120"))  # seconds
 AUTOBUG_COND_MAX_SELECTION_TRIES = int(os.getenv("AF_AUTOBUG_COND_MAX_SELECTION_TRIES", "2"))
 
-# Trace模块开关：控制是否在停滞后运行完整的trace分析
-# 设置为True时，在停滞后运行完整的llvm-cov trace分析
+# Trace模块开关：控制是否在停滞后运行完整的 trace 分析
 ENABLE_STAGNATION_TRACE = os.getenv("AF_ENABLE_STAGNATION_TRACE", "true").lower() in {"1", "true", "yes", "on"}
 
 PROJECT_HOME = ROOT_DIR / "benchmarks" / PROJECT
@@ -223,7 +206,7 @@ def resolve_source_path(path_like) -> Path | None:
         candidate_strings.append(str(path_like))
 
     # Some binaries embed paths from per-variant build directories rather than src/.
-    build_variants = ("llvmcov", "fuzz", "cmplog", "trace", "ipl", "tmp")
+    build_variants = ("fuzz", "cmplog", "trace", "ipl", "tmp")
     base_candidates = [
         BUILD_PATH.as_posix(),
         (PROJECT_HOME / "build").as_posix(),
@@ -329,9 +312,6 @@ def update_indirect_calls(static_func, new_edges):
             func["calls"] = list(existing_calls)
 
 EXEC_ARGS = ""
-
-# llvm-cov config
-COV_TARGET_PATH = PROJECT_HOME / "target" / "llvmcov" / "target"
 
 # DSE config
 DSE_DOCKER_TMP_PATH = Path("/root/Project") / OUTPUT_DIR_NAME / "runtime" / "symbolic" / "tmp"
@@ -836,8 +816,6 @@ def build_runtime_command_context(
         f"example_target_command: {format_cmd(AFL_TARGET_PATH, target_args)}",
         f"trace_program: {os.fspath(TRACE_TARGET_PATH)}",
         f"example_trace_command: {format_cmd(TRACE_TARGET_PATH, target_args)}",
-        f"coverage_program: {os.fspath(COV_TARGET_PATH)}",
-        f"example_coverage_command: {format_cmd(COV_TARGET_PATH, target_args)}",
         "</runtime_command>",
     ]
     return "\n".join(lines)
@@ -856,7 +834,7 @@ def set_project(project_name: str, output_dir_name: str = "out"):
     global RUN_ROOT, RUN_LOG_PATH, RUN_RUNTIME_PATH, RUN_LLM_PATH, RUN_MUT_PATH
     global RUN_SLICE_PATH, RUN_TRACE_PATH, RUN_TAINT_PATH, RUN_SEMANTIC_FIELDS_PATH, RUN_SYMBOLIC_PATH
     global REWARD_FEED_PATH
-    global LLM_TMP_PATH, MUT_TMP_PATH, bcfile_path, COV_TARGET_PATH
+    global LLM_TMP_PATH, MUT_TMP_PATH, bcfile_path
     global IPL_TARGET_PATH, bbs, funcs, slice_out
     global DSE_TMP_PATH, DSE_TARGET_PATH, DSE_PROGRAM, DSE_DOCKER_TMP_PATH
     global FLAGREC_BITCODE, FLAGREC_CACHE
@@ -904,7 +882,6 @@ def set_project(project_name: str, output_dir_name: str = "out"):
     # Target Binary Paths
     AFL_TARGET_PATH = PROJECT_HOME / "target" / "afl" / f"{PROJECT}_fuzz"
     TRACE_TARGET_PATH = PROJECT_HOME / "target" / "trace" / f"{PROJECT}_trace"
-    COV_TARGET_PATH = PROJECT_HOME / "target" / "llvmcov" / "target"
     bcfile_path = Path(PROJECT_HOME) / 'target' / 'trace' / f"{PROJECT}_trace.bc"
     slice_out = os.fspath(RUN_SLICE_PATH / "slice.txt")
     IPL_TARGET_PATH = PROJECT_HOME / "target" / "ipl" / f"{PROJECT}_ipl"
@@ -986,7 +963,6 @@ def set_project(project_name: str, output_dir_name: str = "out"):
                 module.SYMBOLIC_QUEUE_PATH = SYMBOLIC_QUEUE_PATH
                 module.AFL_TARGET_PATH = AFL_TARGET_PATH
                 module.TRACE_TARGET_PATH = TRACE_TARGET_PATH
-                module.COV_TARGET_PATH = COV_TARGET_PATH
                 module.SRC_PATH = SRC_PATH
                 module.SRC_BEAR_PATH = SRC_BEAR_PATH
                 module.TSEED_ISI_PATH = TSEED_ISI_PATH

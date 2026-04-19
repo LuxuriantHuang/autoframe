@@ -7,11 +7,12 @@ that may affect branch conditions, using the flagrec static analysis tool.
 
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
-from config import LOGGER_NAME
+from config import LOGGER_NAME, ROOT_DIR
 
 logger = logging.getLogger(LOGGER_NAME + __name__)
 
@@ -33,10 +34,11 @@ def run_flagrec_analysis(bitcode_path: str, source_dir: str, output_dir: str,
     Raises:
         RuntimeError: If flagrec execution fails
     """
-    flagrec_bin = "/home/lab420/Desktop/autoframe/flag_var/flagrec/build/flagrec"
+    default_flagrec_bin = ROOT_DIR / "flag_var" / "flagrec" / "build" / "flagrec"
+    flagrec_bin = Path(os.environ.get("AF_FLAGREC_BIN", os.fspath(default_flagrec_bin)))
 
     cmd = [
-        flagrec_bin,
+        str(flagrec_bin),
         "--bitcode", str(bitcode_path),
         "--source-dir", str(source_dir),
         "--out", str(output_dir),

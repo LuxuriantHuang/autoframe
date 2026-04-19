@@ -12,7 +12,6 @@ DO_PATCH=0
 DO_BUILD=0
 DO_STATUS=0
 DO_SYNC_URLS=0
-COPY_LLVM_TOOLS=1
 
 declare -a REQUESTED_COMPONENTS=()
 
@@ -30,12 +29,11 @@ Options:
   --github-user USER     GitHub account that hosts the mirrored repositories
   --protocol MODE        ssh or https (default: ssh)
   --jobs N               Parallel build jobs
-  --skip-copy-tools      Do not copy llvm-cov/llvm-profdata into tools/bin
   -h, --help             Show this help
 
 Examples:
   scripts/bootstrap-third-party.sh --init --sync-urls --apply-patches
-  scripts/bootstrap-third-party.sh --build --component llvm-project --component svf/third_party/SVF
+  scripts/bootstrap-third-party.sh --build --component svf/third_party/SVF --component tracer
   GITHUB_USER=someone PROTOCOL=https scripts/bootstrap-third-party.sh --init --sync-urls
 EOF
 }
@@ -154,43 +152,16 @@ apply_patches() {
   done < "${MANIFEST}"
 }
 
-copy_llvm_tools() {
-  local build_dir="${ROOT_DIR}/llvm-project/build/bin"
-  local tools_dir="${ROOT_DIR}/tools/bin"
-  mkdir -p "${tools_dir}"
-
-  if [ -x "${build_dir}/llvm-cov" ]; then
-    cp "${build_dir}/llvm-cov" "${tools_dir}/llvm-cov"
-  fi
-  if [ -x "${build_dir}/llvm-profdata" ]; then
-    cp "${build_dir}/llvm-profdata" "${tools_dir}/llvm-profdata"
-  fi
-}
-
 build_component() {
   local component="$1"
   case "${component}" in
     AFLplusplus)
       log "building AFLplusplus"
-      make -C "${ROOT_DIR}/AFLplusplus" -j"${JOBS}"
-      ;;
-    llvm-project)
-      log "building llvm-project tools"
-      cmake -S "${ROOT_DIR}/llvm-project/llvm" \
-        -B "${ROOT_DIR}/llvm-project/build" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DLLVM_ENABLE_PROJECTS="clang" \
-        -DLLVM_TARGETS_TO_BUILD="X86"
-      cmake --build "${ROOT_DIR}/llvm-project/build" \
-        --target llvm-cov llvm-profdata opt \
-        -j"${JOBS}"
-      if [ "${COPY_LLVM_TOOLS}" -eq 1 ]; then
-        copy_llvm_tools
-      fi
+      make -C "${ROOT_DIR}/AFLplusplus" LLVM_CONFIG="${LLVM_CONFIG:-llvm-config-10}" -j"${JOBS}"
       ;;
     tracer)
       log "building tracer"
-      make -C "${ROOT_DIR}/tracer" -j"${JOBS}"
+      make -C "${ROOT_DIR}/tracer" LLVM_CONFIG="${LLVM_CONFIG:-llvm-config-10}" -j"${JOBS}"
       ;;
     "svf/third_party/SVF")
       log "building upstream SVF"
@@ -225,7 +196,6 @@ build_component() {
 build_all() {
   local default_order=(
     AFLplusplus
-    llvm-project
     tracer
     "svf/third_party/SVF"
     svf-local
@@ -306,9 +276,6 @@ while [ "$#" -gt 0 ]; do
       shift
       [ "$#" -gt 0 ] || die "--jobs requires a value"
       JOBS="$1"
-      ;;
-    --skip-copy-tools)
-      COPY_LLVM_TOOLS=0
       ;;
     -h|--help)
       usage

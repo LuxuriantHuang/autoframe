@@ -8,8 +8,8 @@ fi
 
 INPUT="$1"
 OUTDIR="$2"
-WPA_BIN="${3:-/home/lab420/Desktop/svf/third_party/SVF/Release-build/bin/wpa}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd -P)"
+WPA_BIN="${3:-${ROOT_DIR}/third_party/SVF/Release-build/bin/wpa}"
 EXTRACTOR="${ROOT_DIR}/build/ir_graph_extractor"
 WPA_OUT="${OUTDIR}/svf_wpa.out"
 WPA_ERR="${OUTDIR}/svf_wpa.err"
