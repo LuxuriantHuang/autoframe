@@ -50,11 +50,11 @@ build_aflplusplus() {
         # 先清理
         make clean >/dev/null 2>&1 || true
 
-        # AFL++ 使用 clang-14（如果有），其他组件用 clang-10
-        local afl_llvm_config="llvm-config-14"
-        if ! command -v llvm-config-14 >/dev/null 2>&1; then
-            warn "llvm-config-14 not found, falling back to llvm-config-10"
-            afl_llvm_config="$LLVM_CONFIG"
+        # AFL++ 使用 clang-18
+        local afl_llvm_config="llvm-config-18"
+        if ! command -v llvm-config-18 >/dev/null 2>&1; then
+            warn "llvm-config-18 not found, falling back to llvm-config-10"
+            afl_llvm_config="llvm-config-10"
         fi
 
         # 构建，只构建 LLVM 模式（不需要 gcc_plugin）
@@ -65,7 +65,7 @@ build_aflplusplus() {
     popd >/dev/null
 }
 
-# 构建 tracer
+# 构建 tracer（使用 clang-10）
 build_tracer() {
     log "Building tracer..."
 
@@ -75,7 +75,7 @@ build_tracer() {
         log "tracer already built, skipping"
     else
         make clean >/dev/null 2>&1 || true
-        make LLVM_CONFIG="$LLVM_CONFIG" -j"$JOBS" \
+        make LLVM_CONFIG="llvm-config-${LLVM_VER_LEGACY}" CC=clang-${LLVM_VER_LEGACY} CXX=clang++-${LLVM_VER_LEGACY} -j"$JOBS" \
             || die "tracer build failed"
     fi
 
@@ -85,6 +85,9 @@ build_tracer() {
 # 构建 SVF
 build_svf() {
     log "Building SVF..."
+
+    # 设置 LLVM 10 环境
+    source "$ROOT_DIR/svf/third_party/SVF/use_svf_llvm10.sh"
 
     # SVF 需要 libtinfo 和 libffi
     local linker_flags="-ltinfo -lffi"
@@ -134,8 +137,9 @@ build_ipl_modeling() {
     if [ -f "install/lib/libLLVMTrack.so" ] && [ -n "${SKIP_REBUILD:-}" ]; then
         log "ipl-modeling already built, skipping"
     else
-        # 需要设置 CFLAGS 启用 GNU 扩展（fgets_unlocked 等）
-        export PATH="/usr/lib/llvm-${LLVM_VERSION}/bin:$PATH"
+        # 使用 clang-10，设置 CFLAGS 启用 GNU 扩展
+        export PATH="/usr/lib/llvm-${LLVM_VER_LEGACY}/bin:$PATH"
+        export LLVM_CONFIG="llvm-config-${LLVM_VER_LEGACY}"
         export CFLAGS="-D_GNU_SOURCE"
 
         bash build.sh \
