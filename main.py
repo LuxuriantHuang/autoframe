@@ -21,6 +21,12 @@ from pathlib import Path
 from re import Match
 from typing import Any, Optional, Dict
 
+# 禁用代理环境变量，避免 OpenAI API SSL 握手问题
+os.environ.pop('http_proxy', None)
+os.environ.pop('https_proxy', None)
+os.environ.pop('HTTP_PROXY', None)
+os.environ.pop('HTTPS_PROXY', None)
+
 from CoverageTracer import (
     CoverageTracer,
     _rank_call_chains_with_dynamic_context,

@@ -27,9 +27,7 @@ ENV LLVM_CONFIG=llvm-config-${LLVM_DEFAULT_VERSION}
 
 WORKDIR /app
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    printf '%s\n' \
+RUN printf '%s\n' \
     'deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ focal main restricted universe multiverse' \
     'deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ focal-updates main restricted universe multiverse' \
     'deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ focal-backports main restricted universe multiverse' \
@@ -79,8 +77,7 @@ RUN curl -fsSL ${LLVM_APT_MIRROR}/llvm.sh -o /tmp/llvm.sh \
     && for version in ${LLVM_EXTRA_VERSIONS} ${LLVM_DEFAULT_VERSION}; do /tmp/llvm.sh "${version}" -m "${LLVM_APT_MIRROR}"; done \
     && rm -f /tmp/llvm.sh
 
-RUN --mount=type=cache,target=/root/.conda/pkgs,sharing=locked \
-    curl --retry 10 --retry-delay 5 -fL https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniforge.sh \
+RUN curl --retry 10 --retry-delay 5 -fL https://mirrors.tuna.tsinghua.edu.cn/anaconda/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniforge.sh \
     && bash /tmp/miniforge.sh -b -p /opt/conda \
     && rm -f /tmp/miniforge.sh \
     && /opt/conda/bin/conda config --system --add pkgs_dirs /root/.conda/pkgs \
@@ -116,8 +113,12 @@ RUN git config --global url."https://github.com/".insteadOf git@github.com: \
          git checkout "${AFL_REPO_REF}" || git checkout FETCH_HEAD; \
        fi
 
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    ln -sf ${PY311_HOME}/bin/python /usr/local/bin/python \
+COPY third_party/ipl-libcxx-artifacts/build_fast /app/ipl-modeling/libcxx/build_fast/
+COPY third_party/ipl-libcxx-artifacts/build_track /app/ipl-modeling/libcxx/build_track/
+
+COPY scripts/build-third-party.sh /app/scripts/build-third-party.sh
+
+RUN ln -sf ${PY311_HOME}/bin/python /usr/local/bin/python \
     && ln -sf ${PY311_HOME}/bin/python /usr/local/bin/python3 \
     && ln -sf ${PY311_HOME}/bin/pip /usr/local/bin/pip \
     && ln -sf ${PY311_HOME}/bin/pip /usr/local/bin/pip3 \
@@ -129,8 +130,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
       --trusted-host pypi.tuna.tsinghua.edu.cn \
       gllvm
 
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
-    python -m pip install \
+RUN python -m pip install \
       -i https://pypi.tuna.tsinghua.edu.cn/simple \
       --trusted-host pypi.tuna.tsinghua.edu.cn \
       -r requirements.txt \
@@ -142,23 +142,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 RUN chmod +x scripts/bootstrap-third-party.sh benchmarks/build_single_dir.sh \
     && mkdir -p /app/tools/bin
 
-RUN bash -lc 'set -euo pipefail; \
-    jobs="$(nproc)"; \
-    unset AFL_REPO_URL AFL_REPO_REF || true; \
-    make -C /app/AFLplusplus clean; \
-    make -C /app/AFLplusplus LLVM_CONFIG=llvm-config-10 -j"${jobs}"; \
-    make -C /app/tracer LLVM_CONFIG=llvm-config-10 -j"${jobs}"; \
-    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"; \
-    source /app/svf/third_party/SVF/use_svf_llvm10.sh; \
-    cmake -S /app/svf/third_party/SVF -B /app/svf/third_party/SVF/Release-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS="-ltinfo -lffi"; \
-    cmake --build /app/svf/third_party/SVF/Release-build -j"${jobs}"; \
-    cmake -S /app/svf -B /app/svf/build -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$(llvm-config-10 --prefix)/lib/cmake/llvm" -DCMAKE_EXE_LINKER_FLAGS="-ltinfo -lffi"; \
-    cmake --build /app/svf/build -j"${jobs}"; \
-    sed -i '/^#define MAX_FIELD_RANGES 64$/a void extract_field_ids_from_label(uint32_t label, BranchRecord *branch);' /app/ipl-modeling/external_lib/branch_field_mapper.c; \
-    (cd /app/ipl-modeling && PATH="/usr/lib/llvm-10/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin" LLVM_CONFIG=llvm-config-10 bash build.sh); \
-    cmake -S /app/flag_var/flagrec -B /app/flag_var/flagrec/build -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR="$(llvm-config-10 --prefix)/lib/cmake/llvm" -DBUILD_TESTS=ON -DCMAKE_EXE_LINKER_FLAGS="-ltinfo -lffi"; \
-    cmake --build /app/flag_var/flagrec/build -j"${jobs}"; \
-    bash /app/AutoBug/build.sh'
+RUN bash /app/scripts/build-third-party.sh --component all
 
 RUN bash -lc 'set -euo pipefail; \
     mkdir -p /opt/autoframe-runtime/{AFLplusplus,AutoBug,flag_var/flagrec,ipl-modeling,svf,tracer,opt}; \
@@ -191,9 +175,7 @@ ENV LLVM_CONFIG=llvm-config-${LLVM_DEFAULT_VERSION}
 
 WORKDIR /app
 
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-    printf '%s\n' \
+RUN printf '%s\n' \
     'deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ focal main restricted universe multiverse' \
     'deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ focal-updates main restricted universe multiverse' \
     'deb http://mirrors.tuna.tsinghua.edu.cn/ubuntu/ focal-backports main restricted universe multiverse' \
@@ -233,4 +215,39 @@ RUN ln -sf ${PY311_HOME}/bin/python /usr/local/bin/python \
 
 COPY --from=builder /opt/autoframe-runtime/ /app/
 
-CMD ["bash"]
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf \
+    automake \
+    build-essential \
+    cmake \
+    g++ \
+    gcc \
+    libtool \
+    make \
+    ninja-build \
+    pkg-config \
+    wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget https://ftp.gnu.org/gnu/autoconf/autoconf-2.71.tar.gz \
+    && tar -xzf autoconf-2.71.tar.gz \
+    && cd autoconf-2.71 \
+    && ./configure --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && cd .. \
+    && rm -rf autoconf-2.71 autoconf-2.71.tar.gz \
+    && wget https://ftp.gnu.org/gnu/automake/automake-1.16.3.tar.gz \
+    && tar -xzf automake-1.16.3.tar.gz \
+    && cd automake-1.16.3 \
+    && ./configure --prefix=/usr/local \
+    && make -j$(nproc) \
+    && make install \
+    && cd .. \
+    && rm -rf automake-1.16.3 automake-1.16.3.tar.gz
+
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# 默认启动：可通过 docker run -e AFL_CMD="..." 传入 AFL 命令
+# 或者在容器内手动运行 /app/entrypoint.sh
+CMD ["/app/entrypoint.sh"]
